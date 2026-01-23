@@ -32,7 +32,7 @@ struct RpcConfig {
     int poll_interval_sec;        // Polling interval for templates
     
     RpcConfig() 
-        : url("http://127.0.0.1:9899")
+        : url("http://127.0.0.1:9897")
         , timeout_sec(30)
         , poll_interval_sec(5) {}
 };
