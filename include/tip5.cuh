@@ -3,6 +3,22 @@
 
 #include "common.cuh"
 
+// ===== MSVC 128-BIT INTEGER SUPPORT =====
+// MSVC doesn't support __uint128_t natively
+// Use _umul128 intrinsic for 128-bit multiplication
+#ifdef _WIN32
+    #ifdef _MSC_VER
+        #include <intrin.h>
+        struct host_uint128 {
+            uint64_t low;
+            uint64_t high;
+            host_uint128() : low(0), high(0) {}
+            host_uint128(uint64_t l) : low(l), high(0) {}
+            host_uint128(uint64_t l, uint64_t h) : low(l), high(h) {}
+        };
+    #endif
+#endif
+
 // ===== TIP5 ALGORITHM CONSTANTS =====
 constexpr int STATE_SIZE = 16;
 constexpr int NUM_ROUNDS = 5;
@@ -35,11 +51,14 @@ enum class Domain : uint64_t {
 
 // ===== CONSTANT MEMORY DECLARATIONS =====
 // These are defined in tip5.cu and accessed via extern
+// Skip extern declarations when TIP5_DEFINING_CONSTANTS is defined
+#ifndef TIP5_DEFINING_CONSTANTS
 extern __constant__ uint32_t MDS_COEFF[STATE_SIZE];
 extern __constant__ uint64_t ROUND_CONSTANTS[NUM_ROUNDS][STATE_SIZE];
 extern __constant__ uint8_t LOOKUP_TABLE[256];
 extern __constant__ uint64_t d_gpu_range_start;
 extern __constant__ uint64_t d_gpu_range_size;
+#endif
 
 // ===== HOST LOOKUP TABLES =====
 extern const uint8_t LOOKUP_TABLE_HOST[256];
@@ -71,9 +90,24 @@ __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl
 }
 
 // Host version using 128-bit arithmetic
+#ifdef _WIN32
+    #ifdef _MSC_VER
+        // MSVC: Use host_uint128 struct
+        __host__ inline uint64_t montyred_host(const host_uint128& x) {
+            uint64_t xl = x.low;
+            uint64_t xh = x.high;
+    #else
+        // MinGW: supports __uint128_t
+        __host__ inline uint64_t montyred_host(__uint128_t x) {
+            uint64_t xl = static_cast<uint64_t>(x);
+            uint64_t xh = static_cast<uint64_t>(x >> 64);
+    #endif
+#else
+    // GCC/Clang: supports __uint128_t
 __host__ inline uint64_t montyred_host(__uint128_t x) {
     uint64_t xl = static_cast<uint64_t>(x);
     uint64_t xh = static_cast<uint64_t>(x >> 64);
+#endif
     
     uint64_t shifted = xl << 32;
     uint64_t a = xl - shifted;
@@ -105,7 +139,20 @@ __host__ inline uint64_t fast_field_add_host(uint64_t a, uint64_t b) {
 
 // ===== FIELD MULTIPLICATION (HOST) =====
 __host__ inline uint64_t field_mul_host(uint64_t a, uint64_t b) {
+#ifdef _WIN32
+    #ifdef _MSC_VER
+        // MSVC: Use _umul128 intrinsic
+        unsigned __int64 high;
+        unsigned __int64 low = _umul128(a, b, &high);
+        host_uint128 prod(low, high);
+    #else
+        // MinGW: supports __uint128_t
+        __uint128_t prod = static_cast<__uint128_t>(a) * b;
+    #endif
+#else
+    // GCC/Clang: supports __uint128_t
     __uint128_t prod = static_cast<__uint128_t>(a) * b;
+#endif
     return montyred_host(prod);
 }
 
@@ -173,7 +220,20 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
 
 // Host version
 __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
+#ifdef _WIN32
+    #ifdef _MSC_VER
+        // MSVC: Use _umul128 intrinsic
+        unsigned __int64 high;
+        unsigned __int64 low = _umul128(element_in, R2, &high);
+        host_uint128 stage1(low, high);
+    #else
+        // MinGW: supports __uint128_t
+        __uint128_t stage1 = static_cast<__uint128_t>(element_in) * R2;
+    #endif
+#else
+    // GCC/Clang: supports __uint128_t
     __uint128_t stage1 = static_cast<__uint128_t>(element_in) * R2;
+#endif
     uint64_t reduced_in = montyred_host(stage1);
     
     uint64_t sbox_out = 0;
@@ -182,7 +242,16 @@ __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
         sbox_out |= static_cast<uint64_t>(LOOKUP_TABLE_HOST[byte]) << (i * 8);
     }
     
+#ifdef _WIN32
+    #ifdef _MSC_VER
+        // MSVC: stage3 is just sbox_out (no multiplication needed for montyred)
+        host_uint128 stage3(sbox_out, 0);
+    #else
+        __uint128_t stage3 = static_cast<__uint128_t>(sbox_out) * sbox_out;
+    #endif
+#else
     __uint128_t stage3 = static_cast<__uint128_t>(sbox_out) * sbox_out;
+#endif
     return x7_computer_host(sbox_out);
 }
 

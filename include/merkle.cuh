@@ -112,13 +112,32 @@ __global__ void __launch_bounds__(256) merkle_zip_kernel(
 __device__ __forceinline__ Digest compute_leaf_from_commitment_device(
     const Digest commitment, 
     uint64_t base_index, 
-    size_t num_leafs);
+    size_t num_leafs) {
+    
+    // Compute bud (leaf) using BUDDING_ROUNDS hash iterations
+    Digest hash = commitment;
+    
+    for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
+        Digest round_digest;
+        round_digest.values[0] = base_index;
+        round_digest.values[1] = 0;
+        round_digest.values[2] = 0;
+        round_digest.values[3] = 0;
+        round_digest.values[4] = round;
+        hash = tip5_hash_fixed_device(hash, round_digest);
+    }
+    
+    return hash;
+}
 
 // Parallel version for warp-cooperative computation
 __device__ __forceinline__ Digest compute_leaf_from_commitment_device_parallel(
     const Digest commitment, 
     uint64_t base_index, 
-    size_t num_leafs);
+    size_t num_leafs) {
+    // Use the same implementation as the regular version
+    return compute_leaf_from_commitment_device(commitment, base_index, num_leafs);
+}
 
 // Get internal node from tree, with on-demand computation if needed
 // Used when not all layers are stored in memory
@@ -215,6 +234,16 @@ inline uint64_t bitreverse_host(uint64_t n, uint32_t log2_n) {
 
 // Calculate the starting index of a layer in the internal nodes array
 inline size_t layer_start_index(size_t layer, size_t num_leafs) {
+    if (layer == 0) return 0;
+    size_t start = 0;
+    for (size_t l = 0; l < layer; ++l) {
+        start += num_leafs >> (l + 1);
+    }
+    return start;
+}
+
+// Device version for use in CUDA kernels
+__device__ __forceinline__ size_t layer_start_index_device(size_t layer, size_t num_leafs) {
     if (layer == 0) return 0;
     size_t start = 0;
     for (size_t l = 0; l < layer; ++l) {
