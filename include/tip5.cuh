@@ -242,16 +242,7 @@ __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
         sbox_out |= static_cast<uint64_t>(LOOKUP_TABLE_HOST[byte]) << (i * 8);
     }
     
-#ifdef _WIN32
-    #ifdef _MSC_VER
-        // MSVC: stage3 is just sbox_out (no multiplication needed for montyred)
-        host_uint128 stage3(sbox_out, 0);
-    #else
-        __uint128_t stage3 = static_cast<__uint128_t>(sbox_out) * sbox_out;
-    #endif
-#else
-    __uint128_t stage3 = static_cast<__uint128_t>(sbox_out) * sbox_out;
-#endif
+    // stage3 was computed but never used - removed to eliminate warning
     return x7_computer_host(sbox_out);
 }
 
