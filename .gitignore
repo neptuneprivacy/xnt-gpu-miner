@@ -1,0 +1,83 @@
+# =========================
+# Build artifacts (CUDA/C++)
+# =========================
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.i
+*.ii
+*.ptx
+*.cubin
+*.fatbin
+*.d
+*.depend
+device_link.o
+
+# Binaries produced by this repo
+xnt-miner
+xnt-miner-bin
+xnt-miner-modular
+
+# ==============
+# CMake outputs
+# ==============
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+Makefile.user
+
+# Common build directories
+build/
+cmake-build-*/
+
+# ============
+# IDE/editors
+# ============
+.vscode/
+.idea/
+.vs/
+.fleet/
+.DS_Store
+
+# CLion
+cmake-build-debug/
+cmake-build-release/
+
+# Cursor / local tooling
+.cursor/
+
+# =========
+# Logs/tmp
+# =========
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# ==================
+# OS / environment
+# ==================
+.env
+.env.*
+
+# ================
+# Rust (xnt-core/)
+# ================
+**/target/
+**/*.rlib
+**/*.rmeta
+
