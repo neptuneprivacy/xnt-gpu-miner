@@ -1,46 +1,39 @@
-// TIP5 Hash Implementation
-// This file contains the TIP5 cryptographic hash function implementation
-
-// Include common for basic types
 #include "common.cuh"
 
-// Define constants BEFORE including tip5.cuh so header functions can use them
-// Use literal sizes since we can't include tip5.cuh yet (it would declare extern)
 constexpr int TIP5_STATE_SIZE = 16;
 constexpr int TIP5_NUM_ROUNDS = 5;
 
-// ===== CONSTANT MEMORY DEFINITIONS =====
 __constant__ uint32_t MDS_COEFF[TIP5_STATE_SIZE] = {
     61402, 1108, 28750, 33823, 7454, 43244, 53865, 12034,
     56951, 27521, 41351, 40901, 12021, 59689, 26798, 17845
 };
 
 __constant__ uint64_t ROUND_CONSTANTS[TIP5_NUM_ROUNDS][TIP5_STATE_SIZE] = {
-    { // Round 0
+    {
         0xBD2A3DEB61AB60DEULL, 0xEA7DF21AD9547ED2ULL, 0x900B3677A1DE063FULL, 0x1B46887E876C8677ULL,
         0xD364D977889CFB97ULL, 0xDC8DFAC843699F02ULL, 0x375C405D7190DB58ULL, 0x27924006D2B0D4B1ULL,
         0x78DD1172D483CD38ULL, 0x3346C66244882A56ULL, 0xB0249B279F498AA5ULL, 0x94CD51BE79338D4DULL,
         0xB0E0DC7052C5B218ULL, 0xF8DCC4D248ADAD95ULL, 0x68E3C635FEC868B7ULL, 0xD7D06B3FFB6B0D8CULL
     },
-    { // Round 1
+    {
         0xF3500DEA20EF032AULL, 0x4865BF175BBA5803ULL, 0xD5F7FE3027287A27ULL, 0xA57333F44E193412ULL,
         0x8726E153A977EAE2ULL, 0x3014A98463FC191BULL, 0xBA145461AF39B212ULL, 0x03AB70105933202FULL,
         0x3D90B7EEBFCF71E5ULL, 0x386322B1CC520BFDULL, 0x27C2C8DAF774F675ULL, 0x4FCB83F50309BC6AULL,
         0x5E6D5CE8275F3CB3ULL, 0xECC2F6592C8F905CULL, 0x837F532461E609B4ULL, 0xB2B1F6B95C92C93CULL
     },
-    { // Round 2
+    {
         0xC0027AF556411DC1ULL, 0x16E18C885FC2A26CULL, 0x8880EF183D9F2BF3ULL, 0xB2930BDB5CA88C45ULL,
         0x9C2EC8322E1C1553ULL, 0xE5B05EAF3220A674ULL, 0xA49CC6AE4B861C4EULL, 0x11708E0AEB86EBD7ULL,
         0xC09DE92BBC3902E0ULL, 0x929B3C79516BCBC1ULL, 0xE006E5BF738F27D1ULL, 0x2D9E1EC0EAC8EA38ULL,
         0x0984D8D94BF937C5ULL, 0x4959273C220E6747ULL, 0xFE1D934207E796FAULL, 0x2B9B9298F2F6DD73ULL
     },
-    { // Round 3
+    {
         0x07A1F5A67D6E3A41ULL, 0x4407593EE73743D9ULL, 0x9F054720EF802E59ULL, 0x78D4B711336E6AA6ULL,
         0xADC638AEF3C8B228ULL, 0xA4D6D3E86AFB2114ULL, 0x9D4808E725531968ULL, 0x369804DF3866D0EFULL,
         0xE6DBD9A9D2215024ULL, 0x8ED22CA212EE85B2ULL, 0x397BB882FCD23EB6ULL, 0xEB8F8786D7277531ULL,
         0x9999D4CDAFF543B5ULL, 0xF382A61217F192D6ULL, 0x49C37260B026ADC1ULL, 0x3FF8918CE35C1019ULL
     },
-    { // Round 4
+    {
         0x2E7DF8B76080BD07ULL, 0xF5DBAC250B8A28B9ULL, 0x853C3727AE9DA4CCULL, 0xB2F1F5F3D9E5A26DULL,
         0x3FCE22012D337847ULL, 0x6B5A3E6DB7EEE347ULL, 0x171582CD59DDE50DULL, 0xC0C0B3095EE62A8AULL,
         0x665B25C6F6A203D2ULL, 0x3099AED93B6AE69FULL, 0x801DF6092BE69C38ULL, 0x8066AD0CDFFF43CDULL,
@@ -67,15 +60,10 @@ __constant__ uint8_t LOOKUP_TABLE[256] = {
      15, 222,  82, 115,  70, 210,  27,  41,   1, 170,  40, 131, 192, 229, 248, 255
 };
 
-// d_gpu_range_start and d_gpu_range_size are defined in pow.cu
-
-// Now include tip5.cuh - it will see our constant definitions above
-// Skip extern declarations since we've already defined them
 #define TIP5_DEFINING_CONSTANTS
 #include "tip5.cuh"
 #undef TIP5_DEFINING_CONSTANTS
 
-// ===== HOST LOOKUP TABLES =====
 const uint8_t LOOKUP_TABLE_HOST[256] = {
     0,   7,  26,  63, 124, 215,  85, 254, 214, 228,  45, 185, 140, 173,  33, 240,
     29, 177, 176,  32,   8, 110,  87, 202, 204,  99, 150, 106, 230,  14, 235, 128,
@@ -101,31 +89,31 @@ const uint32_t MDS_COEFF_HOST[16] = {
 };
 
 const uint64_t ROUND_CONSTANTS_HOST[5][16] = {
-    { // Round 0
+    {
         0xBD2A3DEB61AB60DEULL, 0xEA7DF21AD9547ED2ULL, 0x900B3677A1DE063FULL, 0x1B46887E876C8677ULL,
         0xD364D977889CFB97ULL, 0xDC8DFAC843699F02ULL, 0x375C405D7190DB58ULL, 0x27924006D2B0D4B1ULL,
         0x78DD1172D483CD38ULL, 0x3346C66244882A56ULL, 0xB0249B279F498AA5ULL, 0x94CD51BE79338D4DULL,
         0xB0E0DC7052C5B218ULL, 0xF8DCC4D248ADAD95ULL, 0x68E3C635FEC868B7ULL, 0xD7D06B3FFB6B0D8CULL
     },
-    { // Round 1
+    {
         0xF3500DEA20EF032AULL, 0x4865BF175BBA5803ULL, 0xD5F7FE3027287A27ULL, 0xA57333F44E193412ULL,
         0x8726E153A977EAE2ULL, 0x3014A98463FC191BULL, 0xBA145461AF39B212ULL, 0x03AB70105933202FULL,
         0x3D90B7EEBFCF71E5ULL, 0x386322B1CC520BFDULL, 0x27C2C8DAF774F675ULL, 0x4FCB83F50309BC6AULL,
         0x5E6D5CE8275F3CB3ULL, 0xECC2F6592C8F905CULL, 0x837F532461E609B4ULL, 0xB2B1F6B95C92C93CULL
     },
-    { // Round 2
+    {
         0xC0027AF556411DC1ULL, 0x16E18C885FC2A26CULL, 0x8880EF183D9F2BF3ULL, 0xB2930BDB5CA88C45ULL,
         0x9C2EC8322E1C1553ULL, 0xE5B05EAF3220A674ULL, 0xA49CC6AE4B861C4EULL, 0x11708E0AEB86EBD7ULL,
         0xC09DE92BBC3902E0ULL, 0x929B3C79516BCBC1ULL, 0xE006E5BF738F27D1ULL, 0x2D9E1EC0EAC8EA38ULL,
         0x0984D8D94BF937C5ULL, 0x4959273C220E6747ULL, 0xFE1D934207E796FAULL, 0x2B9B9298F2F6DD73ULL
     },
-    { // Round 3
+    {
         0x07A1F5A67D6E3A41ULL, 0x4407593EE73743D9ULL, 0x9F054720EF802E59ULL, 0x78D4B711336E6AA6ULL,
         0xADC638AEF3C8B228ULL, 0xA4D6D3E86AFB2114ULL, 0x9D4808E725531968ULL, 0x369804DF3866D0EFULL,
         0xE6DBD9A9D2215024ULL, 0x8ED22CA212EE85B2ULL, 0x397BB882FCD23EB6ULL, 0xEB8F8786D7277531ULL,
         0x9999D4CDAFF543B5ULL, 0xF382A61217F192D6ULL, 0x49C37260B026ADC1ULL, 0x3FF8918CE35C1019ULL
     },
-    { // Round 4
+    {
         0x2E7DF8B76080BD07ULL, 0xF5DBAC250B8A28B9ULL, 0x853C3727AE9DA4CCULL, 0xB2F1F5F3D9E5A26DULL,
         0x3FCE22012D337847ULL, 0x6B5A3E6DB7EEE347ULL, 0x171582CD59DDE50DULL, 0xC0C0B3095EE62A8AULL,
         0x665B25C6F6A203D2ULL, 0x3099AED93B6AE69FULL, 0x801DF6092BE69C38ULL, 0x8066AD0CDFFF43CDULL,
@@ -133,22 +121,7 @@ const uint64_t ROUND_CONSTANTS_HOST[5][16] = {
     }
 };
 
-// ===== DEVICE HELPER FUNCTIONS =====
-// Note: These functions are defined inline in tip5.cuh to avoid duplication
-// Only implementations that need to be in .cu file are kept here
-
-// x7_computer, x7_computer_host, and split_lookup_shared are defined inline in tip5.cuh
-
-// split_lookup_host is defined inline in tip5.cuh
-
-// get_mds_coeff is defined inline in tip5.cuh
-
-// get_mds_coeff_host is defined inline in tip5.cuh
-
-// ===== TIP5 LAYER FUNCTIONS =====
-
 __device__ void generated_function(const uint64_t* input, uint64_t* output) {
-    // FFT butterfly network for 16-element circulant matrix
     uint64_t node_34 = input[0] + input[8];
     uint64_t node_38 = input[4] + input[12];
     uint64_t node_36 = input[2] + input[10];
@@ -390,19 +363,15 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        // Manual 64-bit arithmetic to avoid MSVC preprocessor issues with __uint128_t
-        // Calculate: (lo_out[i] >> 4) + (hi_out[i] << 28)
         uint64_t lo_part = lo_out[i] >> 4;
         uint64_t hi_part = hi_out[i] << 28;
         uint64_t s_lo = lo_part + hi_part;
         uint64_t s_hi = 0;
-        // Check for overflow
         if (s_lo < lo_part) {
-            s_hi = 1; // Carry from addition
+            s_hi = 1;
         }
-        // Add carry from hi_part if it overflowed
         if (hi_part > (UINT64_MAX - lo_part)) {
-            s_hi += (hi_part >> 36); // hi_out[i] << 28 can overflow, carry the high bits
+            s_hi += (hi_part >> 36);
         }
         
         uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
@@ -418,8 +387,6 @@ __device__ void round_constants_layer(int round_index, const uint64_t* state_in,
     }
 }
 
-// ===== HOST LAYER FUNCTIONS =====
-
 __host__ void sbox_layer_host(const uint64_t* state_in, uint64_t* state_out) {
     for (int i = 0; i < 4; ++i) {
         state_out[i] = split_lookup_host(state_in[i]);
@@ -434,14 +401,12 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out) {
     for (int i = 0; i < STATE_SIZE; ++i) {
 #ifdef _WIN32
         #ifdef _MSC_VER
-            // MSVC: Use 64-bit arithmetic with manual overflow handling
             uint64_t acc_low = 0;
             uint64_t acc_high = 0;
             for (int j = 0; j < STATE_SIZE; ++j) {
                 uint32_t coeff = get_mds_coeff_host(i, j);
                 unsigned __int64 high;
                 unsigned __int64 low = _umul128(state_in[j], coeff, &high);
-                // Add to accumulator with carry
                 uint64_t new_low = acc_low + low;
                 bool carry = (new_low < acc_low);
                 acc_low = new_low;
@@ -468,10 +433,8 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out) {
         uint64_t upper = (uint64_t)(acc >> 64);
 #endif
         
-        // CORRECTED field reduction with proper overflow handling
 #ifdef _WIN32
         #ifdef _MSC_VER
-            // MSVC: Manual 128-bit addition
             unsigned __int64 mul_high;
             unsigned __int64 mul_low = _umul128(upper, 0xFFFFFFFFULL, &mul_high);
             uint64_t new_low = lower + mul_low;
@@ -486,10 +449,8 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out) {
         uint64_t temp = (uint64_t)temp128;
 #endif
         
-        // Handle overflow from the addition
 #ifdef _WIN32
         #ifdef _MSC_VER
-            // MSVC: Check for overflow manually
             if (temp >= 0xFFFFFFFF00000001ULL) {
                 temp -= 0xFFFFFFFF00000001ULL;
             }
@@ -518,8 +479,6 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
     }
 }
 
-// ===== TIP5 PERMUTATION =====
-
 __device__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
     
@@ -547,9 +506,6 @@ __host__ void tip5_permutation_host(uint64_t* state) {
         }
     }
 }
-
-// ===== TIP5 SPONGE =====
-// tip5_sponge_init, tip5_sponge_absorb_chunk, and tip5_sponge_squeeze are defined inline in tip5.cuh
 
 __host__ void tip5_sponge_init_host(uint64_t* state, Domain domain) {
     for (int i = 0; i < STATE_SIZE; ++i) {
