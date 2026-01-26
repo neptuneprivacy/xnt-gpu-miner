@@ -57,10 +57,13 @@ bool NeptuneCudaMinerClient::submit_solution(
     
     json template_obj = last_template;
     std::string tip_digest = rpc_client->getTipDigest();
-    if (template_obj.contains("metadata")) {
-        std::string prev_block = template_obj["metadata"].value("prevBlock", "");
-        if (tip_digest != prev_block) {
-            return false;
+    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+        json metadata = template_obj["metadata"];
+        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+            std::string prev_block = metadata.value("prevBlock", "");
+            if (tip_digest != prev_block) {
+                return false;
+            }
         }
     }
     
@@ -77,8 +80,10 @@ bool NeptuneCudaMinerClient::submit_solution(
         return true;
     }
     
-    if (response.contains("error")) {
-        std::string error_msg = response["error"].value("message", "Unknown error");
+    if (response.contains("error") && !response["error"].is_null()) {
+        json error = response["error"];
+        std::string error_msg = (error.contains("message") && !error["message"].is_null())
+            ? error.value("message", "Unknown error") : "Unknown error";
         LOG_DEBUG("Submission error: " << error_msg);
     }
     

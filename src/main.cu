@@ -140,7 +140,16 @@ int main(int argc, char* argv[]) {
         startUnifiedMining(rpc_url, g_gpu_device_id);
     } catch (const std::exception& e) {
         Console::showCursor();
-        std::cerr << Color::RED << "Error: " << e.what() << Color::RESET << std::endl;
+        std::string error_msg = e.what();
+        // Replace full wallet address with shortened version in error messages
+        if (!g_miner_wallet_address.empty() && error_msg.find(g_miner_wallet_address) != std::string::npos) {
+            size_t pos = 0;
+            while ((pos = error_msg.find(g_miner_wallet_address, pos)) != std::string::npos) {
+                error_msg.replace(pos, g_miner_wallet_address.length(), shorten_address(g_miner_wallet_address));
+                pos += shorten_address(g_miner_wallet_address).length();
+            }
+        }
+        std::cerr << Color::RED << "Error: " << error_msg << Color::RESET << std::endl;
         return 1;
     }
     

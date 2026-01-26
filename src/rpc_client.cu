@@ -248,7 +248,8 @@ RpcError XntRpcClient::parse_rpc_error(const json& response) const {
     }
     
     json error = response["error"];
-    std::string message = error.value("message", "");
+    std::string message = (error.contains("message") && !error["message"].is_null()) 
+        ? error.value("message", "") : "";
     
     if (message.find("InvalidBlock") != std::string::npos) {
         return RpcError::InvalidBlock;
@@ -268,7 +269,8 @@ std::string XntRpcClient::get_error_message(const json& response) const {
     }
     
     json error = response["error"];
-    return error.value("message", "Unknown error");
+    return (error.contains("message") && !error["message"].is_null())
+        ? error.value("message", "Unknown error") : "Unknown error";
 }
 
 json XntRpcClient::getBlockTemplate(const std::string& guesser_address) {
@@ -344,39 +346,39 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
     PowPuzzle puzzle;
     
     try {
-        if (!template_response.contains("result") || 
-            !template_response["result"].contains("template") ||
-            template_response["result"]["template"].is_null()) {
+        if (!template_response.contains("result")) {
             return puzzle;
         }
         
-        json template_obj = template_response["result"]["template"];
+        json result = template_response["result"];
+        if (!result.contains("template") || result["template"].is_null()) {
+            return puzzle;
+        }
+        
+        json template_obj = result["template"];
         if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
             return puzzle;
         }
         
         json metadata = template_obj["metadata"];
-        
-        json pow_mast_paths;
-        if (metadata.contains("pow_mast_paths") && !metadata["pow_mast_paths"].is_null()) {
-            pow_mast_paths = metadata["pow_mast_paths"];
-        } else if (metadata.contains("powMastPaths") && !metadata["powMastPaths"].is_null()) {
-            pow_mast_paths = metadata["powMastPaths"];
-        } else {
+        if (!metadata.contains("powMastPaths") || metadata["powMastPaths"].is_null()) {
             return puzzle;
         }
         
-        auto safe_get_string = [](const json& obj, const std::string& key, const std::string& default_val) -> std::string {
-            if (obj.contains(key) && !obj[key].is_null() && obj[key].is_string()) {
-                return obj[key].get<std::string>();
-            }
-            return default_val;
-        };
+        json pow_mast_paths = metadata["powMastPaths"];
         
-        puzzle.id = safe_get_string(metadata, "digest", "");
-        puzzle.threshold = safe_get_string(metadata, "threshold", "");
-        puzzle.total_guesser_reward = safe_get_string(metadata, "totalGuesserReward", "");
-        puzzle.prev_block = safe_get_string(metadata, "prevBlock", "");
+        if (metadata.contains("digest") && !metadata["digest"].is_null()) {
+            puzzle.id = metadata.value("digest", "");
+        }
+        if (metadata.contains("threshold") && !metadata["threshold"].is_null()) {
+            puzzle.threshold = metadata.value("threshold", "");
+        }
+        if (metadata.contains("totalGuesserReward") && !metadata["totalGuesserReward"].is_null()) {
+            puzzle.total_guesser_reward = metadata.value("totalGuesserReward", "");
+        }
+        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+            puzzle.prev_block = metadata.value("prevBlock", "");
+        }
         
         if (pow_mast_paths.contains("pow") && pow_mast_paths["pow"].is_array()) {
             for (const auto& path : pow_mast_paths["pow"]) {

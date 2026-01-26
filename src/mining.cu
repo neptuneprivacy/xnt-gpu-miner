@@ -709,32 +709,24 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                 json template_response = client->getBlockTemplate();
                 
                 if (!template_response.empty() && template_response.contains("result")) {
-                    json template_obj = template_response["result"]["template"];
-                    if (template_obj.is_null() || !template_obj.contains("metadata")) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    json result = template_response["result"];
+                    if (!result.contains("template") || result["template"].is_null()) {
                         continue;
                     }
-                    
+                    json template_obj = result["template"];
+                    if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+                        continue;
+                    }
                     json metadata = template_obj["metadata"];
-                    if (metadata.is_null()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                        continue;
-                    }
-                    
-                    auto safe_get_string = [](const json& obj, const std::string& key, const std::string& default_val) -> std::string {
-                        if (obj.contains(key) && !obj[key].is_null() && obj[key].is_string()) {
-                            return obj[key].get<std::string>();
-                        }
-                        return default_val;
-                    };
-                    
-                    std::string template_id = safe_get_string(metadata, "digest", "");
+                    std::string template_id = metadata.contains("digest") && !metadata["digest"].is_null() 
+                        ? metadata.value("digest", "") : "";
                     
                     if (template_id != last_template_id && !template_id.empty()) {
                         XntRpcClient* rpc_client = client->get_rpc_client();
                         if (rpc_client) {
                             std::string tip_digest = rpc_client->getTipDigest();
-                            std::string prev_block = safe_get_string(metadata, "prevBlock", "");
+                            std::string prev_block = metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()
+                                ? metadata.value("prevBlock", "") : "";
                             
                             if (tip_digest == prev_block) {
                                 PowPuzzle puzzle = parseRpcTemplate(template_response);
