@@ -9,13 +9,13 @@ void print_usage(const char* program_name) {
     
     std::cerr << Color::BOLD << "Optional:" << Color::RESET << std::endl;
     std::cerr << "  -d, --device ID       Use specific GPU device ID (default: all GPUs)" << std::endl;
-    std::cerr << "  --rpc-url URL        RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
+    std::cerr << "  --rpc-url URL        RPC endpoint URL (default: http://127.0.0.1:9899)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
     std::cerr << "  " << program_name << " -w nolgam..." << std::endl;
     std::cerr << "  " << program_name << " --wallet nolgam... --device 0" << std::endl;
-    std::cerr << "  " << program_name << " -w nolgam... --rpc-url http://192.168.1.100:9897\n" << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --rpc-url http://192.168.1.100:9899\n" << std::endl;
 }
 
 void print_system_info() {
@@ -47,7 +47,7 @@ int main(int argc, char* argv[]) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     
-    std::string rpc_url = "http://127.0.0.1:9897";
+    std::string rpc_url = "http://127.0.0.1:9899";
     bool show_help = false;
     
     for (int i = 1; i < argc; ++i) {
@@ -75,7 +75,7 @@ int main(int argc, char* argv[]) {
                 std::string port = rpc_url.substr(port_start + 1);
                 rpc_url = "http://" + host + ":" + port;
             } else {
-                rpc_url = "http://" + host + ":9897";
+                rpc_url = "http://" + host + ":9899";
             }
         } else if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
             try {

@@ -34,7 +34,7 @@ private:
 
 public:
     NeptuneCudaMinerClient(
-        const std::string& rpc_url = "http://127.0.0.1:9897",
+        const std::string& rpc_url = "http://127.0.0.1:9899",
         const std::string& wallet_addr = "");
     
     ~NeptuneCudaMinerClient();
