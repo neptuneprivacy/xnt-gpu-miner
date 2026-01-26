@@ -351,7 +351,15 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
         
         json template_obj = template_response["result"]["template"];
         json metadata = template_obj["metadata"];
-        json pow_mast_paths = metadata["powMastPaths"];
+        
+        json pow_mast_paths;
+        if (metadata.contains("pow_mast_paths")) {
+            pow_mast_paths = metadata["pow_mast_paths"];
+        } else if (metadata.contains("powMastPaths")) {
+            pow_mast_paths = metadata["powMastPaths"];
+        } else {
+            return puzzle;
+        }
         
         puzzle.id = metadata.value("digest", "");
         puzzle.threshold = metadata.value("threshold", "");
