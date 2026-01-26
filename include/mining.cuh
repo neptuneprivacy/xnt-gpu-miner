@@ -26,7 +26,7 @@ public:
     UnifiedMiningController(
         int gpu_id, 
         GpuResources* resources,
-        const std::string& rpc_url = "http://127.0.0.1:9899");
+        const std::string& rpc_url = "http://127.0.0.1:9897");
     
     ~UnifiedMiningController();
     
@@ -61,7 +61,7 @@ private:
     
 public:
     MultiGpuManager(
-        const std::string& rpc_url = "http://127.0.0.1:9899",
+        const std::string& rpc_url = "http://127.0.0.1:9897",
         int specific_gpu = -1);
     
     ~MultiGpuManager();
@@ -87,7 +87,7 @@ private:
 };
 
 void startUnifiedMining(
-    const std::string& rpc_url = "http://127.0.0.1:9899",
+    const std::string& rpc_url = "http://127.0.0.1:9897",
     int specific_gpu = -1);
 
 void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller);
