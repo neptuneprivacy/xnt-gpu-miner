@@ -44,7 +44,7 @@ void UnifiedMiningController::start() {
         if (client_ptr->connect_to_node()) {
             connected = true;
             if (gpu_id == 0) {
-                std::cout << "Successfully connected to RPC server!" << std::endl;
+                std::cout << "Connected to node at " << rpc_url << std::endl;
             }
             break;
         }
@@ -52,10 +52,10 @@ void UnifiedMiningController::start() {
         retry_count++;
         
         if (gpu_id == 0) {
-            std::cout << "Connection attempt " << retry_count << " failed, retrying in 10 seconds..." << std::endl;
+            std::cout << "Connection attempt " << retry_count << " failed, retrying in 5 seconds..." << std::endl;
         }
         
-        for (int i = 0; i < 10 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
+        for (int i = 0; i < 5 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
@@ -772,18 +772,20 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                                     gpu_res->update_job_received();
                                     last_template_id = template_id;
                                     
-                                    // Log new job fetched
-                                    std::string short_id = template_id.length() > 20 
-                                        ? template_id.substr(0, 12) + "..." + template_id.substr(template_id.length() - 8) 
-                                        : template_id;
-                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::CYAN << Color::BOLD 
-                                              << "✓ New job fetched" << Color::RESET 
-                                              << " | Template ID: " << Color::CYAN << short_id << Color::RESET << std::endl;
+                                    if (gpu_res->gpu_id == 0) {
+                                        std::cout << "[GPU " << gpu_res->gpu_id << "] New block template received (digest: " 
+                                                  << template_id.substr(0, 16) << "...)" << std::endl;
+                                    }
                                 }
                             } else {
                                 LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");
                             }
                         }
+                    }
+                } else if (!template_response.empty() && template_response.contains("error")) {
+                    if (gpu_res->gpu_id == 0) {
+                        std::cerr << "[GPU " << gpu_res->gpu_id << "] RPC error: " 
+                                  << template_response["error"].value("message", "Unknown error") << std::endl;
                     }
                 }
                 
