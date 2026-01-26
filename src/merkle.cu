@@ -240,23 +240,15 @@ __global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = static_cast<uint32_t>(num_leafs);
     
-    // Each thread handles one output in the reduction layer
-    uint32_t stride = 1u << layer;
-    // mask was computed but never used - removed to eliminate warning
+    if (idx >= n) return;
     
-    if (idx >= (n >> (layer + 1))) return;
+    // Match Rust exactly: *leaf = Tip5::hash_pair(buds[k], buds[(k + (1 << i)) % NUM_LEAFS])
+    // For layer i, we hash buds[k] with buds[(k + (1 << i)) % NUM_LEAFS]
+    size_t k = idx;
+    size_t offset = 1ULL << layer;
+    size_t right_idx = (k + offset) % n;
     
-    // Find the two inputs to hash
-    size_t left_idx = (idx << 1) * stride;
-    size_t right_idx = left_idx + stride;
-    
-    if (layer == 0) {
-        // First layer: hash pairs of buds
-        leafs[idx] = tip5_hash_fixed_device(buds[left_idx], buds[right_idx]);
-    } else {
-        // Subsequent layers: hash pairs of previous layer outputs
-        leafs[idx] = tip5_hash_fixed_device(leafs[left_idx], leafs[right_idx]);
-    }
+    leafs[idx] = tip5_hash_fixed_device(buds[k], buds[right_idx]);
 }
 
 __global__ void __launch_bounds__(256) merkle_zip_kernel(

@@ -1,5 +1,6 @@
 #include "mining.cuh"
 #include "rpc_client.cuh"
+#include "common.cuh"
 
 UnifiedMiningController* g_mining_controller = nullptr;
 
@@ -37,15 +38,21 @@ void UnifiedMiningController::start() {
         
         if (!client_ptr) break;
         
+        if (gpu_id == 0) {
+            std::cout << "Attempting to connect to RPC server at " << rpc_url << "..." << std::endl;
+        }
         if (client_ptr->connect_to_node()) {
             connected = true;
+            if (gpu_id == 0) {
+                std::cout << "Successfully connected to RPC server!" << std::endl;
+            }
             break;
         }
         
         retry_count++;
         
         if (gpu_id == 0) {
-            LOG_DEBUG("Connection attempt " << retry_count << " failed, retrying...");
+            std::cout << "Connection attempt " << retry_count << " failed, retrying in 10 seconds..." << std::endl;
         }
         
         for (int i = 0; i < 10 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
@@ -55,7 +62,7 @@ void UnifiedMiningController::start() {
     
     if (!connected) {
         if (gpu_id == 0) {
-            std::cout << "Connection aborted" << std::endl;
+            std::cout << "Connection aborted after " << retry_count << " attempts" << std::endl;
         }
         
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
@@ -272,6 +279,13 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
     
     gpu_resources->update_job_received();
     gpu_resources->set_paused(false);
+    
+    // Log new job received
+    std::string short_id = puzzle.id.length() > 20 ? puzzle.id.substr(0, 12) + "..." + puzzle.id.substr(puzzle.id.length() - 8) : puzzle.id;
+    std::cout << "[GPU " << gpu_id << "] " << Color::CYAN << Color::BOLD 
+              << "✓ New job received" << Color::RESET 
+              << " | Template ID: " << Color::CYAN << short_id << Color::RESET << std::endl;
+    
     continuousMiningLoop(gpu_resources, this);
 }
 
@@ -533,6 +547,9 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
 bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* controller) {
     if (!gpu_res || !controller) return false;
     
+    auto last_status_time = std::chrono::steady_clock::now();
+    const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
+    
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
         if (gpu_res->gpu_pause_flag) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -581,10 +598,30 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
             gpu_res->hash_tracker.add(hashrate_ms);
         }
         
+        // Periodic status update
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_status_time >= STATUS_UPDATE_INTERVAL) {
+            double avg_hashrate = gpu_res->hash_tracker.get_average();
+            double hashrate_hps = avg_hashrate * 1000.0; // Convert from K nonces/ms to H/s
+            std::string hashrate_str = format_hashrate(hashrate_hps);
+            
+            uint64_t total_nonces = gpu_res->total_nonces_tested.load();
+            uint64_t solutions = gpu_res->solutions_found.load();
+            
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
+                      << "Mining..." << Color::RESET 
+                      << " | Hash Rate: " << Color::YELLOW << hashrate_str << Color::RESET
+                      << " | Nonces: " << total_nonces
+                      << " | Solutions: " << Color::CYAN << solutions << Color::RESET << std::endl;
+            
+            last_status_time = now;
+        }
+        
         if (result.has_value()) {
             gpu_res->solutions_found++;
-            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
-                      << "Solution found! Submitting..." << Color::RESET << std::endl;
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
+                      << "*** SOLUTION FOUND! ***" << Color::RESET 
+                      << " Submitting to node..." << std::endl;
             
             NeptuneCudaMinerClient* client = nullptr;
             {
@@ -604,11 +641,11 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
                 
                 if (accepted) {
                     std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
-                              << "*** BLOCK ACCEPTED! ***" << Color::RESET 
-                              << " Total blocks: " << gpu_res->solutions_found.load() << std::endl;
+                              << "*** ✓ BLOCK ACCEPTED! ✓ ***" << Color::RESET 
+                      << " | Total blocks mined: " << Color::GREEN << gpu_res->solutions_found.load() << Color::RESET << std::endl;
                 } else {
                     std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                              << "Block rejected (stale or invalid)" << Color::RESET << std::endl;
+                              << "✗ Block rejected (stale or invalid)" << Color::RESET << std::endl;
                 }
             } else {
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
@@ -734,6 +771,14 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                                     gpu_res->event_handler->postEvent(EventType::NEW_PUZZLE, "", puzzle_data);
                                     gpu_res->update_job_received();
                                     last_template_id = template_id;
+                                    
+                                    // Log new job fetched
+                                    std::string short_id = template_id.length() > 20 
+                                        ? template_id.substr(0, 12) + "..." + template_id.substr(template_id.length() - 8) 
+                                        : template_id;
+                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::CYAN << Color::BOLD 
+                                              << "✓ New job fetched" << Color::RESET 
+                                              << " | Template ID: " << Color::CYAN << short_id << Color::RESET << std::endl;
                                 }
                             } else {
                                 LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");

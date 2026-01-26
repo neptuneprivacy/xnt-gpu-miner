@@ -213,9 +213,8 @@ __host__ GuesserBuffer Pow::preprocess_gpu(const PowMastPaths& mast_auth_paths,
                                             const Digest& prev_block_digest,
                                             int consensus_rule_set,
                                             bool* cancel_flag) {
-    const char* mode_str = (consensus_rule_set == CONSENSUS_REBOOT) ? "Reboot" :
-                          (consensus_rule_set == CONSENSUS_HARDFORK_ALPHA) ? "HardforkAlpha" : "Xnt";
-    LOG_DEBUG("preprocess: starting (" << mode_str << " mode)");
+    // For mainnet blocks >= 15256, we always use CONSENSUS_XNT
+    LOG_DEBUG("preprocess: starting (XNT consensus mode)");
     
     int current_gpu = 0;
     cudaError_t cuda_error = cudaGetDevice(&current_gpu);
@@ -245,12 +244,9 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
                                                       bool* cancel_flag) {
     GuesserBuffer buffer;
     
-    Digest commitment;
-    if (consensus_rule_set == CONSENSUS_HARDFORK_ALPHA) {
-        commitment = prev_block_digest;
-    } else {
-        commitment = mast_auth_paths.commit();
-    }
+    // For mainnet blocks >= 15256, we use CONSENSUS_XNT
+    // Always use mast_auth_paths.commit() for XNT consensus
+    Digest commitment = mast_auth_paths.commit();
     
     buffer.hash = commitment;
     buffer.prev_block_digest = prev_block_digest;
@@ -311,20 +307,64 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         return GuesserBuffer();
     }
     
-    // Bit-reverse the leafs for proper tree layout
-    uint32_t log2_n = MERKLE_TREE_HEIGHT_;
-    int swapBlocks = (MERKLE_NUM_LEAFS / 2 + threadsPerBlock - 1) / threadsPerBlock;
-    bitreverse_swap_leafs_kernel<<<swapBlocks, threadsPerBlock>>>(
-        buffer.d_leafs, MERKLE_NUM_LEAFS, log2_n);
-    
-    sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        LOG_ERROR("bitreverse_swap_leafs_kernel sync", sync_err);
+    // Convert buds to leafs through NUM_BUD_LAYERS iterations
+    // This matches Rust: iterate log-many times to compute leafs from buds
+    // Allocate temporary buffer for intermediate results
+    Digest* d_temp_leafs = nullptr;
+    cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, MERKLE_NUM_LEAFS * sizeof(Digest));
+    if (temp_alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc temp_leafs", temp_alloc_err);
         buffer.cleanup();
         return GuesserBuffer();
     }
     
-    LOG_DEBUG("preprocess_high_vram: leafs bit-reversed");
+    Digest* current_buds = buffer.d_leafs;
+    Digest* current_leafs = d_temp_leafs;
+    
+    for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
+        if (cancel_flag && *cancel_flag) {
+            cudaFree(d_temp_leafs);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        
+        // Each layer processes all NUM_LEAFS elements
+        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
+        
+        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
+            current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
+        
+        sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            LOG_ERROR("compute_leafs_from_buds_kernel sync", sync_err);
+            cudaFree(d_temp_leafs);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        
+        // Swap pointers for next iteration
+        std::swap(current_buds, current_leafs);
+    }
+    
+    // After NUM_BUD_LAYERS iterations, final leafs are in current_buds
+    // Copy them to buffer.d_leafs if needed
+    if (current_buds != buffer.d_leafs) {
+        cudaMemcpy(buffer.d_leafs, current_buds, MERKLE_NUM_LEAFS * sizeof(Digest), 
+                   cudaMemcpyDeviceToDevice);
+    }
+    
+    cudaFree(d_temp_leafs);
+    LOG_DEBUG("preprocess_high_vram: buds converted to leafs");
+    
+    // Check for cancellation
+    if (cancel_flag && *cancel_flag) {
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    // For CONSENSUS_XNT (mainnet blocks >= 15256), no bit-reverse swap is needed
+    // Bit-reverse swap is only for HardforkAlpha, which we no longer use
+    LOG_DEBUG("preprocess_high_vram: using XNT consensus (no bit-reverse swap)");
     
     size_t current_count = MERKLE_NUM_LEAFS;
     const Digest* current_layer = buffer.d_leafs;

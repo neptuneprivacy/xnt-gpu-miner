@@ -103,6 +103,38 @@ static bool http_post(const std::string& url,
     while ((received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
         buffer[received] = '\0';
         response += buffer;
+        
+        // Check if we've received the complete response
+        size_t header_end = response.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            // Headers received, check Content-Length
+            std::string headers = response.substr(0, header_end);
+            size_t content_length_pos = headers.find("Content-Length:");
+            if (content_length_pos != std::string::npos) {
+                size_t len_start = content_length_pos + 15;
+                while (len_start < headers.length() && headers[len_start] == ' ') len_start++;
+                size_t len_end = len_start;
+                while (len_end < headers.length() && headers[len_end] >= '0' && headers[len_end] <= '9') len_end++;
+                if (len_end > len_start) {
+                    try {
+                        int content_length = std::stoi(headers.substr(len_start, len_end - len_start));
+                        size_t body_start = header_end + 4;
+                        if (response.length() - body_start >= static_cast<size_t>(content_length)) {
+                            break; // Received complete response
+                        }
+                    } catch (...) {
+                        // If parsing fails, continue reading
+                    }
+                }
+            }
+        }
+    }
+    
+    // recv returns 0 when connection is closed (normal)
+    // recv returns -1 on error (timeout or other error)
+    if (received < 0) {
+        close(sock);
+        return false;
     }
     
     close(sock);
@@ -428,7 +460,8 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
             }
         }
         
-        // Default consensus rule set
+        // For mainnet blocks >= 15256, we use CONSENSUS_XNT
+        // Since current block height is > 15256, always use XNT consensus
         puzzle.consensus_rule_set = CONSENSUS_XNT;
         
     } catch (const std::exception& e) {
