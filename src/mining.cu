@@ -39,16 +39,19 @@ void UnifiedMiningController::start() {
         
         if (client_ptr->connect_to_node()) {
             connected = true;
+            if (gpu_id == 0) {
+                std::cout << "Connected to node at " << rpc_url << std::endl;
+            }
             break;
         }
         
         retry_count++;
         
         if (gpu_id == 0) {
-            LOG_DEBUG("Connection attempt " << retry_count << " failed, retrying...");
+            std::cout << "Connection attempt " << retry_count << " failed, retrying in 5 seconds..." << std::endl;
         }
         
-        for (int i = 0; i < 10 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
+        for (int i = 0; i < 5 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
@@ -707,14 +710,31 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                 
                 if (!template_response.empty() && template_response.contains("result")) {
                     json template_obj = template_response["result"]["template"];
+                    if (template_obj.is_null() || !template_obj.contains("metadata")) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        continue;
+                    }
+                    
                     json metadata = template_obj["metadata"];
-                    std::string template_id = metadata.value("digest", "");
+                    if (metadata.is_null()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        continue;
+                    }
+                    
+                    auto safe_get_string = [](const json& obj, const std::string& key, const std::string& default_val) -> std::string {
+                        if (obj.contains(key) && !obj[key].is_null() && obj[key].is_string()) {
+                            return obj[key].get<std::string>();
+                        }
+                        return default_val;
+                    };
+                    
+                    std::string template_id = safe_get_string(metadata, "digest", "");
                     
                     if (template_id != last_template_id && !template_id.empty()) {
                         XntRpcClient* rpc_client = client->get_rpc_client();
                         if (rpc_client) {
                             std::string tip_digest = rpc_client->getTipDigest();
-                            std::string prev_block = metadata.value("prevBlock", "");
+                            std::string prev_block = safe_get_string(metadata, "prevBlock", "");
                             
                             if (tip_digest == prev_block) {
                                 PowPuzzle puzzle = parseRpcTemplate(template_response);
@@ -725,11 +745,21 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                                     gpu_res->event_handler->postEvent(EventType::NEW_PUZZLE, "", puzzle_data);
                                     gpu_res->update_job_received();
                                     last_template_id = template_id;
+                                    
+                                    if (gpu_res->gpu_id == 0) {
+                                        std::cout << "[GPU " << gpu_res->gpu_id << "] New block template received (digest: " 
+                                                  << template_id.substr(0, 16) << "...)" << std::endl;
+                                    }
                                 }
                             } else {
                                 LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");
                             }
                         }
+                    }
+                } else if (!template_response.empty() && template_response.contains("error")) {
+                    if (gpu_res->gpu_id == 0) {
+                        std::cerr << "[GPU " << gpu_res->gpu_id << "] RPC error: " 
+                                  << template_response["error"].value("message", "Unknown error") << std::endl;
                     }
                 }
                 

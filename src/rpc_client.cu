@@ -345,26 +345,38 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
     
     try {
         if (!template_response.contains("result") || 
-            !template_response["result"].contains("template")) {
+            !template_response["result"].contains("template") ||
+            template_response["result"]["template"].is_null()) {
             return puzzle;
         }
         
         json template_obj = template_response["result"]["template"];
+        if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+            return puzzle;
+        }
+        
         json metadata = template_obj["metadata"];
         
         json pow_mast_paths;
-        if (metadata.contains("pow_mast_paths")) {
+        if (metadata.contains("pow_mast_paths") && !metadata["pow_mast_paths"].is_null()) {
             pow_mast_paths = metadata["pow_mast_paths"];
-        } else if (metadata.contains("powMastPaths")) {
+        } else if (metadata.contains("powMastPaths") && !metadata["powMastPaths"].is_null()) {
             pow_mast_paths = metadata["powMastPaths"];
         } else {
             return puzzle;
         }
         
-        puzzle.id = metadata.value("digest", "");
-        puzzle.threshold = metadata.value("threshold", "");
-        puzzle.total_guesser_reward = metadata.value("totalGuesserReward", "");
-        puzzle.prev_block = metadata.value("prevBlock", "");
+        auto safe_get_string = [](const json& obj, const std::string& key, const std::string& default_val) -> std::string {
+            if (obj.contains(key) && !obj[key].is_null() && obj[key].is_string()) {
+                return obj[key].get<std::string>();
+            }
+            return default_val;
+        };
+        
+        puzzle.id = safe_get_string(metadata, "digest", "");
+        puzzle.threshold = safe_get_string(metadata, "threshold", "");
+        puzzle.total_guesser_reward = safe_get_string(metadata, "totalGuesserReward", "");
+        puzzle.prev_block = safe_get_string(metadata, "prevBlock", "");
         
         if (pow_mast_paths.contains("pow") && pow_mast_paths["pow"].is_array()) {
             for (const auto& path : pow_mast_paths["pow"]) {
