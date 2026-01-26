@@ -133,6 +133,14 @@ extern std::atomic<int> g_total_gpu_count;
 extern int g_gpu_device_id;
 extern std::mutex g_log_mutex;
 
+// Helper function to shorten wallet address for display
+inline std::string shorten_address(const std::string& addr, size_t prefix_len = 12, size_t suffix_len = 8) {
+    if (addr.length() <= prefix_len + suffix_len) {
+        return addr;
+    }
+    return addr.substr(0, prefix_len) + "..." + addr.substr(addr.length() - suffix_len);
+}
+
 static constexpr uint64_t DEFAULT_BATCH_SIZE = 262144ULL;
 
 namespace Console {
