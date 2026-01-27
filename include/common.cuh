@@ -143,23 +143,6 @@ inline std::string shorten_address(const std::string& addr, size_t prefix_len = 
 
 static constexpr uint64_t DEFAULT_BATCH_SIZE = 262144ULL;
 
-namespace Console {
-    inline void clearScreen() {
-        std::cout << "\033[2J\033[3J\033[H\033[0m" << std::flush;
-    }
-    
-    inline void moveCursor(int row, int col) {
-        std::cout << "\033[" << row << ";" << col << "H" << std::flush;
-    }
-    
-    inline void hideCursor() {
-        std::cout << "\033[?25l" << std::flush;
-    }
-    
-    inline void showCursor() {
-        std::cout << "\033[?25h" << std::flush;
-    }
-}
 
 inline void enable_ansi_colors() {
 #ifdef _WIN32
