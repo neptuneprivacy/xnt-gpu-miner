@@ -44,7 +44,7 @@ void UnifiedMiningController::start() {
         if (client_ptr->connect_to_node()) {
             connected = true;
             if (gpu_id == 0) {
-                std::cout << "Connected to node at " << rpc_url << std::endl;
+                std::cout << "Successfully connected to RPC server!" << std::endl;
             }
             break;
         }
@@ -52,10 +52,10 @@ void UnifiedMiningController::start() {
         retry_count++;
         
         if (gpu_id == 0) {
-            std::cout << "Connection attempt " << retry_count << " failed, retrying in 5 seconds..." << std::endl;
+            std::cout << "Connection attempt " << retry_count << " failed, retrying in 10 seconds..." << std::endl;
         }
         
-        for (int i = 0; i < 5 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
+        for (int i = 0; i < 10 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
@@ -74,14 +74,31 @@ void UnifiedMiningController::start() {
     
     gpu_resources->gpu_node_connected = true;
     
+    if (gpu_id == 0) {
+        std::cout << "Initializing CUDA..." << std::endl;
+    }
+    
     if (!initializeCuda()) {
+        if (gpu_id == 0) {
+            std::cout << Color::RED << "Failed to initialize CUDA for GPU " << gpu_id << Color::RESET << std::endl;
+        }
         LOG_DEBUG("Failed to initialize CUDA for GPU " << gpu_id);
         return;
+    }
+    
+    if (gpu_id == 0) {
+        std::cout << Color::GREEN << "CUDA initialized successfully" << Color::RESET << std::endl;
+        std::cout << "Starting mining controller..." << std::endl;
     }
     
     controller_running = true;
     fetcher_thread = std::thread(&UnifiedMiningController::fetcherLoop, this);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    if (gpu_id == 0) {
+        std::cout << "Mining loop started. Waiting for block proposals..." << std::endl;
+    }
+    
     miningLoop();
     
     if (fetcher_thread.joinable()) {
@@ -252,28 +269,30 @@ void UnifiedMiningController::miningLoop() {
 
 void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
     if (event.data.empty()) {
-        LOG_DEBUG("[GPU " << gpu_id << "] Empty puzzle data");
+        std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Empty puzzle data" << Color::RESET << std::endl;
         return;
     }
     
     PowPuzzle puzzle = parsePowPuzzle(event.data);
     if (!puzzle.is_valid()) {
-        LOG_DEBUG("[GPU " << gpu_id << "] Invalid puzzle");
+        std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Invalid puzzle from parsePowPuzzle" << Color::RESET << std::endl;
         return;
     }
     
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         if (puzzle.id == gpu_resources->current_proposal_id) {
-            return;
+            return;  // Same puzzle, skip
         }
         gpu_resources->current_proposal_id = puzzle.id;
     }
     
     resetNonceCounter(gpu_resources, puzzle.id);
     
+    std::cout << "[GPU " << gpu_id << "] Starting preprocessing..." << std::endl;
+    
     if (!preprocessPuzzle(puzzle, gpu_resources)) {
-        LOG_DEBUG("[GPU " << gpu_id << "] Preprocessing failed");
+        std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
         return;
     }
     
@@ -706,6 +725,10 @@ void install_signal_handlers() {
 void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
     if (!gpu_res || !controller) return;
     
+    if (gpu_res->gpu_id == 0) {
+        std::cout << "[Fetcher] Block proposal fetcher started" << std::endl;
+    }
+    
     const int POLL_INTERVAL_SEC = 5;
     auto last_poll_time = std::chrono::steady_clock::now();
     std::string last_template_id;
@@ -745,6 +768,16 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                 if (!template_response.empty() && template_response.contains("result")) {
                     json result = template_response["result"];
                     if (!result.contains("template") || result["template"].is_null()) {
+                        // Template is null - node may be syncing
+                        if (gpu_res->gpu_id == 0) {
+                            static auto last_null_log = std::chrono::steady_clock::now();
+                            auto now = std::chrono::steady_clock::now();
+                            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_null_log).count();
+                            if (elapsed >= 30) {  // Log every 30 seconds to avoid spam
+                                std::cout << "[Fetcher] Waiting for block proposal (node may be syncing)..." << std::endl;
+                                last_null_log = now;
+                            }
+                        }
                         continue;
                     }
                     json template_obj = result["template"];
@@ -759,23 +792,36 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                         XntRpcClient* rpc_client = client->get_rpc_client();
                         if (rpc_client) {
                             std::string tip_digest = rpc_client->getTipDigest();
-                            std::string prev_block = metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()
-                                ? metadata.value("prevBlock", "") : "";
+                            // Handle both snake_case (prev_block) and camelCase (prevBlock)
+                            std::string prev_block;
+                            if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+                                prev_block = metadata.value("prev_block", "");
+                            } else if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+                                prev_block = metadata.value("prevBlock", "");
+                            }
                             
                             if (tip_digest == prev_block) {
                                 PowPuzzle puzzle = parseRpcTemplate(template_response);
                                 
                                 if (puzzle.is_valid()) {
                                     client->cache_puzzle(template_obj);
-                                    std::string puzzle_data = template_obj.dump();
+                                    // Pass full response so parsePowPuzzle can find result.template
+                                    std::string puzzle_data = template_response.dump();
                                     gpu_res->event_handler->postEvent(EventType::NEW_PUZZLE, "", puzzle_data);
                                     gpu_res->update_job_received();
                                     last_template_id = template_id;
                                     
-                                    if (gpu_res->gpu_id == 0) {
-                                        std::cout << "[GPU " << gpu_res->gpu_id << "] New block template received (digest: " 
-                                                  << template_id.substr(0, 16) << "...)" << std::endl;
-                                    }
+                                    // Log block proposal accepted and queued for mining
+                                    std::string short_id = template_id.length() > 20 
+                                        ? template_id.substr(0, 12) + "..." + template_id.substr(template_id.length() - 8) 
+                                        : template_id;
+                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
+                                              << "✓ Block proposal accepted" << Color::RESET 
+                                              << " | Proposal ID: " << Color::CYAN << short_id << Color::RESET 
+                                              << " | Queued for preprocessing..." << std::endl;
+                                } else {
+                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
+                                              << "✗ Block proposal invalid (missing required fields)" << Color::RESET << std::endl;
                                 }
                             } else {
                                 LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");
@@ -784,20 +830,44 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                     }
                 } else if (!template_response.empty() && template_response.contains("error")) {
                     if (gpu_res->gpu_id == 0) {
-                        std::cerr << "[GPU " << gpu_res->gpu_id << "] RPC error: " 
-                                  << template_response["error"].value("message", "Unknown error") << std::endl;
+                        std::cerr << Color::RED << "[Fetcher] RPC error: " 
+                                  << template_response["error"].value("message", "Unknown error") 
+                                  << Color::RESET << std::endl;
+                    }
+                } else if (template_response.empty()) {
+                    if (gpu_res->gpu_id == 0) {
+                        static auto last_empty_log = std::chrono::steady_clock::now();
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_empty_log).count();
+                        if (elapsed >= 30) {
+                            std::cout << "[Fetcher] " << Color::YELLOW << "Empty response from RPC" << Color::RESET << std::endl;
+                            last_empty_log = now;
+                        }
                     }
                 }
                 
                 last_poll_time = std::chrono::steady_clock::now();
             } else {
                 if (!gpu_res->gpu_reconnection_in_progress) {
+                    if (gpu_res->gpu_id == 0) {
+                        static auto last_reconnect_log = std::chrono::steady_clock::now();
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_reconnect_log).count();
+                        if (elapsed >= 10) {
+                            std::cout << "[Fetcher] " << Color::YELLOW << "Not connected, attempting reconnect..." << Color::RESET << std::endl;
+                            last_reconnect_log = now;
+                        }
+                    }
                     gpu_res->event_handler->postEvent(EventType::RECONNECT);
                 }
             }
         }
         
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    
+    if (gpu_res->gpu_id == 0) {
+        std::cout << "[Fetcher] Block proposal fetcher stopped" << std::endl;
     }
 }
 

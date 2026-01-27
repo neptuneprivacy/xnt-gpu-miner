@@ -61,8 +61,8 @@ bool NeptuneCudaMinerClient::submit_solution(
         json metadata = template_obj["metadata"];
         if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
             std::string prev_block = metadata.value("prevBlock", "");
-            if (tip_digest != prev_block) {
-                return false;
+        if (tip_digest != prev_block) {
+            return false;
             }
         }
     }

@@ -249,8 +249,8 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     Digest commitment = mast_auth_paths.commit();
     
     buffer.hash = commitment;
-    buffer.prev_block_digest = prev_block_digest;
-    buffer.consensus_rule_set = consensus_rule_set;
+    buffer.prev_block_digest = prev_block_digest;  // Still needed for validation
+    buffer.consensus_rule_set = CONSENSUS_XNT;  // Always XNT for blocks >= 15256
     buffer.mast_paths = mast_auth_paths;
     buffer.num_leafs = MERKLE_NUM_LEAFS;
     
@@ -309,9 +309,11 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     
     // Convert buds to leafs through NUM_BUD_LAYERS iterations
     // This matches Rust: iterate log-many times to compute leafs from buds
-    // Allocate temporary buffer for intermediate results
+    // Optimize memory: allocate only half size since each layer halves the output
+    // The first layer outputs MERKLE_NUM_LEAFS/2 elements, which is the max we need
+    size_t temp_buffer_size = (MERKLE_NUM_LEAFS / 2) * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
-    cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, MERKLE_NUM_LEAFS * sizeof(Digest));
+    cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, temp_buffer_size);
     if (temp_alloc_err != cudaSuccess) {
         LOG_ERROR("cudaMalloc temp_leafs", temp_alloc_err);
         buffer.cleanup();
@@ -328,8 +330,9 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
             return GuesserBuffer();
         }
         
-        // Each layer processes all NUM_LEAFS elements
-        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
+        // Each layer outputs MERKLE_NUM_LEAFS >> (layer + 1) elements
+        size_t output_count = MERKLE_NUM_LEAFS >> (layer + 1);
+        int layerBlocks = (output_count + threadsPerBlock - 1) / threadsPerBlock;
         
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
@@ -342,14 +345,26 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
             return GuesserBuffer();
         }
         
-        // Swap pointers for next iteration
-        std::swap(current_buds, current_leafs);
+        // Alternate between temp buffer and main buffer for next iteration
+        // Even layers: write to temp, odd layers: write to buffer.d_leafs
+        if (layer < NUM_BUD_LAYERS - 1) {
+            if ((layer % 2) == 0) {
+                // Next layer (odd): read from temp, write to buffer
+                current_buds = d_temp_leafs;
+                current_leafs = buffer.d_leafs;
+            } else {
+                // Next layer (even): read from buffer, write to temp
+                current_buds = buffer.d_leafs;
+                current_leafs = d_temp_leafs;
+            }
+        }
     }
     
-    // After NUM_BUD_LAYERS iterations, final leafs are in current_buds
+    // After NUM_BUD_LAYERS iterations, final leafs are in current_leafs
     // Copy them to buffer.d_leafs if needed
-    if (current_buds != buffer.d_leafs) {
-        cudaMemcpy(buffer.d_leafs, current_buds, MERKLE_NUM_LEAFS * sizeof(Digest), 
+    if (current_leafs != buffer.d_leafs) {
+        size_t final_count = MERKLE_NUM_LEAFS >> NUM_BUD_LAYERS;
+        cudaMemcpy(buffer.d_leafs, current_leafs, final_count * sizeof(Digest), 
                    cudaMemcpyDeviceToDevice);
     }
     

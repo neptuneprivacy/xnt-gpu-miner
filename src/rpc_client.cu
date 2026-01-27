@@ -374,6 +374,10 @@ bool XntRpcClient::testConnection() {
     return make_rpc_request("chain_height", params, response);
 }
 
+// Track last logged proposal ID to avoid duplicate logs
+static std::string g_last_logged_proposal_id;
+static bool g_null_template_logged = false;
+
 PowPuzzle parseRpcTemplate(const json& template_response) {
     PowPuzzle puzzle;
     
@@ -384,7 +388,16 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
         
         json result = template_response["result"];
         if (!result.contains("template") || result["template"].is_null()) {
+            // Only log null template once to avoid spam
+            if (!g_null_template_logged) {
+                std::cout << "[RPC] " << Color::YELLOW << "Template is null (node may be syncing)" << Color::RESET << std::endl;
+                g_null_template_logged = true;
+            }
             return puzzle;
+        }
+        // Reset null template flag when we get a valid template
+        if (g_null_template_logged) {
+            g_null_template_logged = false;
         }
         
         json template_obj = result["template"];
@@ -392,23 +405,45 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
             return puzzle;
         }
         
+        // Match Rust structure: RpcBlockTemplateMetadata
+        // Fields: digest, prev_block, threshold, total_guesser_reward, pow_mast_paths
         json metadata = template_obj["metadata"];
-        if (!metadata.contains("powMastPaths") || metadata["powMastPaths"].is_null()) {
+        
+        // Handle both snake_case (pow_mast_paths) and camelCase (powMastPaths)
+        json pow_mast_paths;
+        if (metadata.contains("pow_mast_paths") && !metadata["pow_mast_paths"].is_null()) {
+            pow_mast_paths = metadata["pow_mast_paths"];
+        } else if (metadata.contains("powMastPaths") && !metadata["powMastPaths"].is_null()) {
+            pow_mast_paths = metadata["powMastPaths"];
+        } else {
             return puzzle;
         }
         
-        json pow_mast_paths = metadata["powMastPaths"];
-        
+        // Extract proposal/template ID (digest field)
+        // This is the unique identifier for this block template
         if (metadata.contains("digest") && !metadata["digest"].is_null()) {
             puzzle.id = metadata.value("digest", "");
+        } else {
+            // If digest is missing, template is invalid
+            return puzzle;
         }
+        // Extract threshold (target digest for PoW solution)
         if (metadata.contains("threshold") && !metadata["threshold"].is_null()) {
             puzzle.threshold = metadata.value("threshold", "");
+        } else {
+            // Threshold is required for mining
+            return puzzle;
         }
-        if (metadata.contains("totalGuesserReward") && !metadata["totalGuesserReward"].is_null()) {
+        // Handle both snake_case (total_guesser_reward) and camelCase (totalGuesserReward)
+        if (metadata.contains("total_guesser_reward") && !metadata["total_guesser_reward"].is_null()) {
+            puzzle.total_guesser_reward = metadata.value("total_guesser_reward", "");
+        } else if (metadata.contains("totalGuesserReward") && !metadata["totalGuesserReward"].is_null()) {
             puzzle.total_guesser_reward = metadata.value("totalGuesserReward", "");
         }
-        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+        // Handle both snake_case (prev_block) and camelCase (prevBlock)
+        if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+            puzzle.prev_block = metadata.value("prev_block", "");
+        } else if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
             puzzle.prev_block = metadata.value("prevBlock", "");
         }
         
@@ -464,7 +499,27 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
         // Since current block height is > 15256, always use XNT consensus
         puzzle.consensus_rule_set = CONSENSUS_XNT;
         
+        // Only log when we get a NEW block proposal (different proposal ID)
+        // This matches the Rust RpcBlockTemplateMetadata structure
+        if (puzzle.id != g_last_logged_proposal_id && !puzzle.id.empty()) {
+            g_last_logged_proposal_id = puzzle.id;
+            
+            std::string short_id = puzzle.id.length() > 20 
+                ? puzzle.id.substr(0, 12) + "..." + puzzle.id.substr(puzzle.id.length() - 8) 
+                : puzzle.id;
+            
+            std::cout << "[RPC] " << Color::GREEN << Color::BOLD << "✓ Block proposal received" << Color::RESET << std::endl
+                      << "  Proposal ID: " << Color::CYAN << short_id << Color::RESET << std::endl
+                      << "  Threshold: " << puzzle.threshold.substr(0, 16) << "..." << std::endl
+                      << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl
+                      << "  Reward: " << puzzle.total_guesser_reward << std::endl
+                      << "  MAST Paths: pow=" << puzzle.auth_paths.pow.size() 
+                      << ", header=" << puzzle.auth_paths.header.size()
+                      << ", kernel=" << puzzle.auth_paths.kernel.size() << std::endl;
+        }
+        
     } catch (const std::exception& e) {
+        std::cout << "[RPC] " << Color::RED << "✗ Failed to parse block proposal: " << e.what() << Color::RESET << std::endl;
         LOG_DEBUG("Failed to parse RPC template: " << e.what());
     }
     
