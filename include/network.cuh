@@ -48,7 +48,8 @@ public:
     bool submit_solution(
         const std::string& proposal_id,
         const Pow& pow_solution,
-        const Digest& solution_hash);
+        const Digest& solution_hash,
+        const json& template_obj);
     
     json getBlockTemplate();
     void cache_puzzle(const json& template_obj);

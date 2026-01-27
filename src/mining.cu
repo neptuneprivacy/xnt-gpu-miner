@@ -279,12 +279,22 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
         return;
     }
     
+    // Parse and store the template for this proposal
+    json template_response = json::parse(event.data);
+    json template_obj;
+    if (template_response.contains("result") && template_response["result"].contains("template")) {
+        template_obj = template_response["result"]["template"];
+    } else if (template_response.contains("template")) {
+        template_obj = template_response["template"];
+    }
+    
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         if (puzzle.id == gpu_resources->current_proposal_id) {
             return;  // Same puzzle, skip
         }
         gpu_resources->current_proposal_id = puzzle.id;
+        gpu_resources->current_template = template_obj;  // Store template for this proposal
         // Make target 100000x easier for testing
         Digest original_target = hex_to_digest(puzzle.threshold);
         gpu_resources->current_real_target = original_target;
@@ -740,10 +750,18 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
                 PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
                 Digest solution_hash = mast_paths.fast_mast_hash(result.value());
                 
+                // Get the template for this proposal
+                json template_obj;
+                {
+                    std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                    template_obj = gpu_res->current_template;
+                }
+                
                 bool accepted = client->submit_solution(
                     proposal_id,
                     result.value(),
-                    solution_hash
+                    solution_hash,
+                    template_obj
                 );
                 
                 if (accepted) {

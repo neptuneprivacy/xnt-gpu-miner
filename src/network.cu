@@ -45,17 +45,17 @@ json NeptuneCudaMinerClient::getBlockTemplate() {
 bool NeptuneCudaMinerClient::submit_solution(
     const std::string& proposal_id,
     const Pow& pow_solution,
-    const Digest& solution_hash) {
+    const Digest& solution_hash,
+    const json& template_obj) {
     
     if (!rpc_client) {
         return false;
     }
     
-    if (!has_last_template) {
+    if (template_obj.is_null() || template_obj.empty()) {
+        std::cout << "[SUBMIT] ERROR: No template provided for proposal " << proposal_id << std::endl;
         return false;
     }
-    
-    json template_obj = last_template;
     std::string tip_digest = rpc_client->getTipDigest();
     
     // Check if template is stale

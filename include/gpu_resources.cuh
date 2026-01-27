@@ -173,6 +173,7 @@ struct GpuResources {
     
     HashRateTracker hash_tracker;
     std::string current_proposal_id;
+    json current_template;  // Store template for current proposal to ensure correct appendix
     Digest current_target;
     Digest current_real_target;
     Digest cached_prev_block;  // Track last preprocessed prev_block to avoid re-preprocessing
