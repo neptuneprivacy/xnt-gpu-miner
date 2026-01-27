@@ -285,11 +285,12 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
             return;  // Same puzzle, skip
         }
         gpu_resources->current_proposal_id = puzzle.id;
-        // Make target 10000x easier for testing
+        // Make target 100000x easier for testing
         Digest original_target = hex_to_digest(puzzle.threshold);
-        gpu_resources->current_target = make_target_easier(original_target, 10000);
+        gpu_resources->current_real_target = original_target;
+        gpu_resources->current_target = make_target_easier(original_target, 100000);
         std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
-                  << "TEST MODE: Target made 10000x easier" << Color::RESET << std::endl;
+                  << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
     }
     
     resetNonceCounter(gpu_resources, puzzle.id);
@@ -621,9 +622,9 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
         return false;
     }
     
-    // Make target 10000x easier for testing
+    // Make target 100000x easier for testing
     Digest original_target = hex_to_digest(puzzle.threshold);
-    Digest target = make_target_easier(original_target, 10000);
+    Digest target = make_target_easier(original_target, 100000);
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
     

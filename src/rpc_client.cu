@@ -44,17 +44,13 @@ static bool http_post(const std::string& url,
         }
     }
     
-    std::cout << "[HTTP] Connecting to " << host << ":" << port << " path: " << path << std::endl;
-    
     socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET_VALUE) {
-        std::cout << "[HTTP] ERROR: socket() failed" << std::endl;
         return false;
     }
     
     struct hostent* host_entry = gethostbyname(host.c_str());
     if (!host_entry) {
-        std::cout << "[HTTP] ERROR: gethostbyname() failed for " << host << std::endl;
         close(sock);
         return false;
     }
@@ -66,12 +62,9 @@ static bool http_post(const std::string& url,
     memcpy(&server_addr.sin_addr, host_entry->h_addr, host_entry->h_length);
     
     if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR_VALUE) {
-        std::cout << "[HTTP] ERROR: connect() failed" << std::endl;
         close(sock);
         return false;
     }
-    
-    std::cout << "[HTTP] Connected successfully" << std::endl;
     
     #ifdef _WIN32
         DWORD timeout = timeout_sec * 1000;
@@ -98,16 +91,11 @@ static bool http_post(const std::string& url,
     request << body;
     
     std::string request_str = request.str();
-    std::cout << "[HTTP] Sending request (" << request_str.length() << " bytes)" << std::endl;
-    std::cout << "[HTTP] Request (first 500 chars): " << request_str.substr(0, 500) << std::endl;
     
     if (send(sock, request_str.c_str(), request_str.length(), 0) == SOCKET_ERROR_VALUE) {
-        std::cout << "[HTTP] ERROR: send() failed" << std::endl;
         close(sock);
         return false;
     }
-    
-    std::cout << "[HTTP] Request sent, waiting for response..." << std::endl;
     
     response.clear();
     char buffer[4096];
@@ -145,18 +133,14 @@ static bool http_post(const std::string& url,
     // recv returns 0 when connection is closed (normal)
     // recv returns -1 on error (timeout or other error)
     if (received < 0) {
-        std::cout << "[HTTP] ERROR: recv() failed (timeout or error)" << std::endl;
         close(sock);
         return false;
     }
     
-    std::cout << "[HTTP] Received " << response.length() << " bytes total" << std::endl;
     close(sock);
     
     size_t header_end = response.find("\r\n\r\n");
     if (header_end == std::string::npos) {
-        std::cout << "[HTTP] ERROR: No header/body separator found" << std::endl;
-        std::cout << "[HTTP] Response received: " << response << std::endl;
         return false;
     }
     
@@ -166,20 +150,13 @@ static bool http_post(const std::string& url,
     }
     
     std::string status_line = response.substr(0, status_line_end);
-    std::cout << "[HTTP] Status line: " << status_line << std::endl;
     
     if (status_line.find("HTTP/1.1 200") == std::string::npos &&
         status_line.find("HTTP/1.0 200") == std::string::npos) {
-        std::cout << "[HTTP] ERROR: Non-200 status code!" << std::endl;
-        std::cout << "[HTTP] Full response: " << response << std::endl;
         return false;
     }
     
-    std::string response_body = response.substr(header_end + 4);
-    std::cout << "[HTTP] Response body length: " << response_body.length() << " bytes" << std::endl;
-    std::cout << "[HTTP] Response body (first 500 chars): " << response_body.substr(0, 500) << std::endl;
-    
-    response = response_body;
+    response = response.substr(header_end + 4);
     
     return true;
 }
@@ -242,40 +219,53 @@ bool XntRpcClient::make_rpc_request(const std::string& method,
     std::string auth_header = build_auth_header();
     std::string http_response;
     
-    std::cout << "[RPC] HTTP POST to: " << config.url << std::endl;
-    std::cout << "[RPC] Method: " << method << std::endl;
-    std::cout << "[RPC] Request body length: " << request_body.length() << " bytes" << std::endl;
+    // Only log for submitBlock
+    bool is_submit = (method == "mining_submitBlock");
+    if (is_submit) {
+        std::cout << "[SUBMIT] Sending mining_submitBlock request..." << std::endl;
+    }
     
     if (!http_post(config.url, request_body, auth_header, http_response, config.timeout_sec)) {
-        std::cout << "[RPC] http_post() returned false" << std::endl;
-        std::cout << "[RPC] HTTP response received: " << (http_response.empty() ? "(empty)" : http_response.substr(0, 500)) << std::endl;
+        if (is_submit) {
+            std::cout << "[SUBMIT] ERROR: HTTP request failed" << std::endl;
+        }
         last_error = RpcError::ConnectionFailed;
         last_error_message = "HTTP request failed";
         return false;
     }
     
-    std::cout << "[RPC] http_post() returned true" << std::endl;
-    std::cout << "[RPC] HTTP response length: " << http_response.length() << " bytes" << std::endl;
-    std::cout << "[RPC] HTTP response (first 1000 chars): " << http_response.substr(0, 1000) << std::endl;
-    
     try {
         response = json::parse(http_response);
-        std::cout << "[RPC] JSON parsed successfully" << std::endl;
         
         if (response.contains("error")) {
-            std::cout << "[RPC] Response contains error field" << std::endl;
+            if (is_submit) {
+                json error = response["error"];
+                std::string error_code = (error.contains("code") && !error["code"].is_null())
+                    ? std::to_string(error["code"].get<int>()) : "unknown";
+                std::string error_msg = (error.contains("message") && !error["message"].is_null())
+                    ? error.value("message", "Unknown error") : "Unknown error";
+                std::cout << "[SUBMIT] ERROR: Code=" << error_code << ", Message=" << error_msg << std::endl;
+                if (error.contains("data") && !error["data"].is_null()) {
+                    std::cout << "[SUBMIT] Error data: " << error["data"].dump() << std::endl;
+                }
+            }
             last_error = parse_rpc_error(response);
             last_error_message = get_error_message(response);
             return false;
         }
         
-        std::cout << "[RPC] Response OK, no error field" << std::endl;
+        if (is_submit) {
+            std::cout << "[SUBMIT] Response: " << response.dump() << std::endl;
+        }
+        
         last_error = RpcError::None;
         last_error_message = "";
         return true;
     } catch (const std::exception& e) {
-        std::cout << "[RPC] JSON parse exception: " << e.what() << std::endl;
-        std::cout << "[RPC] HTTP response that failed to parse: " << http_response << std::endl;
+        if (is_submit) {
+            std::cout << "[SUBMIT] ERROR: JSON parse failed - " << e.what() << std::endl;
+            std::cout << "[SUBMIT] Raw response: " << http_response << std::endl;
+        }
         last_error = RpcError::InvalidResponse;
         last_error_message = std::string("JSON parse error: ") + e.what();
         return false;
@@ -357,28 +347,17 @@ json XntRpcClient::getBlockTemplate(const std::string& guesser_address) {
 }
 
 json XntRpcClient::submitBlock(const json& template_obj, const json& pow) {
-    json params = json::object();
-    params["template"] = template_obj;
-    params["pow"] = pow;
-    
-    std::cout << "[RPC] Calling mining_submitBlock..." << std::endl;
-    std::cout << "[RPC] Request params size: template=" << template_obj.dump().length() 
-              << " bytes, pow=" << pow.dump().length() << " bytes" << std::endl;
+    // JSON-RPC server expects params as an array: [template, pow]
+    json params = json::array();
+    params.push_back(template_obj);
+    params.push_back(pow);
     
     json response;
-    bool success = make_rpc_request("mining_submitBlock", params, response);
-    
-    if (!success) {
-        std::cout << "[RPC] make_rpc_request FAILED" << std::endl;
-        std::cout << "[RPC] Last error: " << static_cast<int>(last_error) << std::endl;
-        std::cout << "[RPC] Last error message: " << last_error_message << std::endl;
-        std::cout << "[RPC] Response (raw): " << response.dump() << std::endl;
-        return json();
+    if (make_rpc_request("mining_submitBlock", params, response)) {
+        return response;
     }
     
-    std::cout << "[RPC] make_rpc_request SUCCESS" << std::endl;
-    std::cout << "[RPC] Response: " << response.dump() << std::endl;
-    return response;
+    return json();
 }
 
 uint64_t XntRpcClient::getChainHeight() {
@@ -579,18 +558,21 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
 
 json powToRpcFormat(const Pow& pow_solution, const Digest& solution_hash) {
     json pow_json;
+
+    // Digests are serialized as hex strings in the JSON-RPC API
     pow_json["root"] = digest_to_hex(solution_hash);
-    
+
     pow_json["pathA"] = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         pow_json["pathA"].push_back(digest_to_hex(pow_solution.path_a[i]));
     }
-    
+
     pow_json["pathB"] = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         pow_json["pathB"].push_back(digest_to_hex(pow_solution.path_b[i]));
     }
-    
+
     pow_json["nonce"] = digest_to_hex(pow_solution.nonce);
+
     return pow_json;
 }

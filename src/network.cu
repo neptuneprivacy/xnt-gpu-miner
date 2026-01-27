@@ -57,51 +57,53 @@ bool NeptuneCudaMinerClient::submit_solution(
     
     json template_obj = last_template;
     std::string tip_digest = rpc_client->getTipDigest();
+    
+    // Check if template is stale
     if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
         json metadata = template_obj["metadata"];
+        std::string prev_block;
         if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
-            std::string prev_block = metadata.value("prevBlock", "");
-        if (tip_digest != prev_block) {
+            prev_block = metadata.value("prevBlock", "");
+        } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+            prev_block = metadata.value("prev_block", "");
+        }
+
+        if (!prev_block.empty() && tip_digest != prev_block) {
+            std::string short_prev = prev_block.length() > 20 ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) : prev_block;
+            std::string short_tip = tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest;
+            std::cout << "[SUBMIT] Template stale: prev_block=" << short_prev << " != tip=" << short_tip << std::endl;
             return false;
-            }
         }
     }
     
+    // Extract the block from template (RpcBlockTemplate has "block" and "metadata" fields)
+    // SubmitBlockRequest expects: { template: RpcBlock, pow: RpcBlockPow }
+    if (!template_obj.contains("block") || template_obj["block"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Template missing 'block' field" << std::endl;
+        return false;
+    }
+    
+    json block_obj = template_obj["block"];
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
     
     // Log submission details
-    std::cout << "[SUBMIT] Submitting solution for proposal: " << proposal_id << std::endl;
-    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
-        json metadata = template_obj["metadata"];
-        if (metadata.contains("digest") && !metadata["digest"].is_null()) {
-            std::string digest = metadata.value("digest", "");
-            std::string short_digest = digest.length() > 20 ? digest.substr(0, 12) + "..." + digest.substr(digest.length() - 8) : digest;
-            std::cout << "[SUBMIT] Template digest: " << short_digest << std::endl;
-        }
-        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
-            std::string prev = metadata.value("prevBlock", "");
-            std::string short_prev = prev.length() > 20 ? prev.substr(0, 12) + "..." + prev.substr(prev.length() - 8) : prev;
-            std::cout << "[SUBMIT] Previous block: " << short_prev << " | Tip: " << (tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest) << std::endl;
-        }
-    }
+    std::string short_id = proposal_id.length() > 20 ? proposal_id.substr(0, 12) + "..." + proposal_id.substr(proposal_id.length() - 8) : proposal_id;
+    std::cout << "[SUBMIT] Submitting solution for proposal: " << short_id << std::endl;
     
-    json response = rpc_client->submitBlock(template_obj, pow_json);
-    
-    // Log full response
-    std::cout << "[SUBMIT] RPC Response: " << response.dump() << std::endl;
+    json response = rpc_client->submitBlock(block_obj, pow_json);
     
     if (!response.empty() && response.contains("result")) {
         if (response["result"].is_boolean()) {
             bool success = response["result"].get<bool>();
-            std::cout << "[SUBMIT] Result (boolean): " << (success ? "SUCCESS" : "FAILED") << std::endl;
+            std::cout << "[SUBMIT] " << (success ? "✓ ACCEPTED" : "✗ REJECTED") << std::endl;
             return success;
         }
         if (response["result"].contains("success")) {
             bool success = response["result"]["success"].get<bool>();
-            std::cout << "[SUBMIT] Result (success field): " << (success ? "SUCCESS" : "FAILED") << std::endl;
+            std::cout << "[SUBMIT] " << (success ? "✓ ACCEPTED" : "✗ REJECTED") << std::endl;
             return success;
         }
-        std::cout << "[SUBMIT] Result present but format unknown" << std::endl;
+        std::cout << "[SUBMIT] ✓ ACCEPTED (result present)" << std::endl;
         return true;
     }
     
@@ -111,13 +113,12 @@ bool NeptuneCudaMinerClient::submit_solution(
             ? error.value("message", "Unknown error") : "Unknown error";
         std::string error_code = (error.contains("code") && !error["code"].is_null())
             ? std::to_string(error["code"].get<int>()) : "unknown";
-        std::cout << "[SUBMIT] ERROR: Code=" << error_code << ", Message=" << error_msg << std::endl;
+        std::cout << "[SUBMIT] ✗ REJECTED: " << error_msg << " (code=" << error_code << ")" << std::endl;
         if (error.contains("data") && !error["data"].is_null()) {
-            std::cout << "[SUBMIT] Error data: " << error["data"].dump() << std::endl;
+            std::cout << "[SUBMIT]   Details: " << error["data"].dump() << std::endl;
         }
-        LOG_DEBUG("Submission error: " << error_msg);
     } else {
-        std::cout << "[SUBMIT] No result or error in response" << std::endl;
+        std::cout << "[SUBMIT] ✗ REJECTED: No response from server" << std::endl;
     }
     
     return false;
