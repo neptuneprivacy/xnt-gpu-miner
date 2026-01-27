@@ -209,7 +209,17 @@ __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
         uint8_t byte = (reduced_in >> (i * 8)) & 0xFF;
         sbox_out |= static_cast<uint64_t>(LOOKUP_TABLE_HOST[byte]) << (i * 8);
     }
-    return x7_computer_host(sbox_out);
+    
+#ifdef _WIN32
+    #ifdef _MSC_VER
+        host_uint128 stage3(sbox_out, 0);
+    #else
+        __uint128_t stage3 = static_cast<__uint128_t>(sbox_out);
+    #endif
+#else
+    __uint128_t stage3 = static_cast<__uint128_t>(sbox_out);
+#endif
+    return montyred_host(stage3);
 }
 
 __device__ __forceinline__ uint32_t get_mds_coeff(int i, int j) {
