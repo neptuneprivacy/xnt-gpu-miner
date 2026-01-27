@@ -367,12 +367,19 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
     }
     
     if (need_preprocess) {
-        std::cout << "[GPU " << gpu_id << "] Starting preprocessing..." << std::endl;
+        auto preprocess_start = std::chrono::steady_clock::now();
         
         if (!preprocessPuzzle(puzzle, gpu_resources)) {
             std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
             return;
         }
+        
+        auto preprocess_end = std::chrono::steady_clock::now();
+        auto preprocess_duration = std::chrono::duration_cast<std::chrono::milliseconds>(preprocess_end - preprocess_start).count();
+        double preprocess_seconds = preprocess_duration / 1000.0;
+        
+        std::cout << "[GPU " << gpu_id << "] " << Color::GREEN << "Finished preprocessing" << Color::RESET 
+                  << " (" << std::fixed << std::setprecision(2) << preprocess_seconds << "s)" << std::endl;
         
         // Update cache
         {
@@ -723,13 +730,16 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
             std::string hashrate_str = format_hashrate(hashrate_hps);
             
             uint64_t total_nonces = gpu_res->total_nonces_tested.load();
-            uint64_t solutions = gpu_res->solutions_found.load();
+            uint64_t accepted = gpu_res->solutions_accepted.load();
+            uint64_t rejected = gpu_res->solutions_rejected.load();
             
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
                       << "Mining..." << Color::RESET 
                       << " | Hash Rate: " << Color::YELLOW << hashrate_str << Color::RESET
                       << " | Nonces: " << total_nonces
-                      << " | Solutions: " << Color::CYAN << solutions << Color::RESET << std::endl;
+                      << " | " << Color::GREEN << accepted << Color::RESET 
+                      << " / " << Color::RED << rejected << Color::RESET 
+                      << " (success / reject)" << std::endl;
             
             last_status_time = now;
         }
@@ -765,14 +775,15 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
                 );
                 
                 if (accepted) {
+                    gpu_res->solutions_accepted++;
                     std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
                               << "*** ✓ BLOCK ACCEPTED! ✓ ***" << Color::RESET 
-                      << " | Total blocks mined: " << Color::GREEN << gpu_res->solutions_found.load() << Color::RESET << std::endl;
+                      << " | Total blocks mined: " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET << std::endl;
                 } else {
-                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                              << "✗ Block rejected (stale or invalid)" << Color::RESET << std::endl;
+                    gpu_res->solutions_rejected++;
                 }
             } else {
+                gpu_res->solutions_rejected++;
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
                           << "Cannot submit - not connected to node" << Color::RESET << std::endl;
             }
@@ -917,14 +928,6 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                                     gpu_res->update_job_received();
                                     last_template_id = template_id;
                                     
-                                    // Log block proposal accepted and queued for mining
-                                    std::string short_id = template_id.length() > 20 
-                                        ? template_id.substr(0, 12) + "..." + template_id.substr(template_id.length() - 8) 
-                                        : template_id;
-                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
-                                              << "✓ Block proposal accepted" << Color::RESET 
-                                              << " | Proposal ID: " << Color::CYAN << short_id << Color::RESET 
-                                              << " | Queued for preprocessing..." << std::endl;
                                 } else {
                                     std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
                                               << "✗ Block proposal invalid (missing required fields)" << Color::RESET << std::endl;

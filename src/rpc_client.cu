@@ -219,16 +219,7 @@ bool XntRpcClient::make_rpc_request(const std::string& method,
     std::string auth_header = build_auth_header();
     std::string http_response;
     
-    // Only log for submitBlock
-    bool is_submit = (method == "mining_submitBlock");
-    if (is_submit) {
-        std::cout << "[SUBMIT] Sending mining_submitBlock request..." << std::endl;
-    }
-    
     if (!http_post(config.url, request_body, auth_header, http_response, config.timeout_sec)) {
-        if (is_submit) {
-            std::cout << "[SUBMIT] ERROR: HTTP request failed" << std::endl;
-        }
         last_error = RpcError::ConnectionFailed;
         last_error_message = "HTTP request failed";
         return false;
@@ -238,34 +229,15 @@ bool XntRpcClient::make_rpc_request(const std::string& method,
         response = json::parse(http_response);
         
         if (response.contains("error")) {
-            if (is_submit) {
-                json error = response["error"];
-                std::string error_code = (error.contains("code") && !error["code"].is_null())
-                    ? std::to_string(error["code"].get<int>()) : "unknown";
-                std::string error_msg = (error.contains("message") && !error["message"].is_null())
-                    ? error.value("message", "Unknown error") : "Unknown error";
-                std::cout << "[SUBMIT] ERROR: Code=" << error_code << ", Message=" << error_msg << std::endl;
-                if (error.contains("data") && !error["data"].is_null()) {
-                    std::cout << "[SUBMIT] Error data: " << error["data"].dump() << std::endl;
-                }
-            }
             last_error = parse_rpc_error(response);
             last_error_message = get_error_message(response);
             return false;
-        }
-        
-        if (is_submit) {
-            std::cout << "[SUBMIT] Response: " << response.dump() << std::endl;
         }
         
         last_error = RpcError::None;
         last_error_message = "";
         return true;
     } catch (const std::exception& e) {
-        if (is_submit) {
-            std::cout << "[SUBMIT] ERROR: JSON parse failed - " << e.what() << std::endl;
-            std::cout << "[SUBMIT] Raw response: " << http_response << std::endl;
-        }
         last_error = RpcError::InvalidResponse;
         last_error_message = std::string("JSON parse error: ") + e.what();
         return false;
@@ -353,11 +325,10 @@ json XntRpcClient::submitBlock(const json& template_obj, const json& pow) {
     params.push_back(pow);
     
     json response;
-    if (make_rpc_request("mining_submitBlock", params, response)) {
-        return response;
-    }
+    make_rpc_request("mining_submitBlock", params, response);
     
-    return json();
+    // Return response even if it contains an error, so caller can extract error details
+    return response;
 }
 
 uint64_t XntRpcClient::getChainHeight() {
@@ -542,10 +513,7 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
                       << "  Proposal ID: " << Color::CYAN << short_id << Color::RESET << std::endl
                       << "  Threshold: " << puzzle.threshold.substr(0, 16) << "..." << std::endl
                       << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl
-                      << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl
-                      << "  MAST Paths: pow=" << puzzle.auth_paths.pow.size() 
-                      << ", header=" << puzzle.auth_paths.header.size()
-                      << ", kernel=" << puzzle.auth_paths.kernel.size() << std::endl;
+                      << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl;
         }
         
     } catch (const std::exception& e) {

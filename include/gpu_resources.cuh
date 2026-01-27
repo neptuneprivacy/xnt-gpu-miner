@@ -186,6 +186,8 @@ struct GpuResources {
     std::chrono::steady_clock::time_point session_start_time;
     
     std::atomic<uint64_t> solutions_found{0};
+    std::atomic<uint64_t> solutions_accepted{0};
+    std::atomic<uint64_t> solutions_rejected{0};
     std::atomic<uint64_t> total_nonces_tested{0};
     
     uint64_t optimal_max_nonces;

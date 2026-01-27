@@ -2,6 +2,7 @@
 #include "rpc_client.cuh"
 #include "pow.cuh"
 #include "digest.cuh"
+#include "common.cuh"
 
 NeptuneCudaMinerClient::NeptuneCudaMinerClient(
     const std::string& rpc_url,
@@ -71,7 +72,7 @@ bool NeptuneCudaMinerClient::submit_solution(
         if (!prev_block.empty() && tip_digest != prev_block) {
             std::string short_prev = prev_block.length() > 20 ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) : prev_block;
             std::string short_tip = tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest;
-            std::cout << "[SUBMIT] Template stale: prev_block=" << short_prev << " != tip=" << short_tip << std::endl;
+            std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: Template stale (prev_block=" << short_prev << " != tip=" << short_tip << ")" << Color::RESET << std::endl;
             return false;
         }
     }
@@ -106,47 +107,53 @@ bool NeptuneCudaMinerClient::submit_solution(
         block_obj["kernel"] = kernel_obj;
     }
     
-    // Debug: log appendix structure
-    json appendix = kernel_obj["appendix"];
-    if (appendix.is_array()) {
-        std::cout << "[SUBMIT] Block appendix has " << appendix.size() << " claim(s)" << std::endl;
-    }
-    
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
-    
-    // Log submission details
-    std::string short_id = proposal_id.length() > 20 ? proposal_id.substr(0, 12) + "..." + proposal_id.substr(proposal_id.length() - 8) : proposal_id;
-    std::cout << "[SUBMIT] Submitting solution for proposal: " << short_id << std::endl;
     
     json response = rpc_client->submitBlock(block_obj, pow_json);
     
     if (!response.empty() && response.contains("result")) {
         if (response["result"].is_boolean()) {
             bool success = response["result"].get<bool>();
-            std::cout << "[SUBMIT] " << (success ? "✓ ACCEPTED" : "✗ REJECTED") << std::endl;
+            if (!success) {
+                std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: Block rejected" << Color::RESET << std::endl;
+            }
             return success;
         }
         if (response["result"].contains("success")) {
             bool success = response["result"]["success"].get<bool>();
-            std::cout << "[SUBMIT] " << (success ? "✓ ACCEPTED" : "✗ REJECTED") << std::endl;
+            if (!success) {
+                std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: Block rejected" << Color::RESET << std::endl;
+            }
             return success;
         }
-        std::cout << "[SUBMIT] ✓ ACCEPTED (result present)" << std::endl;
         return true;
     }
     
     if (response.contains("error") && !response["error"].is_null()) {
         json error = response["error"];
-        std::string error_msg = (error.contains("message") && !error["message"].is_null())
-            ? error.value("message", "Unknown error") : "Unknown error";
-        std::string error_code = (error.contains("code") && !error["code"].is_null())
-            ? std::to_string(error["code"].get<int>()) : "unknown";
-        std::cout << "[SUBMIT] ✗ REJECTED: " << error_msg << " (code=" << error_code << ")" << std::endl;
+        std::string error_reason = "Unknown error";
+        
+        // Extract exact error reason from error data
         if (error.contains("data") && !error["data"].is_null()) {
-            std::cout << "[SUBMIT]   Details: " << error["data"].dump() << std::endl;
+            json error_data = error["data"];
+            if (error_data.is_object() && !error_data.empty()) {
+                // Get the first value from the error data object
+                auto it = error_data.begin();
+                if (it != error_data.end() && it.value().is_string()) {
+                    error_reason = it.value().get<std::string>();
+                } else if (it != error_data.end()) {
+                    error_reason = it.value().dump();
+                }
+            } else if (error_data.is_string()) {
+                error_reason = error_data.get<std::string>();
+            }
+        } else if (error.contains("message") && !error["message"].is_null()) {
+            error_reason = error.value("message", "Unknown error");
         }
+        
+        std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: " << error_reason << Color::RESET << std::endl;
     } else {
-        std::cout << "[SUBMIT] ✗ REJECTED: No response from server" << std::endl;
+        std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: No response from server" << Color::RESET << std::endl;
     }
     
     return false;
