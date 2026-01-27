@@ -512,7 +512,7 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
                       << "  Proposal ID: " << Color::CYAN << short_id << Color::RESET << std::endl
                       << "  Threshold: " << puzzle.threshold.substr(0, 16) << "..." << std::endl
                       << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl
-                      << "  Reward: " << puzzle.total_guesser_reward << std::endl
+                      << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl
                       << "  MAST Paths: pow=" << puzzle.auth_paths.pow.size() 
                       << ", header=" << puzzle.auth_paths.header.size()
                       << ", kernel=" << puzzle.auth_paths.kernel.size() << std::endl;

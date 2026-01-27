@@ -253,6 +253,44 @@ inline std::string format_hashrate(double rate) {
     return oss.str();
 }
 
+// Format reward from NAU (Neptune Atomic Units) to XNT
+// Conversion: 1 XNT = 4 * 10^30 NAU = 4,000,000,000,000,000,000,000,000,000,000 NAU
+inline std::string format_reward_xnt(const std::string& nau_str) {
+    if (nau_str.empty()) return "0 XNT";
+    
+    constexpr double CONVERSION_FACTOR = 4.0 * 1e30;
+    
+    try {
+        // Parse as double (sufficient precision for display)
+        // Double can represent integers exactly up to 2^53 (~9e15), but for display
+        // we can accept some precision loss for very large numbers
+        double nau_value = std::stod(nau_str);
+        double xnt_value = nau_value / CONVERSION_FACTOR;
+        
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(8);
+        oss << xnt_value;
+        
+        std::string result = oss.str();
+        
+        // Remove trailing zeros after decimal point for cleaner display
+        size_t dot_pos = result.find('.');
+        if (dot_pos != std::string::npos) {
+            size_t last_non_zero = result.find_last_not_of('0');
+            if (last_non_zero != std::string::npos && last_non_zero > dot_pos) {
+                result = result.substr(0, last_non_zero + 1);
+            } else if (last_non_zero == dot_pos) {
+                result = result.substr(0, dot_pos);
+            }
+        }
+        
+        return result + " XNT";
+    } catch (const std::exception&) {
+        // If parsing fails, return the original string with " NAU" suffix
+        return nau_str + " NAU";
+    }
+}
+
 inline std::string trim(const std::string& str) {
     size_t first = str.find_first_not_of(" \t\n\r");
     if (first == std::string::npos) return "";

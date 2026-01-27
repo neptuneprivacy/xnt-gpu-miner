@@ -174,6 +174,8 @@ struct GpuResources {
     HashRateTracker hash_tracker;
     std::string current_proposal_id;
     Digest current_target;
+    Digest cached_prev_block;  // Track last preprocessed prev_block to avoid re-preprocessing
+    PowMastPaths cached_mast_paths;  // Track MAST paths used for preprocessing
     
     std::atomic<uint64_t> gpu_puzzle_random_start{0};
     std::atomic<uint64_t> gpu_puzzle_nonce_counter{0};
