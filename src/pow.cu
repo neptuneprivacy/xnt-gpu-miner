@@ -513,7 +513,7 @@ static int g_total_miners = 1024;    // Total miners in pool (configurable)
 
 // Generate cryptographically strong random start with multiple entropy sources
 // Uses GPU UUID for hardware-unique identification instead of worker_id
-inline uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, const std::string& worker_id = "", const std::string& gpu_uuid = "") {
+uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, const std::string& worker_id, const std::string& gpu_uuid) {
     // Entropy source 1: High-resolution timestamp (nanoseconds)
     auto now = std::chrono::high_resolution_clock::now();
     uint64_t timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
@@ -587,16 +587,8 @@ inline uint64_t generate_secure_random_start(const std::string& puzzle_id, int g
 // GPU Range Calculation with Mining Pool Support
 // Hierarchical partitioning: First by miner ID, then by GPU ID
 // Supports miners with hundreds of GPUs and large pools
-struct GpuNonceRange {
-    uint64_t range_start;
-    uint64_t range_size;
-    int miner_id;
-    int total_miners;
-    int gpu_id;
-    int total_gpus;
-};
 
-inline GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus = 8) {
+GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus) {
     // Get partition ID from environment (for nonce space partitioning)
     // Check both PARTITION_ID (new) and MINER_ID (legacy) for backward compatibility
     const char* env_partition_id = std::getenv("PARTITION_ID");
