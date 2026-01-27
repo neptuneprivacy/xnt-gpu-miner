@@ -24,8 +24,7 @@ public:
                               size_t count, bool* cancel_flag = nullptr);
     
     Digest root() const {
-        if (internal_nodes_.empty()) return Digest::default_digest();
-        return internal_nodes_.back();
+        return internal_nodes_[1];
     }
     
     size_t num_leafs() const { return leafs_.size(); }

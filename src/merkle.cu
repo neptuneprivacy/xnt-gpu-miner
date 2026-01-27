@@ -5,62 +5,55 @@
 MTree MTree::build_inplace(std::vector<Digest> leafs, 
                            std::vector<Digest> internal_nodes,
                            bool* cancel_flag) {
-    MTree tree(std::move(leafs), std::move(internal_nodes));
-    
-    if (tree.leafs_.empty()) {
-        return tree;
+    // Calculate height
+    size_t height = 0;
+    size_t temp = leafs.size();
+    while (temp > 1) {
+        temp >>= 1;
+        height++;
     }
     
-    size_t height = calculate_tree_height(tree.leafs_.size());
+    size_t num_sequential_layers = std::min(height, size_t(8));
+    size_t seq_cutoff_height = std::max(size_t(1), height - num_sequential_layers);
     
-    // Build tree layer by layer
-    // Layer 0: hash pairs of leafs
-    // Layer 1+: hash pairs of previous layer
+    // First layer: connects leafs to internal nodes
+    size_t range_layer_0_start = 1 << (height - 1);
+    size_t range_layer_0_end = 1 << height;
     
-    size_t num_sequential_layers = 4; // Use sequential for top layers
-    size_t seq_cutoff_height = (height > num_sequential_layers) ? height - num_sequential_layers : 0;
+    // EXACT CPU LOGIC: Use merkle_zip like CPU version
+    merkle_zip(&internal_nodes[range_layer_0_start], leafs.data(), 
+               range_layer_0_end - range_layer_0_start);
     
-    // Build lower layers (parallel)
-    for (size_t layer = 0; layer < seq_cutoff_height; ++layer) {
+    if (cancel_flag && *cancel_flag) {
+        return MTree();
+    }
+    
+    // EXACT CPU LOGIC: Remaining layers connect internal nodes to internal nodes
+    for (size_t layer = 1; layer < seq_cutoff_height; ++layer) {
+        size_t parents_start = 1 << (height - 1 - layer);
+        size_t mid_point = 1 << (height - layer);
+        
+        par_merkle_zip(&internal_nodes[parents_start], 
+                      &internal_nodes[mid_point], 
+                      mid_point - parents_start,
+                      cancel_flag);
+        
         if (cancel_flag && *cancel_flag) {
             return MTree();
         }
-        
-        size_t parents_start = layer_start_index(layer, tree.leafs_.size());
-        size_t count = layer_node_count(layer, tree.leafs_.size());
-        
-        if (layer == 0) {
-            // First layer: hash pairs of leafs
-            merkle_zip(tree.internal_nodes_.data() + parents_start, 
-                      tree.leafs_.data(), count);
-        } else {
-            // Subsequent layers: hash pairs of previous layer
-            size_t children_start = layer_start_index(layer - 1, tree.leafs_.size());
-            merkle_zip(tree.internal_nodes_.data() + parents_start,
-                      tree.internal_nodes_.data() + children_start, count);
-        }
     }
     
-    // Build upper layers (sequential for cache efficiency)
+    // EXACT CPU LOGIC: Do top of tree sequentially
     for (size_t layer = seq_cutoff_height; layer < height; ++layer) {
-        if (cancel_flag && *cancel_flag) {
-            return MTree();
-        }
+        size_t parents_start = 1 << (height - 1 - layer);
+        size_t mid_point = 1 << (height - layer);
         
-        size_t parents_start = layer_start_index(layer, tree.leafs_.size());
-        size_t count = layer_node_count(layer, tree.leafs_.size());
-        
-        if (layer == 0) {
-            merkle_zip(tree.internal_nodes_.data() + parents_start,
-                      tree.leafs_.data(), count);
-        } else {
-            size_t children_start = layer_start_index(layer - 1, tree.leafs_.size());
-            merkle_zip(tree.internal_nodes_.data() + parents_start,
-                      tree.internal_nodes_.data() + children_start, count);
-        }
+        merkle_zip(&internal_nodes[parents_start], 
+                  &internal_nodes[mid_point], 
+                  mid_point - parents_start);
     }
     
-    return tree;
+    return MTree(std::move(leafs), std::move(internal_nodes));
 }
 
 void MTree::merkle_zip(Digest* parents, const Digest* children, size_t count) {
@@ -81,40 +74,24 @@ void MTree::par_merkle_zip(Digest* parents, const Digest* children,
 }
 
 std::vector<Digest> MTree::path(size_t index) const {
-    std::vector<Digest> result;
+    std::vector<Digest> path;
+    size_t running_index = index + leafs_.size();
+    path.push_back(leafs_[index ^ 1]);
     
-    if (leafs_.empty() || index >= leafs_.size()) {
-        return result;
+    // Calculate tree height as log2 of number of leafs
+    size_t tree_height = 0;
+    size_t temp = leafs_.size();
+    while (temp > 1) {
+        temp >>= 1;
+        tree_height++;
     }
     
-    size_t tree_height = calculate_tree_height(leafs_.size());
-    result.reserve(tree_height);
-    
-    size_t running_index = index;
-    
-    // First level: sibling leaf
-    size_t sibling_leaf_index = (running_index ^ 1);
-    if (sibling_leaf_index < leafs_.size()) {
-        result.push_back(leafs_[sibling_leaf_index]);
-    } else {
-        result.push_back(Digest::default_digest());
-    }
-    running_index >>= 1;
-    
-    // Subsequent levels: sibling internal nodes
-    for (size_t i = 0; i < tree_height - 1; ++i) {
-        size_t layer_start = layer_start_index(i, leafs_.size());
-        size_t sibling_index = layer_start + (running_index ^ 1);
-        
-        if (sibling_index < internal_nodes_.size()) {
-            result.push_back(internal_nodes_[sibling_index]);
-        } else {
-            result.push_back(Digest::default_digest());
-        }
+    for (size_t i = 1; i < tree_height; ++i) {
         running_index >>= 1;
+        path.push_back(internal_nodes_[running_index ^ 1]);
     }
     
-    return result;
+    return path;
 }
 
 // ===== GPU PREPROCESSING KERNELS =====
