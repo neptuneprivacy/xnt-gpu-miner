@@ -73,6 +73,7 @@ std::string digest_to_hex(const Digest& digest);
 Digest hex_to_digest(const std::string& hex);
 Digest parse_digest_string(const std::string& str);
 bool digest_less_than_or_equal(const Digest& a, const Digest& b);
+Digest make_target_easier(const Digest& target, uint64_t factor);
 
 __device__ __host__ __forceinline__ int digest_compare(const Digest& a, const Digest& b) {
     for (int i = DIGEST_LEN - 1; i >= 0; --i) {

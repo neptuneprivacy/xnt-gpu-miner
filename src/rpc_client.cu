@@ -150,6 +150,7 @@ static bool http_post(const std::string& url,
     }
     
     std::string status_line = response.substr(0, status_line_end);
+    
     if (status_line.find("HTTP/1.1 200") == std::string::npos &&
         status_line.find("HTTP/1.0 200") == std::string::npos) {
         return false;
@@ -218,7 +219,16 @@ bool XntRpcClient::make_rpc_request(const std::string& method,
     std::string auth_header = build_auth_header();
     std::string http_response;
     
+    // Only log for submitBlock
+    bool is_submit = (method == "mining_submitBlock");
+    if (is_submit) {
+        std::cout << "[SUBMIT] Sending mining_submitBlock request..." << std::endl;
+    }
+    
     if (!http_post(config.url, request_body, auth_header, http_response, config.timeout_sec)) {
+        if (is_submit) {
+            std::cout << "[SUBMIT] ERROR: HTTP request failed" << std::endl;
+        }
         last_error = RpcError::ConnectionFailed;
         last_error_message = "HTTP request failed";
         return false;
@@ -228,15 +238,34 @@ bool XntRpcClient::make_rpc_request(const std::string& method,
         response = json::parse(http_response);
         
         if (response.contains("error")) {
+            if (is_submit) {
+                json error = response["error"];
+                std::string error_code = (error.contains("code") && !error["code"].is_null())
+                    ? std::to_string(error["code"].get<int>()) : "unknown";
+                std::string error_msg = (error.contains("message") && !error["message"].is_null())
+                    ? error.value("message", "Unknown error") : "Unknown error";
+                std::cout << "[SUBMIT] ERROR: Code=" << error_code << ", Message=" << error_msg << std::endl;
+                if (error.contains("data") && !error["data"].is_null()) {
+                    std::cout << "[SUBMIT] Error data: " << error["data"].dump() << std::endl;
+                }
+            }
             last_error = parse_rpc_error(response);
             last_error_message = get_error_message(response);
             return false;
+        }
+        
+        if (is_submit) {
+            std::cout << "[SUBMIT] Response: " << response.dump() << std::endl;
         }
         
         last_error = RpcError::None;
         last_error_message = "";
         return true;
     } catch (const std::exception& e) {
+        if (is_submit) {
+            std::cout << "[SUBMIT] ERROR: JSON parse failed - " << e.what() << std::endl;
+            std::cout << "[SUBMIT] Raw response: " << http_response << std::endl;
+        }
         last_error = RpcError::InvalidResponse;
         last_error_message = std::string("JSON parse error: ") + e.what();
         return false;
@@ -318,9 +347,10 @@ json XntRpcClient::getBlockTemplate(const std::string& guesser_address) {
 }
 
 json XntRpcClient::submitBlock(const json& template_obj, const json& pow) {
-    json params = json::object();
-    params["template"] = template_obj;
-    params["pow"] = pow;
+    // JSON-RPC server expects params as an array: [template, pow]
+    json params = json::array();
+    params.push_back(template_obj);
+    params.push_back(pow);
     
     json response;
     if (make_rpc_request("mining_submitBlock", params, response)) {
@@ -512,7 +542,7 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
                       << "  Proposal ID: " << Color::CYAN << short_id << Color::RESET << std::endl
                       << "  Threshold: " << puzzle.threshold.substr(0, 16) << "..." << std::endl
                       << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl
-                      << "  Reward: " << puzzle.total_guesser_reward << std::endl
+                      << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl
                       << "  MAST Paths: pow=" << puzzle.auth_paths.pow.size() 
                       << ", header=" << puzzle.auth_paths.header.size()
                       << ", kernel=" << puzzle.auth_paths.kernel.size() << std::endl;
@@ -528,18 +558,21 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
 
 json powToRpcFormat(const Pow& pow_solution, const Digest& solution_hash) {
     json pow_json;
+
+    // Digests are serialized as hex strings in the JSON-RPC API
     pow_json["root"] = digest_to_hex(solution_hash);
-    
+
     pow_json["pathA"] = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         pow_json["pathA"].push_back(digest_to_hex(pow_solution.path_a[i]));
     }
-    
+
     pow_json["pathB"] = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         pow_json["pathB"].push_back(digest_to_hex(pow_solution.path_b[i]));
     }
-    
+
     pow_json["nonce"] = digest_to_hex(pow_solution.nonce);
+
     return pow_json;
 }

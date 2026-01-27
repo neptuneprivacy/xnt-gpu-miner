@@ -279,3 +279,10 @@ __host__ Digest digest_multiply_scalar(const Digest& d, uint64_t scalar) {
     
     return result;
 }
+
+// Make target easier by multiplying (for testing - makes it easier to find solutions)
+__host__ Digest make_target_easier(const Digest& target, uint64_t factor) {
+    // Multiply target by factor to make it easier
+    // This makes it 10000x easier to find solutions for testing
+    return digest_multiply_scalar(target, factor);
+}

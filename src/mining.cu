@@ -285,16 +285,91 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
             return;  // Same puzzle, skip
         }
         gpu_resources->current_proposal_id = puzzle.id;
-        gpu_resources->current_target = hex_to_digest(puzzle.threshold);
+        // Make target 100000x easier for testing
+        Digest original_target = hex_to_digest(puzzle.threshold);
+        gpu_resources->current_real_target = original_target;
+        gpu_resources->current_target = make_target_easier(original_target, 100000);
+        std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+                  << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
     }
     
     resetNonceCounter(gpu_resources, puzzle.id);
     
-    std::cout << "[GPU " << gpu_id << "] Starting preprocessing..." << std::endl;
+    Digest prev_block = hex_to_digest(puzzle.prev_block);
+    PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     
-    if (!preprocessPuzzle(puzzle, gpu_resources)) {
-        std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
-        return;
+    // Check if we can reuse existing buffer (same prev_block and MAST paths)
+    bool need_preprocess = true;
+    {
+        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+        if (gpu_resources->buffer && gpu_resources->buffer->is_valid()) {
+            // Check if prev_block matches
+            bool prev_block_match = true;
+            for (int i = 0; i < DIGEST_LEN; ++i) {
+                if (gpu_resources->cached_prev_block.values[i] != prev_block.values[i]) {
+                    prev_block_match = false;
+                    break;
+                }
+            }
+            
+            // Check if MAST paths match (for XNT consensus, commitment depends on MAST paths)
+            bool mast_paths_match = true;
+            if (prev_block_match) {
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = 0; j < DIGEST_LEN; ++j) {
+                        if (gpu_resources->cached_mast_paths.pow[i].values[j] != mast_paths.pow[i].values[j]) {
+                            mast_paths_match = false;
+                            break;
+                        }
+                    }
+                    if (!mast_paths_match) break;
+                }
+                if (mast_paths_match) {
+                    for (int i = 0; i < 2; ++i) {
+                        for (int j = 0; j < DIGEST_LEN; ++j) {
+                            if (gpu_resources->cached_mast_paths.header[i].values[j] != mast_paths.header[i].values[j]) {
+                                mast_paths_match = false;
+                                break;
+                            }
+                        }
+                        if (!mast_paths_match) break;
+                    }
+                }
+                if (mast_paths_match) {
+                    for (int j = 0; j < DIGEST_LEN; ++j) {
+                        if (gpu_resources->cached_mast_paths.kernel[0].values[j] != mast_paths.kernel[0].values[j]) {
+                            mast_paths_match = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (prev_block_match && mast_paths_match) {
+                need_preprocess = false;
+                // Update MAST paths in buffer and cache (for consistency)
+                gpu_resources->buffer->mast_paths = mast_paths;
+                gpu_resources->cached_mast_paths = mast_paths;
+                std::cout << "[GPU " << gpu_id << "] " << Color::GREEN 
+                          << "Reusing cached buffer (same prev_block and MAST paths)" << Color::RESET << std::endl;
+            }
+        }
+    }
+    
+    if (need_preprocess) {
+        std::cout << "[GPU " << gpu_id << "] Starting preprocessing..." << std::endl;
+        
+        if (!preprocessPuzzle(puzzle, gpu_resources)) {
+            std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
+            return;
+        }
+        
+        // Update cache
+        {
+            std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+            gpu_resources->cached_prev_block = prev_block;
+            gpu_resources->cached_mast_paths = mast_paths;
+        }
     }
     
     gpu_resources->update_job_received();
@@ -547,7 +622,9 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
         return false;
     }
     
-    Digest target = hex_to_digest(puzzle.threshold);
+    // Make target 100000x easier for testing
+    Digest original_target = hex_to_digest(puzzle.threshold);
+    Digest target = make_target_easier(original_target, 100000);
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
     
@@ -560,6 +637,9 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
         puzzle.consensus_rule_set,
         nullptr
     );
+    
+    // Update nonce counter
+    gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
     
     return result.has_value();
 }
@@ -616,6 +696,9 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
         
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        
+        // Update nonce counter
+        gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
         
         if (duration_ms > 0) {
             double hashrate_ms = static_cast<double>(gpu_res->optimal_max_nonces) / duration_ms;

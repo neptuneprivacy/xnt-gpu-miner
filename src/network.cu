@@ -57,26 +57,81 @@ bool NeptuneCudaMinerClient::submit_solution(
     
     json template_obj = last_template;
     std::string tip_digest = rpc_client->getTipDigest();
+    
+    // Check if template is stale
     if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
         json metadata = template_obj["metadata"];
+        std::string prev_block;
         if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
-            std::string prev_block = metadata.value("prevBlock", "");
-        if (tip_digest != prev_block) {
+            prev_block = metadata.value("prevBlock", "");
+        } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+            prev_block = metadata.value("prev_block", "");
+        }
+
+        if (!prev_block.empty() && tip_digest != prev_block) {
+            std::string short_prev = prev_block.length() > 20 ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) : prev_block;
+            std::string short_tip = tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest;
+            std::cout << "[SUBMIT] Template stale: prev_block=" << short_prev << " != tip=" << short_tip << std::endl;
             return false;
-            }
         }
     }
     
+    // Extract the block from template (RpcBlockTemplate has "block" and "metadata" fields)
+    // SubmitBlockRequest expects: { template: RpcBlock, pow: RpcBlockPow }
+    if (!template_obj.contains("block") || template_obj["block"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Template missing 'block' field" << std::endl;
+        return false;
+    }
+    
+    json block_obj = template_obj["block"];
+    
+    // Ensure block has kernel.appendix with required structure
+    // RpcBlockAppendix is serialized as an array of RpcClaim objects
+    if (!block_obj.contains("kernel") || block_obj["kernel"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Block missing 'kernel' field" << std::endl;
+        return false;
+    }
+    
+    json kernel_obj = block_obj["kernel"];
+    
+    // Check if appendix exists, if not create empty array
+    // If it exists but is not an array, ensure it's properly structured
+    if (!kernel_obj.contains("appendix") || kernel_obj["appendix"].is_null()) {
+        std::cout << "[SUBMIT] WARNING: Block kernel missing 'appendix', adding empty array" << std::endl;
+        kernel_obj["appendix"] = json::array();
+        block_obj["kernel"] = kernel_obj;
+    } else if (!kernel_obj["appendix"].is_array()) {
+        std::cout << "[SUBMIT] WARNING: Block kernel 'appendix' is not an array, fixing structure" << std::endl;
+        kernel_obj["appendix"] = json::array();
+        block_obj["kernel"] = kernel_obj;
+    }
+    
+    // Debug: log appendix structure
+    json appendix = kernel_obj["appendix"];
+    if (appendix.is_array()) {
+        std::cout << "[SUBMIT] Block appendix has " << appendix.size() << " claim(s)" << std::endl;
+    }
+    
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
-    json response = rpc_client->submitBlock(template_obj, pow_json);
+    
+    // Log submission details
+    std::string short_id = proposal_id.length() > 20 ? proposal_id.substr(0, 12) + "..." + proposal_id.substr(proposal_id.length() - 8) : proposal_id;
+    std::cout << "[SUBMIT] Submitting solution for proposal: " << short_id << std::endl;
+    
+    json response = rpc_client->submitBlock(block_obj, pow_json);
     
     if (!response.empty() && response.contains("result")) {
         if (response["result"].is_boolean()) {
-            return response["result"].get<bool>();
+            bool success = response["result"].get<bool>();
+            std::cout << "[SUBMIT] " << (success ? "✓ ACCEPTED" : "✗ REJECTED") << std::endl;
+            return success;
         }
         if (response["result"].contains("success")) {
-            return response["result"]["success"].get<bool>();
+            bool success = response["result"]["success"].get<bool>();
+            std::cout << "[SUBMIT] " << (success ? "✓ ACCEPTED" : "✗ REJECTED") << std::endl;
+            return success;
         }
+        std::cout << "[SUBMIT] ✓ ACCEPTED (result present)" << std::endl;
         return true;
     }
     
@@ -84,7 +139,14 @@ bool NeptuneCudaMinerClient::submit_solution(
         json error = response["error"];
         std::string error_msg = (error.contains("message") && !error["message"].is_null())
             ? error.value("message", "Unknown error") : "Unknown error";
-        LOG_DEBUG("Submission error: " << error_msg);
+        std::string error_code = (error.contains("code") && !error["code"].is_null())
+            ? std::to_string(error["code"].get<int>()) : "unknown";
+        std::cout << "[SUBMIT] ✗ REJECTED: " << error_msg << " (code=" << error_code << ")" << std::endl;
+        if (error.contains("data") && !error["data"].is_null()) {
+            std::cout << "[SUBMIT]   Details: " << error["data"].dump() << std::endl;
+        }
+    } else {
+        std::cout << "[SUBMIT] ✗ REJECTED: No response from server" << std::endl;
     }
     
     return false;

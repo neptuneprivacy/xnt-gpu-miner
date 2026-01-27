@@ -143,23 +143,6 @@ inline std::string shorten_address(const std::string& addr, size_t prefix_len = 
 
 static constexpr uint64_t DEFAULT_BATCH_SIZE = 262144ULL;
 
-namespace Console {
-    inline void clearScreen() {
-        std::cout << "\033[2J\033[3J\033[H\033[0m" << std::flush;
-    }
-    
-    inline void moveCursor(int row, int col) {
-        std::cout << "\033[" << row << ";" << col << "H" << std::flush;
-    }
-    
-    inline void hideCursor() {
-        std::cout << "\033[?25l" << std::flush;
-    }
-    
-    inline void showCursor() {
-        std::cout << "\033[?25h" << std::flush;
-    }
-}
 
 inline void enable_ansi_colors() {
 #ifdef _WIN32
@@ -251,6 +234,44 @@ inline std::string format_hashrate(double rate) {
     else if (rate >= 1e3) oss << (rate / 1e3) << " KH/s";
     else oss << rate << " H/s";
     return oss.str();
+}
+
+// Format reward from NAU (Neptune Atomic Units) to XNT
+// Conversion: 1 XNT = 4 * 10^30 NAU = 4,000,000,000,000,000,000,000,000,000,000 NAU
+inline std::string format_reward_xnt(const std::string& nau_str) {
+    if (nau_str.empty()) return "0 XNT";
+    
+    constexpr double CONVERSION_FACTOR = 4.0 * 1e30;
+    
+    try {
+        // Parse as double (sufficient precision for display)
+        // Double can represent integers exactly up to 2^53 (~9e15), but for display
+        // we can accept some precision loss for very large numbers
+        double nau_value = std::stod(nau_str);
+        double xnt_value = nau_value / CONVERSION_FACTOR;
+        
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(8);
+        oss << xnt_value;
+        
+        std::string result = oss.str();
+        
+        // Remove trailing zeros after decimal point for cleaner display
+        size_t dot_pos = result.find('.');
+        if (dot_pos != std::string::npos) {
+            size_t last_non_zero = result.find_last_not_of('0');
+            if (last_non_zero != std::string::npos && last_non_zero > dot_pos) {
+                result = result.substr(0, last_non_zero + 1);
+            } else if (last_non_zero == dot_pos) {
+                result = result.substr(0, dot_pos);
+            }
+        }
+        
+        return result + " XNT";
+    } catch (const std::exception&) {
+        // If parsing fails, return the original string with " NAU" suffix
+        return nau_str + " NAU";
+    }
 }
 
 inline std::string trim(const std::string& str) {
