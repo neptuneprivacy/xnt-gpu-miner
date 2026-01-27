@@ -637,6 +637,9 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
         nullptr
     );
     
+    // Update nonce counter
+    gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
+    
     return result.has_value();
 }
 
@@ -692,6 +695,9 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
         
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        
+        // Update nonce counter
+        gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
         
         if (duration_ms > 0) {
             double hashrate_ms = static_cast<double>(gpu_res->optimal_max_nonces) / duration_ms;

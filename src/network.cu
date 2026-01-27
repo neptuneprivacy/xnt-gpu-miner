@@ -68,15 +68,40 @@ bool NeptuneCudaMinerClient::submit_solution(
     }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
+    
+    // Log submission details
+    std::cout << "[SUBMIT] Submitting solution for proposal: " << proposal_id << std::endl;
+    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+        json metadata = template_obj["metadata"];
+        if (metadata.contains("digest") && !metadata["digest"].is_null()) {
+            std::string digest = metadata.value("digest", "");
+            std::string short_digest = digest.length() > 20 ? digest.substr(0, 12) + "..." + digest.substr(digest.length() - 8) : digest;
+            std::cout << "[SUBMIT] Template digest: " << short_digest << std::endl;
+        }
+        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+            std::string prev = metadata.value("prevBlock", "");
+            std::string short_prev = prev.length() > 20 ? prev.substr(0, 12) + "..." + prev.substr(prev.length() - 8) : prev;
+            std::cout << "[SUBMIT] Previous block: " << short_prev << " | Tip: " << (tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest) << std::endl;
+        }
+    }
+    
     json response = rpc_client->submitBlock(template_obj, pow_json);
+    
+    // Log full response
+    std::cout << "[SUBMIT] RPC Response: " << response.dump() << std::endl;
     
     if (!response.empty() && response.contains("result")) {
         if (response["result"].is_boolean()) {
-            return response["result"].get<bool>();
+            bool success = response["result"].get<bool>();
+            std::cout << "[SUBMIT] Result (boolean): " << (success ? "SUCCESS" : "FAILED") << std::endl;
+            return success;
         }
         if (response["result"].contains("success")) {
-            return response["result"]["success"].get<bool>();
+            bool success = response["result"]["success"].get<bool>();
+            std::cout << "[SUBMIT] Result (success field): " << (success ? "SUCCESS" : "FAILED") << std::endl;
+            return success;
         }
+        std::cout << "[SUBMIT] Result present but format unknown" << std::endl;
         return true;
     }
     
@@ -84,7 +109,15 @@ bool NeptuneCudaMinerClient::submit_solution(
         json error = response["error"];
         std::string error_msg = (error.contains("message") && !error["message"].is_null())
             ? error.value("message", "Unknown error") : "Unknown error";
+        std::string error_code = (error.contains("code") && !error["code"].is_null())
+            ? std::to_string(error["code"].get<int>()) : "unknown";
+        std::cout << "[SUBMIT] ERROR: Code=" << error_code << ", Message=" << error_msg << std::endl;
+        if (error.contains("data") && !error["data"].is_null()) {
+            std::cout << "[SUBMIT] Error data: " << error["data"].dump() << std::endl;
+        }
         LOG_DEBUG("Submission error: " << error_msg);
+    } else {
+        std::cout << "[SUBMIT] No result or error in response" << std::endl;
     }
     
     return false;
