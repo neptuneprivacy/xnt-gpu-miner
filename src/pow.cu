@@ -4,54 +4,117 @@ __constant__ uint64_t d_gpu_range_start;
 __constant__ uint64_t d_gpu_range_size;
 
 __device__ Digest PowMastPaths::commit_device() const {
-    Digest pow_root = pow[0];
-    for (int i = 1; i < 3; ++i) {
-        pow_root = tip5_hash_fixed_device(pow_root, pow[i]);
+    // Match Rust: Tip5::hash_varlen over flattened pow, header, kernel digests
+    uint64_t values[DIGEST_LEN * 6];
+    size_t pos = 0;
+    
+    for (int i = 0; i < 3; ++i) {
+        #pragma unroll
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            values[pos++] = pow[i].values[j];
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        #pragma unroll
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            values[pos++] = header[i].values[j];
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < DIGEST_LEN; ++j) {
+        values[pos++] = kernel[0].values[j];
     }
     
-    Digest header_root = header[0];
-    for (int i = 1; i < 2; ++i) {
-        header_root = tip5_hash_fixed_device(header_root, header[i]);
-    }
-    
-    Digest combined = tip5_hash_fixed_device(pow_root, header_root);
-    combined = tip5_hash_fixed_device(combined, kernel[0]);
-    
-    return combined;
+    return tip5_hash_varlen_device(values, pos);
 }
 
 __host__ Digest PowMastPaths::commit() const {
-    Digest pow_root = pow[0];
-    for (int i = 1; i < 3; ++i) {
-        pow_root = tip5_hash_fixed_host(pow_root, pow[i]);
+    // Match Rust: Tip5::hash_varlen over flattened pow, header, kernel digests
+    std::vector<uint64_t> values;
+    values.reserve(DIGEST_LEN * 6);
+    
+    auto append_digest = [&values](const Digest& d) {
+        for (int i = 0; i < DIGEST_LEN; ++i) {
+            values.push_back(d.values[i]);
+        }
+    };
+    
+    for (int i = 0; i < 3; ++i) {
+        append_digest(pow[i]);
     }
-    
-    Digest header_root = header[0];
-    for (int i = 1; i < 2; ++i) {
-        header_root = tip5_hash_fixed_host(header_root, header[i]);
+    for (int i = 0; i < 2; ++i) {
+        append_digest(header[i]);
     }
+    append_digest(kernel[0]);
     
-    Digest combined = tip5_hash_fixed_host(pow_root, header_root);
-    combined = tip5_hash_fixed_host(combined, kernel[0]);
-    
-    return combined;
+    return tip5_hash_varlen_host(values);
 }
 
 Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
     auto pow_encoding = pow_obj.encode();
-    auto pow_digest = tip5_hash_varlen_host(pow_encoding);
+    Digest pow_digest = tip5_hash_varlen_host(pow_encoding);
     
-    Digest header_mast_hash = pow_digest;
-    for (int i = 0; i < 3; ++i) {
-        header_mast_hash = tip5_hash_fixed_host(header_mast_hash, pow[i]);
+    // Match Rust fast_mast_hash ordering
+    Digest header_mast_hash = tip5_hash_fixed_host(pow_digest, pow[0]);
+    header_mast_hash = tip5_hash_fixed_host(header_mast_hash, pow[1]);
+    header_mast_hash = tip5_hash_fixed_host(pow[2], header_mast_hash);
+    
+    std::vector<uint64_t> header_vals(header_mast_hash.values,
+                                      header_mast_hash.values + DIGEST_LEN);
+    Digest header_var = tip5_hash_varlen_host(header_vals);
+    
+    Digest kernel_mast_hash = tip5_hash_fixed_host(header_var, header[0]);
+    kernel_mast_hash = tip5_hash_fixed_host(kernel_mast_hash, header[1]);
+    
+    std::vector<uint64_t> kernel_vals(kernel_mast_hash.values,
+                                      kernel_mast_hash.values + DIGEST_LEN);
+    Digest kernel_var = tip5_hash_varlen_host(kernel_vals);
+    
+    return tip5_hash_fixed_host(kernel_var, kernel[0]);
+}
+
+__device__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
+    // Encode POW: nonce, path_b, path_a, root (BFieldCodec order)
+    constexpr size_t ENCODING_LEN = DIGEST_LEN * (1 + 2 * MERKLE_TREE_HEIGHT_ + 1);
+    uint64_t encoding[ENCODING_LEN];
+    size_t pos = 0;
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        encoding[pos++] = pow_obj.nonce.values[i];
     }
     
-    for (int i = 0; i < 2; ++i) {
-        header_mast_hash = tip5_hash_fixed_host(header_mast_hash, header[i]);
+    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        #pragma unroll
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            encoding[pos++] = pow_obj.path_b[i].values[j];
+        }
     }
     
-    Digest final_hash = tip5_hash_fixed_host(header_mast_hash, kernel[0]);
-    return final_hash;
+    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        #pragma unroll
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            encoding[pos++] = pow_obj.path_a[i].values[j];
+        }
+    }
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        encoding[pos++] = pow_obj.root.values[i];
+    }
+    
+    Digest pow_digest = tip5_hash_varlen_device(encoding, pos);
+    
+    Digest header_mast_hash = tip5_hash_fixed_device(pow_digest, pow[0]);
+    header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
+    header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
+    
+    Digest header_var = tip5_hash_varlen_device(header_mast_hash.values, DIGEST_LEN);
+    Digest kernel_mast_hash = tip5_hash_fixed_device(header_var, header[0]);
+    kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
+    
+    Digest kernel_var = tip5_hash_varlen_device(kernel_mast_hash.values, DIGEST_LEN);
+    return tip5_hash_fixed_device(kernel_var, kernel[0]);
 }
 
 VramMode detect_vram_mode(int gpu_id) {
@@ -308,10 +371,8 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     }
     
     // Convert buds to leafs through NUM_BUD_LAYERS iterations
-    // This matches Rust: iterate log-many times to compute leafs from buds
-    // Optimize memory: allocate only half size since each layer halves the output
-    // The first layer outputs MERKLE_NUM_LEAFS/2 elements, which is the max we need
-    size_t temp_buffer_size = (MERKLE_NUM_LEAFS / 2) * sizeof(Digest);
+    // Match Rust: output size stays NUM_LEAFS every layer
+    size_t temp_buffer_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
     cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, temp_buffer_size);
     if (temp_alloc_err != cudaSuccess) {
@@ -330,9 +391,8 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
             return GuesserBuffer();
         }
         
-        // Each layer outputs MERKLE_NUM_LEAFS >> (layer + 1) elements
-        size_t output_count = MERKLE_NUM_LEAFS >> (layer + 1);
-        int layerBlocks = (output_count + threadsPerBlock - 1) / threadsPerBlock;
+        // Each layer outputs MERKLE_NUM_LEAFS elements
+        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
         
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
@@ -345,26 +405,14 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
             return GuesserBuffer();
         }
         
-        // Alternate between temp buffer and main buffer for next iteration
-        // Even layers: write to temp, odd layers: write to buffer.d_leafs
-        if (layer < NUM_BUD_LAYERS - 1) {
-            if ((layer % 2) == 0) {
-                // Next layer (odd): read from temp, write to buffer
-                current_buds = d_temp_leafs;
-                current_leafs = buffer.d_leafs;
-            } else {
-                // Next layer (even): read from buffer, write to temp
-                current_buds = buffer.d_leafs;
-                current_leafs = d_temp_leafs;
-            }
-        }
+        // Swap for next iteration
+        std::swap(current_buds, current_leafs);
     }
     
-    // After NUM_BUD_LAYERS iterations, final leafs are in current_leafs
+    // After NUM_BUD_LAYERS iterations, final leafs are in current_buds
     // Copy them to buffer.d_leafs if needed
-    if (current_leafs != buffer.d_leafs) {
-        size_t final_count = MERKLE_NUM_LEAFS >> NUM_BUD_LAYERS;
-        cudaMemcpy(buffer.d_leafs, current_leafs, final_count * sizeof(Digest), 
+    if (current_buds != buffer.d_leafs) {
+        cudaMemcpy(buffer.d_leafs, current_buds, temp_buffer_size,
                    cudaMemcpyDeviceToDevice);
     }
     
@@ -414,6 +462,9 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     
     cudaMemcpy(&buffer.merkle_root, buffer.d_merkle_tree + buffer.tree_size - 1,
                sizeof(Digest), cudaMemcpyDeviceToHost);
+    
+    // Precompute index picker preimage: Tip5::hash_pair(root, mast_auth_paths.commit())
+    buffer.index_picker_preimage = tip5_hash_fixed_host(buffer.merkle_root, commitment);
     
     LOG_DEBUG("preprocess_high_vram: complete");
     return buffer;

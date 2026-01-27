@@ -30,6 +30,7 @@ class GuesserBuffer {
 public:
     Digest merkle_root;
     Digest hash;
+    Digest index_picker_preimage;
     Digest prev_block_digest;
     Digest* d_merkle_tree;
     size_t tree_size;
@@ -41,6 +42,7 @@ public:
     GuesserBuffer() 
         : merkle_root()
         , hash()
+        , index_picker_preimage()
         , prev_block_digest()
         , d_merkle_tree(nullptr)
         , tree_size(0)
@@ -70,6 +72,7 @@ public:
     GuesserBuffer(GuesserBuffer&& other) noexcept
         : merkle_root(other.merkle_root)
         , hash(other.hash)
+        , index_picker_preimage(other.index_picker_preimage)
         , prev_block_digest(other.prev_block_digest)
         , d_merkle_tree(other.d_merkle_tree)
         , tree_size(other.tree_size)
@@ -88,6 +91,7 @@ public:
             cleanup();
             merkle_root = other.merkle_root;
             hash = other.hash;
+            index_picker_preimage = other.index_picker_preimage;
             prev_block_digest = other.prev_block_digest;
             d_merkle_tree = other.d_merkle_tree;
             tree_size = other.tree_size;

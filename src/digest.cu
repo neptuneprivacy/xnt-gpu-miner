@@ -141,39 +141,21 @@ __host__ Digest tip5_hash_varlen_host(const std::vector<uint64_t>& input) {
 std::string digest_to_hex(const Digest& digest) {
     std::ostringstream oss;
     
-    std::vector<uint8_t> bytes;
-    bytes.reserve(DIGEST_LEN * 8);
-    
+    // Match Rust: serialize bytes in order (little-endian per limb), fixed 40 bytes
+    std::array<uint8_t, DIGEST_LEN * 8> bytes{};
     for (int limb = 0; limb < DIGEST_LEN; ++limb) {
         uint64_t value = digest.values[limb];
         for (int byte = 0; byte < 8; ++byte) {
-            uint8_t b = (value >> (byte * 8)) & 0xFF;
-            bytes.push_back(b);
+            bytes[limb * 8 + byte] = static_cast<uint8_t>((value >> (byte * 8)) & 0xFF);
         }
-    }
-    
-    size_t first_non_zero = bytes.size();
-    for (size_t i = bytes.size(); i > 0; --i) {
-        if (bytes[i - 1] != 0) {
-            first_non_zero = i - 1;
-        }
-    }
-    
-    if (first_non_zero == bytes.size()) {
-        return "0";
     }
     
     oss << std::hex << std::setfill('0');
-    for (size_t i = bytes.size(); i > 0; --i) {
-        oss << std::setw(2) << static_cast<int>(bytes[i - 1]);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        oss << std::setw(2) << static_cast<int>(bytes[i]);
     }
     
-    std::string result = oss.str();
-    size_t start = result.find_first_not_of('0');
-    if (start == std::string::npos) {
-        return "0";
-    }
-    return result.substr(start);
+    return oss.str();
 }
 
 Digest hex_to_digest(const std::string& hex) {
@@ -188,28 +170,28 @@ Digest hex_to_digest(const std::string& hex) {
         hex_str = hex_str.substr(2);
     }
     
-    size_t start = hex_str.find_first_not_of('0');
-    if (start == std::string::npos) {
-        return result;
-    }
-    hex_str = hex_str.substr(start);
-    
     if (hex_str.length() % 2 != 0) {
         hex_str = "0" + hex_str;
     }
     
     std::vector<uint8_t> bytes;
-    for (size_t i = hex_str.length(); i >= 2; i -= 2) {
-        std::string byteString = hex_str.substr(i - 2, 2);
+    bytes.reserve(hex_str.length() / 2);
+    for (size_t i = 0; i + 1 < hex_str.length(); i += 2) {
+        std::string byteString = hex_str.substr(i, 2);
         uint8_t byte = static_cast<uint8_t>(std::stoul(byteString, nullptr, 16));
         bytes.push_back(byte);
     }
     
+    // Right-pad to 40 bytes if shorter
     const size_t max_bytes = DIGEST_LEN * 8;
+    if (bytes.size() < max_bytes) {
+        bytes.resize(max_bytes, 0);
+    }
+    
     const size_t nbytes = std::min(bytes.size(), max_bytes);
     for (size_t i = 0; i < nbytes; ++i) {
-        const int limb_index = i / 8;
-        const int byte_offset = i % 8;
+        const int limb_index = static_cast<int>(i / 8);
+        const int byte_offset = static_cast<int>(i % 8);
         result.values[limb_index] |= static_cast<uint64_t>(bytes[i]) << (byte_offset * 8);
     }
     

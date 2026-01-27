@@ -133,7 +133,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
         
-        // Compute indices from hash and nonce
+        // Compute indices from index picker preimage and nonce
         uint64_t index_a, index_b;
         Pow::indices(hash, nonce_digest, index_a, index_b);
         
@@ -181,49 +181,17 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         // Get Merkle root (last internal node)
         Digest merkle_root = d_internal_nodes[num_leafs - 2];
         
-        // Compute POW hash using MAST paths
-        // Create temporary POW structure for encoding
-        uint64_t state[STATE_SIZE];
-        
-        // Initialize state for variable length hashing
-        tip5_sponge_init(state, Domain::VariableLength);
-        
-        // Absorb nonce
+        // Compute POW hash using correct fast_mast_hash implementation
+        Pow pow;
+        pow.root = merkle_root;
+        pow.nonce = nonce_digest;
         #pragma unroll
-        for (int i = 0; i < DIGEST_LEN; ++i) {
-            state[i] = nonce_digest.values[i];
-        }
-        state[DIGEST_LEN] = 0;
-        
-        tip5_permutation(state);
-        
-        // Absorb paths and root (simplified - full implementation would hash complete encoding)
-        #pragma unroll
-        for (int i = 0; i < DIGEST_LEN; ++i) {
-            state[i] = merkle_root.values[i];
+        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+            pow.path_a[i] = path_a[i];
+            pow.path_b[i] = path_b[i];
         }
         
-        tip5_permutation(state);
-        
-        // Combine with MAST paths for header hash
-        Digest header_hash;
-        #pragma unroll
-        for (int i = 0; i < DIGEST_LEN; ++i) {
-            header_hash.values[i] = state[i];
-        }
-        
-        // Apply POW MAST path
-        for (int i = 0; i < 3; ++i) {
-            header_hash = tip5_hash_fixed_device(header_hash, mast_paths.pow[i]);
-        }
-        
-        // Apply header MAST path
-        for (int i = 0; i < 2; ++i) {
-            header_hash = tip5_hash_fixed_device(header_hash, mast_paths.header[i]);
-        }
-        
-        // Apply kernel MAST path
-        Digest final_hash = tip5_hash_fixed_device(header_hash, mast_paths.kernel[0]);
+        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
         // Check against target
         bool is_solution = true;
@@ -345,38 +313,18 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
             running_b >>= 1;
         }
         
-        // Compute final hash (same as high_vram kernel)
+        // Compute final hash using correct fast_mast_hash implementation
         Digest merkle_root = d_internal_nodes[stored_nodes_count - 1];
-        
-        uint64_t state[STATE_SIZE];
-        tip5_sponge_init(state, Domain::VariableLength);
-        
+        Pow pow;
+        pow.root = merkle_root;
+        pow.nonce = nonce_digest;
         #pragma unroll
-        for (int i = 0; i < DIGEST_LEN; ++i) {
-            state[i] = nonce_digest.values[i];
-        }
-        state[DIGEST_LEN] = 0;
-        tip5_permutation(state);
-        
-        #pragma unroll
-        for (int i = 0; i < DIGEST_LEN; ++i) {
-            state[i] = merkle_root.values[i];
-        }
-        tip5_permutation(state);
-        
-        Digest header_hash;
-        #pragma unroll
-        for (int i = 0; i < DIGEST_LEN; ++i) {
-            header_hash.values[i] = state[i];
+        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+            pow.path_a[i] = path_a[i];
+            pow.path_b[i] = path_b[i];
         }
         
-        for (int i = 0; i < 3; ++i) {
-            header_hash = tip5_hash_fixed_device(header_hash, mast_paths.pow[i]);
-        }
-        for (int i = 0; i < 2; ++i) {
-            header_hash = tip5_hash_fixed_device(header_hash, mast_paths.header[i]);
-        }
-        Digest final_hash = tip5_hash_fixed_device(header_hash, mast_paths.kernel[0]);
+        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
         bool is_solution = true;
         for (int i = DIGEST_LEN - 1; i >= 0; --i) {
@@ -526,7 +474,7 @@ std::optional<Pow> mine_pow_with_buffer(
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block>>>(
                 buffer.d_leafs,
                 buffer.d_merkle_tree,
-                buffer.hash,
+                buffer.index_picker_preimage,
                 target,
                 start_nonce,
                 max_nonces,
@@ -546,7 +494,7 @@ std::optional<Pow> mine_pow_with_buffer(
             parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block>>>(
                 nullptr,
                 buffer.d_merkle_tree,
-                buffer.hash,
+                buffer.index_picker_preimage,
                 target,
                 start_nonce,
                 max_nonces,

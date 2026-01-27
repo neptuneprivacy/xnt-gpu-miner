@@ -285,6 +285,7 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
             return;  // Same puzzle, skip
         }
         gpu_resources->current_proposal_id = puzzle.id;
+        gpu_resources->current_target = hex_to_digest(puzzle.threshold);
     }
     
     resetNonceCounter(gpu_resources, puzzle.id);
@@ -597,7 +598,11 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
         
         auto start_time = std::chrono::high_resolution_clock::now();
         uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
-        Digest target = gpu_res->buffer->hash;
+        Digest target;
+        {
+            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+            target = gpu_res->current_target;
+        }
         
         auto result = mine_pow_with_buffer(
             *gpu_res->buffer,

@@ -173,6 +173,7 @@ struct GpuResources {
     
     HashRateTracker hash_tracker;
     std::string current_proposal_id;
+    Digest current_target;
     
     std::atomic<uint64_t> gpu_puzzle_random_start{0};
     std::atomic<uint64_t> gpu_puzzle_nonce_counter{0};
