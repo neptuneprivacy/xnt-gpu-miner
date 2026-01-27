@@ -350,6 +350,7 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
     
+    // Split each element into lo and hi 32-bit limbs
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         uint64_t b = state_in[i];
@@ -357,23 +358,19 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
         hi[i] = b >> 32;
     }
     
+    // Process each limb with FFT-based generated_function
     uint64_t lo_out[STATE_SIZE], hi_out[STATE_SIZE];
     generated_function(lo, lo_out);
     generated_function(hi, hi_out);
     
+    // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        uint64_t lo_part = lo_out[i] >> 4;
-        uint64_t hi_part = hi_out[i] << 28;
-        uint64_t s_lo = lo_part + hi_part;
-        uint64_t s_hi = 0;
-        if (s_lo < lo_part) {
-            s_hi = 1;
-        }
-        if (hi_part > (UINT64_MAX - lo_part)) {
-            s_hi += (hi_part >> 36);
-        }
+        __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
+        uint64_t s_hi = (uint64_t)(s >> 64);
+        uint64_t s_lo = (uint64_t)s;
         
+        // Goldilocks reduction with overflow check
         uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
         bool overflow = (res < s_lo);
         state_out[i] = overflow ? (res + 0xFFFFFFFFULL) : res;
@@ -482,10 +479,12 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
 __device__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
     
+    // OPTIMIZATION: Fused round constants - no separate function call
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         sbox_layer(state, temp_state);
         mds_layer(temp_state, state);
         
+        // Fused round constants addition
         #pragma unroll
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);

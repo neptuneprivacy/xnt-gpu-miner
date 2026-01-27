@@ -61,13 +61,16 @@ __device__ __forceinline__ uint64_t fast_bitreverse_64(uint64_t val, uint32_t bi
 
 __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl) {
     uint64_t shifted = xl << 32;
-    uint64_t a = xl - shifted;
-    bool e = a > xl;
-    uint64_t b = a + xh;
-    bool c = b < a;
-    bool c2 = c || e;
-    uint64_t r = c2 ? (b + GOLDILOCKS_MODULUS) : (b >= GOLDILOCKS_MODULUS ? b - GOLDILOCKS_MODULUS : b);
-    return r;
+    uint64_t a = xl + shifted;
+    bool e = (a < xl) | (a < shifted);
+
+    uint64_t b = a - (a >> 32);
+    if (e) b -= 1;
+
+    bool c = (xh < b);
+    a = xh - b;
+
+    return a - (0xFFFFFFFFULL & (c ? 0xFFFFFFFFFFFFFFFFULL : 0));
 }
 
 #ifdef _WIN32
@@ -86,20 +89,24 @@ __host__ inline uint64_t montyred_host(__uint128_t x) {
     uint64_t xh = static_cast<uint64_t>(x >> 64);
 #endif
     uint64_t shifted = xl << 32;
-    uint64_t a = xl - shifted;
-    bool e = a > xl;
-    uint64_t b = a + xh;
-    bool c = b < a;
-    uint64_t r = (c || e) ? (b + GOLDILOCKS_MODULUS) : b;
-    if (r >= GOLDILOCKS_MODULUS) r -= GOLDILOCKS_MODULUS;
-    return r;
+    uint64_t a = xl + shifted;
+    bool e = (a < xl) || (a < shifted);
+
+    uint64_t b = a - (a >> 32);
+    if (e) b -= 1;
+
+    bool c = (xh < b);
+    uint64_t r = xh - b;
+
+    return r - (0xFFFFFFFFULL & (c ? 0xFFFFFFFFFFFFFFFFULL : 0));
 }
 
 __device__ __forceinline__ uint64_t fast_field_add(uint64_t a, uint64_t b) {
+    // OPTIMIZATION #11: Simplified logic - only one condition needed
     uint64_t sum = a + b;
-    bool overflow = sum < a;
-    bool needs_reduction = sum >= GOLDILOCKS_MODULUS;
-    return (overflow || needs_reduction) ? (sum - GOLDILOCKS_MODULUS + (overflow ? GOLDILOCKS_MODULUS : 0)) : sum;
+    bool overflow = (sum < a);
+    bool needs_reduction = overflow || (sum >= GOLDILOCKS_MODULUS);
+    return sum - (needs_reduction ? GOLDILOCKS_MODULUS : 0);
 }
 
 __host__ inline uint64_t fast_field_add_host(uint64_t a, uint64_t b) {
@@ -125,26 +132,26 @@ __host__ inline uint64_t field_mul_host(uint64_t a, uint64_t b) {
     return montyred_host(prod);
 }
 
-__device__ __forceinline__ uint64_t x7_computer(uint64_t x) {
-    uint64_t lo2, hi2;
-    asm("mul.lo.u64 %0, %2, %2;\n\t"
-        "mul.hi.u64 %1, %2, %2;" : "=l"(lo2), "=l"(hi2) : "l"(x));
+__device__ __forceinline__ uint64_t x7_computer_pipelined(uint64_t x) {
+    uint64_t lo2 = x * x;
+    uint64_t hi2 = __umul64hi(x, x);
     uint64_t x2 = montyred_from_parts(hi2, lo2);
     
-    uint64_t lo4, hi4;
-    asm("mul.lo.u64 %0, %2, %2;\n\t"
-        "mul.hi.u64 %1, %2, %2;" : "=l"(lo4), "=l"(hi4) : "l"(x2));
+    uint64_t lo4 = x2 * x2;
+    uint64_t hi4 = __umul64hi(x2, x2);
     uint64_t x4 = montyred_from_parts(hi4, lo4);
     
-    uint64_t lo6, hi6;
-    asm("mul.lo.u64 %0, %2, %3;\n\t"
-        "mul.hi.u64 %1, %2, %3;" : "=l"(lo6), "=l"(hi6) : "l"(x4), "l"(x2));
+    uint64_t lo6 = x4 * x2;
+    uint64_t hi6 = __umul64hi(x4, x2);
     uint64_t x6 = montyred_from_parts(hi6, lo6);
     
-    uint64_t lo7, hi7;
-    asm("mul.lo.u64 %0, %2, %3;\n\t"
-        "mul.hi.u64 %1, %2, %3;" : "=l"(lo7), "=l"(hi7) : "l"(x6), "l"(x));
+    uint64_t lo7 = x6 * x;
+    uint64_t hi7 = __umul64hi(x6, x);
     return montyred_from_parts(hi7, lo7);
+}
+
+__device__ __forceinline__ uint64_t x7_computer(uint64_t x) {
+    return x7_computer_pipelined(x);
 }
 
 __host__ inline uint64_t x7_computer_host(uint64_t x) {
@@ -155,29 +162,32 @@ __host__ inline uint64_t x7_computer_host(uint64_t x) {
 }
 
 __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, const uint8_t* __restrict__ shared_lut) {
-    uint64_t lo1, hi1;
-    asm("mul.lo.u64 %0, %2, %3;\n\t"
-        "mul.hi.u64 %1, %2, %3;" : "=l"(lo1), "=l"(hi1) : "l"(element_in), "l"(R2));
+    uint64_t lo1 = element_in * R2;
+    uint64_t hi1 = __umul64hi(element_in, R2);
     uint64_t reduced_in = montyred_from_parts(hi1, lo1);
     
-    uint8_t addr0 = reduced_in & 0xFF;
-    uint8_t addr1 = (reduced_in >> 8) & 0xFF;
-    uint8_t addr2 = (reduced_in >> 16) & 0xFF;
-    uint8_t addr3 = (reduced_in >> 24) & 0xFF;
-    uint8_t addr4 = (reduced_in >> 32) & 0xFF;
-    uint8_t addr5 = (reduced_in >> 40) & 0xFF;
-    uint8_t addr6 = (reduced_in >> 48) & 0xFF;
-    uint8_t addr7 = (reduced_in >> 56) & 0xFF;
+    uint8_t addr0 = (uint8_t)(reduced_in >> 0);
+    uint8_t addr1 = (uint8_t)(reduced_in >> 8);
+    uint8_t addr2 = (uint8_t)(reduced_in >> 16);
+    uint8_t addr3 = (uint8_t)(reduced_in >> 24);
+    uint8_t addr4 = (uint8_t)(reduced_in >> 32);
+    uint8_t addr5 = (uint8_t)(reduced_in >> 40);
+    uint8_t addr6 = (uint8_t)(reduced_in >> 48);
+    uint8_t addr7 = (uint8_t)(reduced_in >> 56);
     
-    uint64_t sbox_out = shared_lut[addr0] | 
-                        (static_cast<uint64_t>(shared_lut[addr1]) << 8) |
-                        (static_cast<uint64_t>(shared_lut[addr2]) << 16) |
-                        (static_cast<uint64_t>(shared_lut[addr3]) << 24) |
-                        (static_cast<uint64_t>(shared_lut[addr4]) << 32) |
-                        (static_cast<uint64_t>(shared_lut[addr5]) << 40) |
-                        (static_cast<uint64_t>(shared_lut[addr6]) << 48) |
-                        (static_cast<uint64_t>(shared_lut[addr7]) << 56);
-    return x7_computer(sbox_out);
+    uint64_t b0 = shared_lut[addr0];
+    uint64_t b1 = shared_lut[addr1];
+    uint64_t b2 = shared_lut[addr2];
+    uint64_t b3 = shared_lut[addr3];
+    uint64_t b4 = shared_lut[addr4];
+    uint64_t b5 = shared_lut[addr5];
+    uint64_t b6 = shared_lut[addr6];
+    uint64_t b7 = shared_lut[addr7];
+    
+    uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
+                        (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+    
+    return montyred_from_parts(0, sbox_out);
 }
 
 __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
@@ -203,11 +213,14 @@ __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
 }
 
 __device__ __forceinline__ uint32_t get_mds_coeff(int i, int j) {
-    return MDS_COEFF[(STATE_SIZE - i + j) % STATE_SIZE];
+    // STATE_SIZE is 16, use bitmask for modulo 16
+    int idx = (i - j) & (STATE_SIZE - 1);
+    return MDS_COEFF[idx];
 }
 
 __host__ inline uint32_t get_mds_coeff_host(int i, int j) {
-    return MDS_COEFF_HOST[(STATE_SIZE - i + j) % STATE_SIZE];
+    int idx = (i - j) & (STATE_SIZE - 1);
+    return MDS_COEFF_HOST[idx];
 }
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out);
@@ -223,15 +236,12 @@ __device__ void tip5_permutation(uint64_t* state);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {
-    uint64_t capacity_val = static_cast<uint64_t>(domain);
+    // OPTIMIZATION #16: Combined initialization in single loop
+    uint64_t capacity_val = (domain == Domain::FixedLength) ? static_cast<uint64_t>(domain) : BFE_ZERO;
+    
     #pragma unroll
-    for (int i = 0; i < RATE; ++i) {
-        state[i] = 0;
-    }
-    state[RATE] = capacity_val;
-    #pragma unroll
-    for (int i = RATE + 1; i < STATE_SIZE; ++i) {
-        state[i] = 0;
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        state[i] = (i < RATE) ? BFE_ZERO : capacity_val;
     }
 }
 

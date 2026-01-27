@@ -2,37 +2,29 @@
 
 __device__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right) {
     uint64_t state[STATE_SIZE];
-    
     tip5_sponge_init(state, Domain::FixedLength);
     
+    // OPTIMIZATION #10: Directly write to state instead of using intermediate array
     #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         state[i] = left.values[i];
-    }
-    
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
         state[i + DIGEST_LEN] = right.values[i];
     }
-    
     tip5_permutation(state);
     
     Digest result;
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        result.values[i] = state[i];
-    }
+    tip5_sponge_squeeze(state, result.values);
     return result;
 }
 
 __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_len) {
     uint64_t state[STATE_SIZE];
-    
     tip5_sponge_init(state, Domain::VariableLength);
     
     size_t pos = 0;
     while (pos + RATE <= input_len) {
-        for (size_t i = 0; i < RATE; ++i) {
+        #pragma unroll
+        for (size_t i = 0; i < RATE; i++) {
             state[i] = input[pos + i];
         }
         tip5_permutation(state);
@@ -40,78 +32,69 @@ __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_le
     }
     
     size_t remaining = input_len - pos;
-    for (size_t i = 0; i < remaining; ++i) {
+    
+    #pragma unroll
+    for (size_t i = 0; i < RATE; i++) {
+        state[i] = BFE_ZERO;
+    }
+    
+    for (size_t i = 0; i < remaining; i++) {
         state[i] = input[pos + i];
     }
     
-    state[remaining] = input_len;
-    
-    for (size_t i = remaining + 1; i < RATE; ++i) {
-        state[i] = 0;
-    }
-    
+    state[remaining] = BFE_ONE;
     tip5_permutation(state);
     
     Digest result;
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        result.values[i] = state[i];
-    }
+    tip5_sponge_squeeze(state, result.values);
     return result;
 }
 
 __host__ Digest tip5_hash_fixed_host(const Digest& left, const Digest& right) {
     uint64_t state[STATE_SIZE];
-    
     tip5_sponge_init_host(state, Domain::FixedLength);
     
+    uint64_t combined_input[RATE];
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        state[i] = left.values[i];
+        combined_input[i] = left.values[i];
+        combined_input[i + DIGEST_LEN] = right.values[i];
     }
     
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        state[i + DIGEST_LEN] = right.values[i];
-    }
-    
-    tip5_permutation_host(state);
+    tip5_sponge_absorb_chunk_host(state, combined_input, RATE);
     
     Digest result;
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        result.values[i] = state[i];
-    }
+    tip5_sponge_squeeze_host(state, result.values);
     return result;
 }
 
 __host__ std::array<uint64_t, DIGEST_LEN> tip5_hash_fixed_host(
     const std::array<uint64_t, DIGEST_LEN>& left,
     const std::array<uint64_t, DIGEST_LEN>& right) {
-    
     uint64_t state[STATE_SIZE];
-    
     tip5_sponge_init_host(state, Domain::FixedLength);
     
+    uint64_t combined_input[RATE];
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        state[i] = left[i];
-        state[i + DIGEST_LEN] = right[i];
+        combined_input[i] = left[i];
+        combined_input[i + DIGEST_LEN] = right[i];
     }
     
-    tip5_permutation_host(state);
+    tip5_sponge_absorb_chunk_host(state, combined_input, RATE);
     
-    std::array<uint64_t, DIGEST_LEN> result;
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        result[i] = state[i];
-    }
-    return result;
+    std::array<uint64_t, DIGEST_LEN> digest;
+    tip5_sponge_squeeze_host(state, digest.data());
+    return digest;
 }
 
 __host__ Digest tip5_hash_varlen_host(const std::vector<uint64_t>& input) {
     uint64_t state[STATE_SIZE];
-    
     tip5_sponge_init_host(state, Domain::VariableLength);
     
     size_t pos = 0;
     while (pos + RATE <= input.size()) {
-        for (size_t i = 0; i < RATE; ++i) {
+        for (size_t i = 0; i < RATE; i++) {
             state[i] = input[pos + i];
         }
         tip5_permutation_host(state);
@@ -119,22 +102,21 @@ __host__ Digest tip5_hash_varlen_host(const std::vector<uint64_t>& input) {
     }
     
     size_t remaining = input.size() - pos;
-    for (size_t i = 0; i < remaining; ++i) {
+    
+    for (size_t i = 0; i < RATE; i++) {
+        state[i] = BFE_ZERO;
+    }
+    
+    for (size_t i = 0; i < remaining; i++) {
         state[i] = input[pos + i];
     }
     
-    state[remaining] = input.size();
-    
-    for (size_t i = remaining + 1; i < RATE; ++i) {
-        state[i] = 0;
-    }
+    state[remaining] = BFE_ONE;
     
     tip5_permutation_host(state);
     
     Digest result;
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        result.values[i] = state[i];
-    }
+    tip5_sponge_squeeze_host(state, result.values);
     return result;
 }
 
