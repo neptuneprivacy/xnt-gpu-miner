@@ -560,7 +560,8 @@ json powToRpcFormat(const Pow& pow_solution, const Digest& solution_hash) {
     json pow_json;
 
     // Digests are serialized as hex strings in the JSON-RPC API
-    pow_json["root"] = digest_to_hex(solution_hash);
+    // Use pow_solution.root (the Merkle root) not solution_hash (the final block hash)
+    pow_json["root"] = digest_to_hex(pow_solution.root);
 
     pow_json["pathA"] = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
