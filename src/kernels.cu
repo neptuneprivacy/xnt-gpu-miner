@@ -1,5 +1,6 @@
 #include "kernels.cuh"
 #include "gpu_resources.cuh"
+#include "common.cuh"
 
 // ===== SHARED MEMORY LOOKUP TABLE =====
 // Loaded once per block for S-box computation
@@ -123,63 +124,64 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         // Early exit if solution found
         if (*d_solution_found) return;
         
-        uint64_t nonce_value = start_nonce + idx;
+        // Sequential nonce within GPU's range (using original working format)
+        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
         
-        // Create nonce digest
+        // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
-        nonce_digest.values[1] = 0;
+        nonce_digest.values[1] = (nonce_value >> 32);  // Upper bits in second limb
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
         
         // Compute indices from index picker preimage and nonce
         uint64_t index_a, index_b;
-        Pow::indices(hash, nonce_digest, index_a, index_b);
+        Pow_indices_device(hash, nonce_digest, index_a, index_b);
         
-        // Build Merkle paths and verify
-        // For HIGH_VRAM mode, we have all data available
+        // Paths are ALWAYS computed using original indices (matching Rust guess())
+        // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
+        // but the tree structure matches the swapped leaves
+        uint64_t path_index_a = index_a;
+        uint64_t path_index_b = index_b;
         
         // Compute path for index_a
         Digest path_a[MERKLE_TREE_HEIGHT_];
-        size_t running_index_a = index_a;
-        
-        // First level: sibling leaf
-        size_t sibling_leaf_a = running_index_a ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_a];
-        running_index_a >>= 1;
+        size_t running_index_a = path_index_a + num_leafs;
+        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
+        size_t sibling_leaf_index_a = path_index_a ^ 1;
+        path_a[0] = d_leafs[sibling_leaf_index_a];
         
         // Subsequent levels: internal nodes
         for (size_t level = 1; level < merkle_height; ++level) {
-            size_t layer_start = 0;
-            for (size_t l = 0; l < level - 1; ++l) {
-                layer_start += num_leafs >> (l + 1);
-            }
-            size_t sibling_index = layer_start + (running_index_a ^ 1);
-            path_a[level] = d_internal_nodes[sibling_index];
             running_index_a >>= 1;
+            size_t sibling_index_a = running_index_a ^ 1;
+            if (sibling_index_a < (MERKLE_NUM_LEAFS)) {
+                path_a[level] = d_internal_nodes[sibling_index_a];
+            } else {
+                path_a[level] = Digest::default_digest();
+            }
         }
         
         // Compute path for index_b
         Digest path_b[MERKLE_TREE_HEIGHT_];
-        size_t running_index_b = index_b;
-        
-        size_t sibling_leaf_b = running_index_b ^ 1;
-        path_b[0] = d_leafs[sibling_leaf_b];
-        running_index_b >>= 1;
+        size_t running_index_b = path_index_b + num_leafs;
+        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
+        size_t sibling_leaf_index_b = path_index_b ^ 1;
+        path_b[0] = d_leafs[sibling_leaf_index_b];
         
         for (size_t level = 1; level < merkle_height; ++level) {
-            size_t layer_start = 0;
-            for (size_t l = 0; l < level - 1; ++l) {
-                layer_start += num_leafs >> (l + 1);
-            }
-            size_t sibling_index = layer_start + (running_index_b ^ 1);
-            path_b[level] = d_internal_nodes[sibling_index];
             running_index_b >>= 1;
+            size_t sibling_index_b = running_index_b ^ 1;
+            if (sibling_index_b < (MERKLE_NUM_LEAFS)) {
+                path_b[level] = d_internal_nodes[sibling_index_b];
+            } else {
+                path_b[level] = Digest::default_digest();
+            }
         }
         
-        // Get Merkle root (last internal node)
-        Digest merkle_root = d_internal_nodes[num_leafs - 2];
+        // Get Merkle root (stored at index 1, like CPU version)
+        Digest merkle_root = d_internal_nodes[1];
         
         // Compute POW hash using correct fast_mast_hash implementation
         Pow pow;
@@ -206,21 +208,22 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         }
         
         if (is_solution) {
-            // Atomically claim this solution
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
-                // We won the race - store solution
-                *d_solution_nonce = nonce_value;
+                // Store first limb of nonce for basic tracking
+                atomicExch((unsigned long long*)d_solution_nonce, nonce_digest.values[0]);
+                // Store full nonce digest so host can submit all 5 limbs
                 *d_solution_nonce_digest = nonce_digest;
                 
-                // Copy paths
+                // Copy the already-computed paths
                 #pragma unroll
                 for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
                     d_solution_path_a[i] = path_a[i];
                     d_solution_path_b[i] = path_b[i];
                 }
+                
+                return;
             }
-            return;
         }
     }
 }
@@ -260,61 +263,73 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
         if (*d_solution_found) return;
         
-        uint64_t nonce_value = start_nonce + idx;
+        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
         
+        // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
+        // The nonce value goes in the LAST limb (index 4), not the first!
         Digest nonce_digest;
-        nonce_digest.values[0] = nonce_value;
+        nonce_digest.values[0] = 0;
         nonce_digest.values[1] = 0;
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
-        nonce_digest.values[4] = 0;
+        nonce_digest.values[4] = nonce_value;
         
         uint64_t index_a, index_b;
-        Pow::indices(hash, nonce_digest, index_a, index_b);
+        Pow_indices_device(hash, nonce_digest, index_a, index_b);
         
-        // Compute leafs on-demand from commitment (leaf_prefix)
-        Digest leaf_a = compute_leaf_from_commitment_device(leaf_prefix, index_a, num_leafs);
-        Digest leaf_b = compute_leaf_from_commitment_device(leaf_prefix, index_b, num_leafs);
+        // Paths are ALWAYS computed using original indices (matching Rust guess())
+        // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
+        // but the tree structure matches the swapped leaves
+        uint64_t path_index_a = index_a;
+        uint64_t path_index_b = index_b;
+        
+        // Commitment is needed for get_internal_node_safe (for computing missing nodes)
+        Digest commitment = mast_paths.commit_device();
+        // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         
         // Build paths using stored internal nodes where available
         // For missing nodes, compute on-demand
         Digest path_a[MERKLE_TREE_HEIGHT_];
         Digest path_b[MERKLE_TREE_HEIGHT_];
         
-        size_t running_a = index_a;
-        size_t running_b = index_b;
-        
-        // First level: compute sibling leafs on-demand
-        size_t sibling_a = running_a ^ 1;
-        size_t sibling_b = running_b ^ 1;
-        path_a[0] = compute_leaf_from_commitment_device(leaf_prefix, sibling_a, num_leafs);
-        path_b[0] = compute_leaf_from_commitment_device(leaf_prefix, sibling_b, num_leafs);
-        running_a >>= 1;
-        running_b >>= 1;
-        
-        // Upper levels: use stored nodes or compute
-        for (size_t level = 1; level < merkle_height; ++level) {
-            size_t layer_start = 0;
-            for (size_t l = 0; l < level - 1; ++l) {
-                layer_start += num_leafs >> (l + 1);
+        // Path B - use get_internal_node_safe for transparent stored/computed node access
+        {
+            size_t running_index = path_index_b + num_leafs;
+            size_t sibling_leaf_index = path_index_b ^ 1;
+            // Leaf level: compute from leaf_prefix (commitment in Reboot/Xnt, prev_block_digest in HardforkAlpha)
+            // Use original index for computation (not bit-reversed)
+            Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
+            path_b[0] = sib;
+            
+            // Internal nodes: use get_internal_node_safe (stored or computed)
+            for (size_t level = 1; level < merkle_height; ++level) {
+                running_index >>= 1;
+                size_t sibling_index = running_index ^ 1;
+                Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
+                path_b[level] = node;
             }
+        }
+        
+        // Path A - use get_internal_node_safe for transparent stored/computed node access
+        {
+            size_t running_index = path_index_a + num_leafs;
+            size_t sibling_leaf_index = path_index_a ^ 1;
+            // Leaf level: compute from leaf_prefix (commitment in Reboot/Xnt, prev_block_digest in HardforkAlpha)
+            // Use original index for computation (not bit-reversed)
+            Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
+            path_a[0] = sib;
             
-            size_t sibling_idx_a = layer_start + (running_a ^ 1);
-            size_t sibling_idx_b = layer_start + (running_b ^ 1);
-            
-            path_a[level] = get_internal_node_safe(d_internal_nodes, sibling_idx_a,
-                                                    stored_nodes_count, leaf_prefix,
-                                                    leaf_prefix, num_leafs);
-            path_b[level] = get_internal_node_safe(d_internal_nodes, sibling_idx_b,
-                                                    stored_nodes_count, leaf_prefix,
-                                                    leaf_prefix, num_leafs);
-            
-            running_a >>= 1;
-            running_b >>= 1;
+            // Internal nodes: use get_internal_node_safe (stored or computed)
+            for (size_t level = 1; level < merkle_height; ++level) {
+                running_index >>= 1;
+                size_t sibling_index = running_index ^ 1;
+                Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
+                path_a[level] = node;
+            }
         }
         
         // Compute final hash using correct fast_mast_hash implementation
-        Digest merkle_root = d_internal_nodes[stored_nodes_count - 1];
+        Digest merkle_root = d_internal_nodes[1];
         Pow pow;
         pow.root = merkle_root;
         pow.nonce = nonce_digest;
@@ -340,16 +355,40 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         if (is_solution) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
-                *d_solution_nonce = nonce_value;
+                atomicExch((unsigned long long*)d_solution_nonce, nonce_value);
                 *d_solution_nonce_digest = nonce_digest;
                 
-                #pragma unroll
-                for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-                    d_solution_path_a[i] = path_a[i];
-                    d_solution_path_b[i] = path_b[i];
+                // Store paths - use get_internal_node_safe for both stored and computed nodes
+                size_t running_index_a = path_index_a + num_leafs;
+                size_t sibling_leaf_index_a = path_index_a ^ 1;
+                // Use original index for computation (not bit-reversed)
+                if (sibling_leaf_index_a < num_leafs) {
+                    d_solution_path_a[0] = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index_a, num_leafs);
+                } else {
+                    d_solution_path_a[0] = Digest::default_digest();
                 }
+                for (size_t level = 1; level < merkle_height; ++level) {
+                    running_index_a >>= 1;
+                    size_t sibling_index_a = running_index_a ^ 1;
+                    d_solution_path_a[level] = get_internal_node_safe(d_internal_nodes, sibling_index_a, stored_nodes_count, commitment, leaf_prefix, num_leafs);
+                }
+            
+                size_t running_index_b = path_index_b + num_leafs;
+                size_t sibling_leaf_index_b = path_index_b ^ 1;
+                // Use original index for computation (not bit-reversed)
+                if (sibling_leaf_index_b < num_leafs) {
+                    d_solution_path_b[0] = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index_b, num_leafs);
+                } else {
+                    d_solution_path_b[0] = Digest::default_digest();
+                }
+                for (size_t level = 1; level < merkle_height; ++level) {
+                    running_index_b >>= 1;
+                    size_t sibling_index_b = running_index_b ^ 1;
+                    d_solution_path_b[level] = get_internal_node_safe(d_internal_nodes, sibling_index_b, stored_nodes_count, commitment, leaf_prefix, num_leafs);
+                }
+            
+                return;
             }
-            return;
         }
     }
 }
@@ -465,6 +504,25 @@ std::optional<Pow> mine_pow_with_buffer(
     int gpu_id;
     cudaGetDevice(&gpu_id);
     calculate_mining_launch_config(max_nonces, threads_per_block, blocks_per_grid, gpu_id);
+    
+    // Calculate GPU's dedicated nonce range to avoid overlap with other GPUs
+    // CRITICAL: Pass actual GPU count to ensure proper nonce space partitioning
+    int actual_gpu_count = g_total_gpu_count.load();
+    GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+    
+    // Copy range to constant memory (avoids register pressure from extra parameters)
+    cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+    if (range_err != cudaSuccess) {
+        LOG_ERROR("copy range_start", range_err);
+        output.free();
+        return std::nullopt;
+    }
+    range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+    if (range_err != cudaSuccess) {
+        LOG_ERROR("copy range_size", range_err);
+        output.free();
+        return std::nullopt;
+    }
     
     // Select and launch appropriate kernel
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);

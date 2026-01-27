@@ -128,25 +128,20 @@ __device__ __forceinline__ Digest tip5_hash_fixed_right_zero_device(const Digest
 __device__ __forceinline__ Digest tip5_hash_varlen_len5_device(const Digest& in) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);
-    
-    #pragma unroll
+    // absorb 5 words
     for (int i = 0; i < DIGEST_LEN; ++i) {
         state[i] = in.values[i];
     }
-    state[DIGEST_LEN] = 5;
-    #pragma unroll
+    // padding marker
+    state[DIGEST_LEN] = BFE_ONE;
+    // zero the rest of the rate slots
     for (int i = DIGEST_LEN + 1; i < RATE; ++i) {
-        state[i] = 0;
+        state[i] = 0ULL;
     }
-    
     tip5_permutation(state);
-    
-    Digest result;
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        result.values[i] = state[i];
-    }
-    return result;
+    Digest out;
+    for (int i = 0; i < DIGEST_LEN; ++i) out.values[i] = state[i];
+    return out;
 }
 
 #endif

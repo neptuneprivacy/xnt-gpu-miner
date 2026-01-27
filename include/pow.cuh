@@ -189,7 +189,20 @@ __device__ void Pow_indices_device(
     uint64_t& index_a, uint64_t& index_b);
 
 uint64_t generate_secure_random_start(
-    const std::string& puzzle_id, int gpu_id, const std::string& gpu_uuid);
+    const std::string& puzzle_id, int gpu_id, 
+    const std::string& worker_id = "", const std::string& gpu_uuid = "");
+
+// GPU Range Calculation with Mining Pool Support
+struct GpuNonceRange {
+    uint64_t range_start;
+    uint64_t range_size;
+    int miner_id;
+    int total_miners;
+    int gpu_id;
+    int total_gpus;
+};
+
+GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus = 8);
 
 extern __constant__ uint64_t d_gpu_range_start;
 extern __constant__ uint64_t d_gpu_range_size;

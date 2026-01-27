@@ -122,23 +122,27 @@ std::vector<Digest> MTree::path(size_t index) const {
 __global__ void __launch_bounds__(256) bitreverse_swap_leafs_kernel(
     Digest* __restrict__ leafs,
     size_t num_leafs,
-    uint32_t log2_n) {
-    
+    uint32_t log2_n
+) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_leafs / 2) return;
     
-    // Compute bit-reversed index
-    uint32_t k = static_cast<uint32_t>(idx);
-    uint32_t rev_k = 0;
+    if (idx >= num_leafs) return;
     
-    #pragma unroll
-    for (uint32_t i = 0; i < log2_n; ++i) {
-        if ((k >> i) & 1) {
-            rev_k |= (1u << (log2_n - 1 - i));
-        }
-    }
+    // Calculate bit-reversed index - match Rust bitreverse implementation exactly
+    // Rust uses u32 and reverses only the lower log2_n bits
+    uint32_t k = (uint32_t)idx;
     
-    // Only swap if k < rev_k (to avoid double-swapping)
+    // Manual bit-reversal matching Rust implementation (for log2_n bits)
+    // This is more accurate than __brev which reverses all 32 bits
+    uint32_t rev_k = k;
+    rev_k = ((rev_k & 0x55555555) << 1) | ((rev_k & 0xaaaaaaaa) >> 1);
+    rev_k = ((rev_k & 0x33333333) << 2) | ((rev_k & 0xcccccccc) >> 2);
+    rev_k = ((rev_k & 0x0f0f0f0f) << 4) | ((rev_k & 0xf0f0f0f0) >> 4);
+    rev_k = ((rev_k & 0x00ff00ff) << 8) | ((rev_k & 0xff00ff00) >> 8);
+    rev_k = __funnelshift_r(rev_k, rev_k, 16);  // rotate_right(16)
+    rev_k = rev_k >> ((32 - log2_n) & 0x1f);
+    
+    // Only swap if k < rev_k (prevents double-swapping) - matches Rust swap_indices logic
     if (k < rev_k && rev_k < num_leafs) {
         Digest temp = leafs[k];
         leafs[k] = leafs[rev_k];
@@ -150,59 +154,64 @@ __global__ void __launch_bounds__(128) build_layer1_from_layer0_on_demand_kernel
     Digest* __restrict__ internal_nodes,
     size_t height,
     size_t num_leafs,
-    const Digest commitment) {
-    
+    const Digest commitment
+) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t layer1_start = num_leafs / 2;  // Layer 1 starts after layer 0
-    size_t layer1_count = num_leafs / 4;
-    
+    size_t layer1_start = 1ULL << (height - 2); // Layer 1 start index (2^25)
+    size_t layer1_count = 1ULL << (height - 2); // Number of nodes in layer 1  
     if (idx >= layer1_count) return;
     
+    // Write index will be [layer1_start + idx]
     size_t write_idx = layer1_start + idx;
     
-    // Layer 0 indices for children
-    size_t layer0_child_a = 2 * idx;
-    size_t layer0_child_b = 2 * idx + 1;
+    // Layer 1 node at write_idx has children from layer 0
+    size_t layer0_child_a = write_idx * 2;
+    size_t layer0_child_b = layer0_child_a + 1;
     
-    // Compute layer 0 nodes on-demand
-    // Each layer 0 node is hash of two leafs
-    uint64_t leaf_idx_a = layer0_child_a * 2;
-    uint64_t leaf_idx_b = layer0_child_a * 2 + 1;
-    Digest leaf_a = compute_leaf_from_commitment_device(commitment, leaf_idx_a, num_leafs);
-    Digest leaf_b = compute_leaf_from_commitment_device(commitment, leaf_idx_b, num_leafs);
-    Digest node_a = tip5_hash_fixed_device(leaf_a, leaf_b);
+    // Compute layer 0 children on-demand from leaves
+    // Each layer 0 node is built from 2 leaves
+    Digest layer0_node_a, layer0_node_b;
     
-    leaf_idx_a = layer0_child_b * 2;
-    leaf_idx_b = layer0_child_b * 2 + 1;
-    leaf_a = compute_leaf_from_commitment_device(commitment, leaf_idx_a, num_leafs);
-    leaf_b = compute_leaf_from_commitment_device(commitment, leaf_idx_b, num_leafs);
-    Digest node_b = tip5_hash_fixed_device(leaf_a, leaf_b);
+    // Compute layer 0 node a from its leaf children
+    {
+        uint64_t leaf_idx_a = (layer0_child_a - (1ULL << (height-1))) * 2;
+        uint64_t leaf_idx_b = leaf_idx_a + 1;
+        Digest leaf_a = compute_leaf_from_commitment_device_parallel(commitment, leaf_idx_a, num_leafs);
+        Digest leaf_b = compute_leaf_from_commitment_device_parallel(commitment, leaf_idx_b, num_leafs);
+        layer0_node_a = tip5_hash_fixed_device(leaf_a, leaf_b);
+    }
     
-    // Hash the two layer 0 nodes to get layer 1 node
-    internal_nodes[write_idx] = tip5_hash_fixed_device(node_a, node_b);
+    // Compute layer 0 node b from its leaf children
+    {
+        uint64_t leaf_idx_a = (layer0_child_b - (1ULL << (height-1))) * 2;
+        uint64_t leaf_idx_b = leaf_idx_a + 1;
+        Digest leaf_a = compute_leaf_from_commitment_device_parallel(commitment, leaf_idx_a, num_leafs);
+        Digest leaf_b = compute_leaf_from_commitment_device_parallel(commitment, leaf_idx_b, num_leafs);
+        layer0_node_b = tip5_hash_fixed_device(leaf_a, leaf_b);
+    }
+    
+    // Hash layer 0 children to create layer 1 node
+    internal_nodes[write_idx] = tip5_hash_fixed_device(layer0_node_a, layer0_node_b);
 }
 
 __global__ void __launch_bounds__(256) build_layer0_from_commitment_kernel(
     Digest* __restrict__ internal_nodes,
     size_t height,
     size_t num_leafs,
-    const Digest commitment) {
-    
+    const Digest commitment
+) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t layer_0_count = num_leafs / 2;
-    
+    size_t range_layer_0_start = 1ULL << (height - 1);
+    size_t layer_0_count = range_layer_0_start;
     if (idx >= layer_0_count) return;
-    
-    // Compute two leaf indices for this layer 0 node
-    uint64_t leaf_idx_a = idx * 2;
-    uint64_t leaf_idx_b = idx * 2 + 1;
-    
-    // Compute leafs from commitment
-    Digest leaf_a = compute_leaf_from_commitment_device(commitment, leaf_idx_a, num_leafs);
-    Digest leaf_b = compute_leaf_from_commitment_device(commitment, leaf_idx_b, num_leafs);
-    
-    // Hash to get layer 0 node
-    internal_nodes[idx] = tip5_hash_fixed_device(leaf_a, leaf_b);
+
+    uint64_t leaf_a_index = (uint64_t)(idx * 2ULL);
+    uint64_t leaf_b_index = leaf_a_index + 1ULL;
+
+    Digest leaf_a = compute_leaf_from_commitment_device(commitment, leaf_a_index, num_leafs);
+    Digest leaf_b = compute_leaf_from_commitment_device(commitment, leaf_b_index, num_leafs);
+
+    internal_nodes[range_layer_0_start + idx] = tip5_hash_fixed_device(leaf_a, leaf_b);
 }
 
 __global__ void __launch_bounds__(256) compute_buds_kernel(
@@ -210,56 +219,65 @@ __global__ void __launch_bounds__(256) compute_buds_kernel(
     const Digest commitment,
     size_t segment_len,
     size_t base_index) {
-    
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= segment_len) return;
-    
-    size_t global_idx = base_index + idx;
-    
-    // Compute bud using BUDDING_ROUNDS iterations
-    Digest hash = commitment;
-    for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
-        Digest round_digest;
-        round_digest.values[0] = global_idx;
-        round_digest.values[1] = 0;
-        round_digest.values[2] = 0;
-        round_digest.values[3] = 0;
-        round_digest.values[4] = round;
-        hash = tip5_hash_fixed_device(hash, round_digest);
+    if (idx < segment_len) {
+        size_t global_idx = base_index + idx;
+        // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
+        // hash = Tip5::hash_pair(hash, Digest::new([index, 0, 0, 0, round]))
+        Digest hash = commitment;
+        for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
+            // Create Digest with values [global_idx, 0, 0, 0, round]
+            Digest round_digest;
+            round_digest.values[0] = global_idx;
+            round_digest.values[1] = 0;
+            round_digest.values[2] = 0;
+            round_digest.values[3] = 0;
+            round_digest.values[4] = round;
+            hash = tip5_hash_fixed_device(hash, round_digest);
+        }
+        buds[global_idx] = hash;
     }
-    
-    buds[idx] = hash;
 }
 
 __global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
     Digest* __restrict__ leafs, 
     const Digest* __restrict__ buds, 
-    size_t num_leafs, 
-    size_t layer) {
-    
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t n = static_cast<uint32_t>(num_leafs);
-    
-    if (idx >= n) return;
-    
-    // Match Rust exactly: *leaf = Tip5::hash_pair(buds[k], buds[(k + (1 << i)) % NUM_LEAFS])
-    // For layer i, we hash buds[k] with buds[(k + (1 << i)) % NUM_LEAFS]
-    size_t k = idx;
-    size_t offset = 1ULL << layer;
-    size_t right_idx = (k + offset) % n;
-    
-    leafs[idx] = tip5_hash_fixed_device(buds[k], buds[right_idx]);
+    size_t num_leafs, size_t layer) {
+    // Fast 32-bit path when safe
+    if (num_leafs <= 0xFFFFFFFFu && layer < 32) {
+        uint32_t idx32 = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t n32 = static_cast<uint32_t>(num_leafs);
+        if (idx32 < n32) {
+            uint32_t stride32 = (1u << static_cast<unsigned int>(layer));
+            uint32_t buddy32 = (idx32 + stride32) & (n32 - 1u);
+            leafs[idx32] = tip5_hash_fixed_device(buds[idx32], buds[buddy32]);
+        }
+    } else {
+        size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < num_leafs) {
+            size_t stride = (1ULL << layer);
+            size_t mask = num_leafs - 1ULL; // num_leafs is power-of-two
+            size_t buddy_index = (idx + stride) & mask;
+            leafs[idx] = tip5_hash_fixed_device(buds[idx], buds[buddy_index]);
+        }
+    }
 }
 
 __global__ void __launch_bounds__(256) merkle_zip_kernel(
     Digest* __restrict__ parents, 
     const Digest* __restrict__ children, 
     size_t count) {
-    
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-    
-    parents[idx] = tip5_hash_fixed_device(children[2 * idx], children[2 * idx + 1]);
+    if (count <= 0xFFFFFFFFu) {
+        uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < static_cast<uint32_t>(count)) {
+            parents[idx] = tip5_hash_fixed_device(children[2*idx], children[2*idx+1]);
+        }
+    } else {
+        size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < count) {
+            parents[idx] = tip5_hash_fixed_device(children[2*idx], children[2*idx+1]);
+        }
+    }
 }
 
 // ===== DEVICE HELPER FUNCTIONS =====
@@ -271,54 +289,34 @@ __device__ __noinline__ Digest get_internal_node_safe(
     size_t node_index,
     size_t stored_nodes_count,
     const Digest& commitment,
-    const Digest& leaf_prefix,
-    size_t num_leafs) {
-    
-    // If node is stored, return it directly
+    const Digest& leaf_prefix,  // Commitment (Reboot/Xnt) or prev_block_digest (HardforkAlpha)
+    size_t num_leafs
+) {
+    // Fast path: If node is within stored buffer, return it directly
     if (node_index < stored_nodes_count) {
         return d_internal_nodes[node_index];
     }
     
-    // Otherwise, compute on demand
-    // This is used in low-VRAM mode where not all nodes are stored
+    // Slow path: Compute layer 0 node on-demand if needed
+    const size_t layer0_start = 1ULL << (MERKLE_TREE_HEIGHT_ - 1); // 2^26
+    const size_t layer0_end = 1ULL << MERKLE_TREE_HEIGHT_;   // 2^27
     
-    // Determine which layer this node is in
-    size_t layer = 0;
-    size_t layer_start = 0;
-    size_t layer_count = num_leafs / 2;
-    
-    while (layer_start + layer_count <= node_index) {
-        layer_start += layer_count;
-        layer_count /= 2;
-        layer++;
-    }
-    
-    size_t index_in_layer = node_index - layer_start;
-    
-    if (layer == 0) {
-        // Layer 0: hash two adjacent leafs
-        uint64_t leaf_a_idx = index_in_layer * 2;
+    if (node_index >= layer0_start && node_index < layer0_end) {
+        // Layer 0 node - compute from leaves
+        size_t layer0_idx = node_index - layer0_start;
+        uint64_t leaf_a_idx = layer0_idx * 2;
         uint64_t leaf_b_idx = leaf_a_idx + 1;
         
-        Digest leaf_a = compute_leaf_from_commitment_device(commitment, leaf_a_idx, num_leafs);
-        Digest leaf_b = compute_leaf_from_commitment_device(commitment, leaf_b_idx, num_leafs);
+        // Use leaf_prefix (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
+        Digest leaf_a = compute_leaf_from_commitment_device(leaf_prefix, leaf_a_idx, num_leafs);
+        Digest leaf_b = compute_leaf_from_commitment_device(leaf_prefix, leaf_b_idx, num_leafs);
         
+        // Hash and return
         return tip5_hash_fixed_device(leaf_a, leaf_b);
-    } else {
-        // Higher layers: recursively compute children
-        size_t child_layer_start = layer_start_index_device(layer - 1, num_leafs);
-        size_t child_a_idx = child_layer_start + index_in_layer * 2;
-        size_t child_b_idx = child_a_idx + 1;
-        
-        Digest child_a = get_internal_node_safe(d_internal_nodes, child_a_idx, 
-                                                 stored_nodes_count, commitment, 
-                                                 leaf_prefix, num_leafs);
-        Digest child_b = get_internal_node_safe(d_internal_nodes, child_b_idx,
-                                                 stored_nodes_count, commitment,
-                                                 leaf_prefix, num_leafs);
-        
-        return tip5_hash_fixed_device(child_a, child_b);
     }
+    
+    // Unknown index - return zero digest
+    return Digest::default_digest();
 }
 
 __device__ void compute_merkle_path(

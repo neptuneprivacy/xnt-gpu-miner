@@ -73,21 +73,44 @@ __global__ void __launch_bounds__(256) merkle_zip_kernel(
     size_t count);
 
 __device__ __forceinline__ Digest compute_leaf_from_commitment_device(
-    const Digest commitment, 
-    uint64_t base_index, 
-    size_t num_leafs) {
-    
-    Digest hash = commitment;
-    for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
-        Digest round_digest;
-        round_digest.values[0] = base_index;
-        round_digest.values[1] = 0;
-        round_digest.values[2] = 0;
-        round_digest.values[3] = 0;
-        round_digest.values[4] = round;
-        hash = tip5_hash_fixed_device(hash, round_digest);
+    const Digest commitment, uint64_t base_index, size_t num_leafs) {
+    const int kLevels = (int)NUM_BUD_LAYERS; // 5
+    const int span = 1 << kLevels;           // 32
+    Digest buf[1 << NUM_BUD_LAYERS];
+
+    // Compute all buds for this leaf
+    for (int i = 0; i < span; ++i) {
+        uint64_t idx = (base_index + (uint64_t)i) % (uint64_t)num_leafs;
+        // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
+        // hash = Tip5::hash_pair(hash, Digest::new([index, 0, 0, 0, round]))
+        Digest hash = commitment;
+        for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
+            // Create Digest with values [idx, 0, 0, 0, round]
+            Digest round_digest;
+            round_digest.values[0] = idx;
+            round_digest.values[1] = 0;
+            round_digest.values[2] = 0;
+            round_digest.values[3] = 0;
+            round_digest.values[4] = round;
+            hash = tip5_hash_fixed_device(hash, round_digest);
+        }
+        buf[i] = hash;
     }
-    return hash;
+
+    // Pairwise fold with doubling stride each level
+    for (int level = 0, step = 1; level < kLevels; ++level, step <<= 1) {
+        for (int i = 0; i < span; i += (step << 1)) {
+            buf[i] = tip5_hash_fixed_device(buf[i], buf[i + step]);
+        }
+    }
+    return buf[0];
+}
+
+// Parallel version - same implementation but may use shared memory optimizations in future
+__device__ __forceinline__ Digest compute_leaf_from_commitment_device_parallel(
+    const Digest commitment, uint64_t base_index, size_t num_leafs) {
+    // Use the same implementation as the regular version to avoid memory access issues
+    return compute_leaf_from_commitment_device(commitment, base_index, num_leafs);
 }
 
 __device__ __noinline__ Digest get_internal_node_safe(

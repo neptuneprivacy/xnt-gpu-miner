@@ -51,70 +51,86 @@ __host__ Digest PowMastPaths::commit() const {
 }
 
 Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
+    // 39 permutations to get the block hash, when Merkle tree height is 20
     auto pow_encoding = pow_obj.encode();
-    Digest pow_digest = tip5_hash_varlen_host(pow_encoding);
+    auto header_mast_hash = tip5_hash_fixed_host(tip5_hash_varlen_host(pow_encoding), this->pow[0]);
+    header_mast_hash = tip5_hash_fixed_host(header_mast_hash, this->pow[1]);
+    header_mast_hash = tip5_hash_fixed_host(this->pow[2], header_mast_hash);
     
-    // Match Rust fast_mast_hash ordering
-    Digest header_mast_hash = tip5_hash_fixed_host(pow_digest, pow[0]);
-    header_mast_hash = tip5_hash_fixed_host(header_mast_hash, pow[1]);
-    header_mast_hash = tip5_hash_fixed_host(pow[2], header_mast_hash);
+    // Convert header_mast_hash to vector for varlen hash
+    std::vector<uint64_t> header_encoding;
+    for (const auto& val : header_mast_hash.values) {
+        header_encoding.push_back(val);
+    }
+    auto kernel_mast_hash = tip5_hash_fixed_host(tip5_hash_varlen_host(header_encoding), this->header[0]);
+    kernel_mast_hash = tip5_hash_fixed_host(kernel_mast_hash, this->header[1]);
     
-    std::vector<uint64_t> header_vals(header_mast_hash.values,
-                                      header_mast_hash.values + DIGEST_LEN);
-    Digest header_var = tip5_hash_varlen_host(header_vals);
-    
-    Digest kernel_mast_hash = tip5_hash_fixed_host(header_var, header[0]);
-    kernel_mast_hash = tip5_hash_fixed_host(kernel_mast_hash, header[1]);
-    
-    std::vector<uint64_t> kernel_vals(kernel_mast_hash.values,
-                                      kernel_mast_hash.values + DIGEST_LEN);
-    Digest kernel_var = tip5_hash_varlen_host(kernel_vals);
-    
-    return tip5_hash_fixed_host(kernel_var, kernel[0]);
+    // Convert kernel_mast_hash to vector for varlen hash
+    std::vector<uint64_t> kernel_encoding;
+    for (const auto& val : kernel_mast_hash.values) {
+        kernel_encoding.push_back(val);
+    }
+    return tip5_hash_fixed_host(tip5_hash_varlen_host(kernel_encoding), this->kernel[0]);
 }
 
 __device__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
-    // Encode POW: nonce, path_b, path_a, root (BFieldCodec order)
-    constexpr size_t ENCODING_LEN = DIGEST_LEN * (1 + 2 * MERKLE_TREE_HEIGHT_ + 1);
-    uint64_t encoding[ENCODING_LEN];
-    size_t pos = 0;
+    // EXACT CPU LOGIC: Compute the encoding manually (correct size)
+    constexpr size_t POW_ENCODING_WORDS = 5 + 2 * MERKLE_TREE_HEIGHT_ * 5 + 5;
+    uint64_t encoding[POW_ENCODING_WORDS]; // nonce + paths + root
+    int idx = 0;
     
-    #pragma unroll
+    // Add nonce values first
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        encoding[pos++] = pow_obj.nonce.values[i];
-    }
-    
-    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-        #pragma unroll
-        for (int j = 0; j < DIGEST_LEN; ++j) {
-            encoding[pos++] = pow_obj.path_b[i].values[j];
+        if (idx < sizeof(encoding)/sizeof(encoding[0])) {
+            encoding[idx++] = pow_obj.nonce.values[i];
         }
     }
     
+    // Add path_b values
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
-            encoding[pos++] = pow_obj.path_a[i].values[j];
+            if (idx < sizeof(encoding)/sizeof(encoding[0])) {
+                encoding[idx++] = pow_obj.path_b[i].values[j];
+            }
+        }
+    }
+
+    // Add path_a values
+    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            if (idx < sizeof(encoding)/sizeof(encoding[0])) {
+                encoding[idx++] = pow_obj.path_a[i].values[j];
+            }
         }
     }
     
-    #pragma unroll
+    // Add root values
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        encoding[pos++] = pow_obj.root.values[i];
+        if (idx < sizeof(encoding)/sizeof(encoding[0])) {
+            encoding[idx++] = pow_obj.root.values[i];
+        }
     }
     
-    Digest pow_digest = tip5_hash_varlen_device(encoding, pos);
-    
-    Digest header_mast_hash = tip5_hash_fixed_device(pow_digest, pow[0]);
+    // Now compute the fast mast hash exactly like CPU version
+    auto pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
+    auto header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
     header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
     header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
     
-    Digest header_var = tip5_hash_varlen_device(header_mast_hash.values, DIGEST_LEN);
-    Digest kernel_mast_hash = tip5_hash_fixed_device(header_var, header[0]);
+    // Convert header_mast_hash to array for varlen hash
+    uint64_t header_encoding[5];
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        header_encoding[i] = header_mast_hash.values[i];
+    }
+    auto kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_device(header_encoding, DIGEST_LEN), header[0]);
     kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
     
-    Digest kernel_var = tip5_hash_varlen_device(kernel_mast_hash.values, DIGEST_LEN);
-    return tip5_hash_fixed_device(kernel_var, kernel[0]);
+    // Convert kernel_mast_hash to array for varlen hash
+    uint64_t kernel_encoding[5];
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        kernel_encoding[i] = kernel_mast_hash.values[i];
+    }
+    return tip5_hash_fixed_device(tip5_hash_varlen_device(kernel_encoding, DIGEST_LEN), kernel[0]);
 }
 
 VramMode detect_vram_mode(int gpu_id) {
@@ -172,8 +188,9 @@ __device__ void Pow::indices(const Digest& hash, const Digest& nonce,
                               uint64_t& index_a, uint64_t& index_b) {
     Digest indexer = tip5_hash_fixed_device(hash, nonce);
     
+    // Use fast right-zero hash variant for the bulk of repetitions
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
-        indexer = tip5_hash_fixed_device(indexer, Digest::default_digest());
+        indexer = tip5_hash_fixed_right_zero_device(indexer);
     }
     
     index_a = indexer.values[0] & MERKLE_INDEX_MASK;
@@ -479,51 +496,168 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
                                     consensus_rule_set, cancel_flag);
 }
 
-__device__ void Pow_indices_device(const Digest& hash, const Digest& nonce,
-                                    uint64_t& index_a, uint64_t& index_b) {
-    Pow::indices(hash, nonce, index_a, index_b);
+__device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
+    Digest indexer = tip5_hash_fixed_device(hash, nonce);
+    // Use fast right-zero hash variant for the bulk of repetitions
+    for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
+        indexer = tip5_hash_fixed_right_zero_device(indexer);
+    }
+
+    index_a = indexer.values[0] & MERKLE_INDEX_MASK;
+    index_b = indexer.values[1] & MERKLE_INDEX_MASK;
 }
 
-uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id,
-                                       const std::string& gpu_uuid) {
-    
+// Mining pool configuration
+static int g_miner_id = 0;           // Unique miner ID in pool (0-65535)
+static int g_total_miners = 1024;    // Total miners in pool (configurable)
+
+// Generate cryptographically strong random start with multiple entropy sources
+// Uses GPU UUID for hardware-unique identification instead of worker_id
+inline uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, const std::string& worker_id = "", const std::string& gpu_uuid = "") {
+    // Entropy source 1: High-resolution timestamp (nanoseconds)
     auto now = std::chrono::high_resolution_clock::now();
-    uint64_t timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        now.time_since_epoch()).count();
+    uint64_t timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
     
-    // Combine various entropy sources
-    uint64_t seed = timestamp_ns;
+    // Entropy source 2: Process ID (unique per miner instance)
+    uint64_t process_id = static_cast<uint64_t>(getpid());
     
-    // Mix in puzzle ID
-    for (char c : puzzle_id) {
-        seed = seed * 31 + c;
-    }
+    // Entropy source 3: Thread ID (additional randomness)
+    uint64_t thread_id = static_cast<uint64_t>(pthread_self());
     
-    // Mix in GPU ID
-    seed = seed * 17 + gpu_id;
-    
-    // Mix in GPU UUID
-    for (char c : gpu_uuid) {
-        seed = seed * 41 + c;
-    }
-    
-    // Add some hardware randomness if available
+    // Entropy source 4: Random device (hardware RNG if available)
     std::random_device rd;
-    try {
-        seed ^= rd();
-        seed ^= (static_cast<uint64_t>(rd()) << 32);
-    } catch (...) {
-        // Random device not available, continue with other entropy
+    uint64_t hw_random = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint64_t>(rd());
+    
+    // Entropy source 5: Memory address (ASLR provides randomness)
+    uint64_t stack_addr = reinterpret_cast<uint64_t>(&now);
+    
+    // Combine all entropy sources with XOR and mixing
+    uint64_t random_seed = timestamp_ns;
+    random_seed ^= process_id * 0x9e3779b97f4a7c15ULL;  // Golden ratio
+    random_seed ^= thread_id * 0x85ebca6b;
+    random_seed ^= hw_random;
+    random_seed ^= stack_addr;
+    
+    // Hash proposal_id (puzzle_id) to ensure different proposals get different nonce ranges
+    // This ensures the same GPU mines different nonce ranges for different jobs/proposals
+    uint64_t proposal_hash = 0;
+    for (size_t i = 0; i < puzzle_id.length(); ++i) {
+        proposal_hash = proposal_hash * 31 + (uint64_t)puzzle_id[i];
     }
     
-    // Final mixing
-    seed ^= (seed >> 33);
-    seed *= 0xff51afd7ed558ccdULL;
-    seed ^= (seed >> 33);
-    seed *= 0xc4ceb9fe1a85ec53ULL;
-    seed ^= (seed >> 33);
+    // NEW: Use GPU UUID AND proposal_id together for hardware-unique + job-unique identification
+    // GPU UUID ensures different GPUs get different ranges
+    // Proposal ID ensures the same GPU gets different ranges for different jobs/proposals
+    uint64_t gpu_proposal_combined = 0;
+    if (!gpu_uuid.empty()) {
+        uint64_t uuid_hash = 0;
+        for (size_t i = 0; i < gpu_uuid.length(); ++i) {
+            uuid_hash = uuid_hash * 31 + (uint64_t)gpu_uuid[i];
+        }
+        // Combine GPU UUID and proposal_id hash together
+        gpu_proposal_combined = uuid_hash ^ (proposal_hash * 0x9e3779b97f4a7c15ULL);
+        random_seed ^= gpu_proposal_combined;  // GPU UUID + proposal_id provides uniqueness per GPU per job
+    } else if (!worker_id.empty()) {
+        // Fallback 1: Use worker_id from server if GPU UUID not available
+        uint64_t worker_hash = 0;
+        for (size_t i = 0; i < worker_id.length(); ++i) {
+            worker_hash = worker_hash * 31 + (uint64_t)worker_id[i];
+        }
+        // Combine worker_id and proposal_id hash together
+        gpu_proposal_combined = worker_hash ^ (proposal_hash * 0x9e3779b97f4a7c15ULL);
+        random_seed ^= gpu_proposal_combined;
+    } else {
+        // Fallback 2: Use miner_id + gpu_id if neither UUID nor worker_id available
+        uint64_t fallback_hash = (uint64_t)g_miner_id ^ ((uint64_t)gpu_id * 0x9e3779b97f4a7c15ULL);
+        gpu_proposal_combined = fallback_hash ^ (proposal_hash * 0x9e3779b97f4a7c15ULL);
+        random_seed ^= gpu_proposal_combined;
+    }
     
-    return seed;
+
+    // Apply SplitMix64 hash mixing for better distribution
+    random_seed ^= (random_seed >> 30);
+    random_seed *= 0xbf58476d1ce4e5b9ULL;
+    random_seed ^= (random_seed >> 27);
+    random_seed *= 0x94d049bb133111ebULL;
+    random_seed ^= (random_seed >> 31);
+    
+    return random_seed;
+}
+
+// GPU Range Calculation with Mining Pool Support
+// Hierarchical partitioning: First by miner ID, then by GPU ID
+// Supports miners with hundreds of GPUs and large pools
+struct GpuNonceRange {
+    uint64_t range_start;
+    uint64_t range_size;
+    int miner_id;
+    int total_miners;
+    int gpu_id;
+    int total_gpus;
+};
+
+inline GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus = 8) {
+    // Get partition ID from environment (for nonce space partitioning)
+    // Check both PARTITION_ID (new) and MINER_ID (legacy) for backward compatibility
+    const char* env_partition_id = std::getenv("PARTITION_ID");
+    if (env_partition_id) {
+        int partition_val = std::atoi(env_partition_id);
+        if (partition_val >= 0 && partition_val < 65536) {
+            g_miner_id = partition_val;
+        }
+    } else {
+        // Legacy support for MINER_ID env var
+        const char* env_miner_id = std::getenv("MINER_ID");
+        if (env_miner_id) {
+            int miner_val = std::atoi(env_miner_id);
+            if (miner_val >= 0 && miner_val < 65536) {
+                g_miner_id = miner_val;
+            }
+        }
+    }
+    
+    // Get total miners in pool
+    const char* env_total_miners = std::getenv("POOL_SIZE");
+    if (env_total_miners) {
+        int pool_val = std::atoi(env_total_miners);
+        if (pool_val > 0 && pool_val <= 65536) {  // Support up to 65K miners
+            g_total_miners = pool_val;
+        }
+    }
+    
+    // Get GPUs per miner (support up to 36 GPUs per machine)
+    // NOTE: This env var is OPTIONAL - if not set, uses the total_gpus parameter
+    //       which should be the actual detected GPU count from the caller
+    const char* env_gpus = std::getenv("NUM_GPUS");
+    if (env_gpus) {
+        int env_val = std::atoi(env_gpus);
+        if (env_val > 0 && env_val <= 36) {  // Hardware limit: 36 GPUs per machine
+            total_gpus = env_val;
+        }
+    }
+    
+    GpuNonceRange range;
+    range.miner_id = g_miner_id;
+    range.total_miners = g_total_miners;
+    range.gpu_id = gpu_id;
+    range.total_gpus = total_gpus;
+    
+    // Two-level partitioning:
+    // Level 1: Divide by total miners in pool
+    // Level 2: Divide miner's range by GPUs per miner
+    
+    const uint64_t usable_bits = 62;
+    const uint64_t total_space = (1ULL << usable_bits);
+    
+    // Each miner gets: total_space / total_miners
+    uint64_t miner_range_size = total_space / g_total_miners;
+    uint64_t miner_range_start = miner_range_size * g_miner_id;
+    
+    // Each GPU within miner gets: miner_range / gpus_per_miner
+    range.range_size = miner_range_size / total_gpus;
+    range.range_start = miner_range_start + (range.range_size * gpu_id);
+    
+    return range;
 }
 
 // ===== SOLUTION VERIFICATION =====
