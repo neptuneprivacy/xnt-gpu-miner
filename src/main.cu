@@ -139,7 +139,7 @@ int main(int argc, char* argv[]) {
     try {
         startUnifiedMining(rpc_url, g_gpu_device_id);
     } catch (const std::exception& e) {
-        Console::showCursor();
+        
         std::string error_msg = e.what();
         // Replace full wallet address with shortened version in error messages
         if (!g_miner_wallet_address.empty() && error_msg.find(g_miner_wallet_address) != std::string::npos) {
@@ -153,7 +153,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    Console::showCursor();
+    
     cudaDeviceReset();
     std::cout << "\n" << Color::GREEN << "Mining stopped" << Color::RESET << std::endl;
     
