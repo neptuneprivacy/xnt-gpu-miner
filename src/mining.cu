@@ -295,12 +295,16 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
         }
         gpu_resources->current_proposal_id = puzzle.id;
         gpu_resources->current_template = template_obj;  // Store template for this proposal
-        // Make target 100000x easier for testing
         Digest original_target = hex_to_digest(puzzle.threshold);
         gpu_resources->current_real_target = original_target;
-        gpu_resources->current_target = make_target_easier(original_target, 100000);
-        std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
-                  << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
+        if (g_test_mode) {
+            // Make target 100000x easier for testing
+            gpu_resources->current_target = make_target_easier(original_target, 100000);
+            std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+                      << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
+        } else {
+            gpu_resources->current_target = original_target;
+        }
     }
     
     resetNonceCounter(gpu_resources, puzzle.id);
@@ -639,9 +643,8 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
         return false;
     }
     
-    // Make target 100000x easier for testing
     Digest original_target = hex_to_digest(puzzle.threshold);
-    Digest target = make_target_easier(original_target, 100000);
+    Digest target = g_test_mode ? make_target_easier(original_target, 100000) : original_target;
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
     
@@ -846,7 +849,6 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
         std::cout << "[Fetcher] Block proposal fetcher started" << std::endl;
     }
     
-    const int POLL_INTERVAL_SEC = 5;
     auto last_poll_time = std::chrono::steady_clock::now();
     std::string last_template_id;
     
@@ -857,7 +859,7 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
         
         bool should_poll = false;
         
-        if (time_since_poll >= POLL_INTERVAL_SEC) {
+        if (time_since_poll >= g_fetch_interval_sec) {
             should_poll = true;
         }
         

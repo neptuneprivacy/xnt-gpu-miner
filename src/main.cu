@@ -97,6 +97,20 @@ int main(int argc, char* argv[]) {
             }
         } else if ((arg == "--rpc-url") && i + 1 < argc) {
             rpc_url = argv[++i];
+        } else if (arg == "--test-mode") {
+            g_test_mode = true;
+        } else if ((arg == "--fetch-interval") && i + 1 < argc) {
+            try {
+                int interval = std::stoi(argv[++i]);
+                if (interval < 1) {
+                    std::cerr << Color::RED << "Error: Fetch interval must be at least 1 second" << Color::RESET << std::endl;
+                    return 1;
+                }
+                g_fetch_interval_sec = interval;
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid fetch interval: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
         } else if (arg[0] == '-') {
             std::cerr << Color::RED << "Error: Unknown option: " << arg << Color::RESET << std::endl;
             std::cerr << "Use --help or -h for usage information" << std::endl;

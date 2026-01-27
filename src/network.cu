@@ -13,7 +13,7 @@ NeptuneCudaMinerClient::NeptuneCudaMinerClient(
     RpcConfig config;
     config.url = rpc_url;
     config.timeout_sec = 30;
-    config.poll_interval_sec = 5;
+    config.poll_interval_sec = g_fetch_interval_sec;
     rpc_client = std::make_unique<XntRpcClient>(config);
 }
 
