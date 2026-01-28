@@ -301,7 +301,7 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     }
     
     size_t vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
-    if (vram_gb < 8) {
+    if (vram_gb < 6) {
         LOG_DEBUG("GPU " << device_id << " has insufficient VRAM (" << vram_gb << " GB)");
         return false;
     }

@@ -491,9 +491,176 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
                                                      const Digest& prev_block_digest,
                                                      int consensus_rule_set,
                                                      bool* cancel_flag) {
-    LOG_DEBUG("preprocess_low_vram: falling back to high_vram implementation");
-    return preprocess_gpu_high_vram(mast_auth_paths, prev_block_digest,
-                                    consensus_rule_set, cancel_flag);
+    GuesserBuffer buffer;
+    
+    // For mainnet blocks >= 15256, we use CONSENSUS_XNT
+    Digest commitment = mast_auth_paths.commit();
+    
+    buffer.hash = commitment;
+    buffer.prev_block_digest = prev_block_digest;
+    buffer.consensus_rule_set = CONSENSUS_XNT;
+    buffer.mast_paths = mast_auth_paths;
+    buffer.num_leafs = MERKLE_NUM_LEAFS;
+    
+    LOG_DEBUG("preprocess_low_vram: commitment computed");
+    
+    if (cancel_flag && *cancel_flag) {
+        return GuesserBuffer();
+    }
+    
+    // For LOW_VRAM mode: Build tree temporarily to get root, then store only top layers
+    // Store top 8 layers (last 255 nodes in sequential tree) + root = 256 nodes
+    const size_t TOP_LAYERS = 8;
+    const size_t STORED_NODES_COUNT = (1ULL << TOP_LAYERS);  // 256 nodes (top 8 layers + root)
+    
+    // Allocate buffer for top layers
+    size_t internal_size = STORED_NODES_COUNT * sizeof(Digest);
+    cudaError_t alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc internal_nodes (low_vram)", alloc_err);
+        return GuesserBuffer();
+    }
+    buffer.tree_size = STORED_NODES_COUNT;
+    
+    LOG_DEBUG("preprocess_low_vram: allocated " << (internal_size / 1024) << " KB for top " << TOP_LAYERS << " layers");
+    
+    // Build full tree temporarily to extract root and top layers.
+    // Use managed memory to avoid VRAM OOM on low-memory GPUs.
+    size_t full_tree_size = (MERKLE_NUM_LEAFS - 1) * sizeof(Digest);
+    Digest* d_full_tree_temp = nullptr;
+    alloc_err = cudaMallocManaged(&d_full_tree_temp, full_tree_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMallocManaged full_tree_temp (low_vram)", alloc_err);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    // Build leafs temporarily
+    size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
+    Digest* d_temp_leafs = nullptr;
+    alloc_err = cudaMallocManaged(&d_temp_leafs, leafs_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMallocManaged temp_leafs (low_vram)", alloc_err);
+        cudaFree(d_full_tree_temp);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    Digest* d_temp_leafs2 = nullptr;
+    alloc_err = cudaMallocManaged(&d_temp_leafs2, leafs_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMallocManaged temp_leafs2 (low_vram)", alloc_err);
+        cudaFree(d_temp_leafs);
+        cudaFree(d_full_tree_temp);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    int threadsPerBlock = 256;
+    
+    // Compute leafs from commitment
+    int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
+    compute_buds_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_temp_leafs, commitment, MERKLE_NUM_LEAFS, 0);
+    
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+        LOG_ERROR("compute_buds_kernel sync", sync_err);
+        cudaFree(d_temp_leafs);
+        cudaFree(d_temp_leafs2);
+        cudaFree(d_full_tree_temp);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    // Convert buds to leafs
+    Digest* current_buds = d_temp_leafs;
+    Digest* current_leafs = d_temp_leafs2;
+    
+    for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
+        if (cancel_flag && *cancel_flag) {
+            cudaFree(d_temp_leafs);
+            cudaFree(d_temp_leafs2);
+            cudaFree(d_full_tree_temp);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        
+        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
+        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
+            current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
+        
+        sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            LOG_ERROR("compute_leafs_from_buds_kernel sync", sync_err);
+            cudaFree(d_temp_leafs);
+            cudaFree(d_temp_leafs2);
+            cudaFree(d_full_tree_temp);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        
+        std::swap(current_buds, current_leafs);
+    }
+    
+    // Build internal tree
+    const Digest* current_layer = current_buds;
+    size_t write_offset = 0;
+    size_t current_count = MERKLE_NUM_LEAFS;
+    
+    for (size_t layer = 0; layer < MERKLE_TREE_HEIGHT_; ++layer) {
+        if (cancel_flag && *cancel_flag) {
+            cudaFree(d_temp_leafs);
+            cudaFree(d_temp_leafs2);
+            cudaFree(d_full_tree_temp);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        
+        size_t parent_count = current_count / 2;
+        Digest* parent_layer = d_full_tree_temp + write_offset;
+        
+        int layerBlocks = (parent_count + threadsPerBlock - 1) / threadsPerBlock;
+        merkle_zip_kernel<<<layerBlocks, threadsPerBlock>>>(
+            parent_layer, current_layer, parent_count);
+        
+        sync_err = cudaDeviceSynchronize();
+        if (sync_err != cudaSuccess) {
+            LOG_ERROR("merkle_zip_kernel sync", sync_err);
+            cudaFree(d_temp_leafs);
+            cudaFree(d_temp_leafs2);
+            cudaFree(d_full_tree_temp);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        
+        current_layer = parent_layer;
+        write_offset += parent_count;
+        current_count = parent_count;
+    }
+    
+    // Copy root (last node in tree)
+    cudaMemcpy(&buffer.merkle_root, d_full_tree_temp + write_offset - 1,
+               sizeof(Digest), cudaMemcpyDeviceToHost);
+    
+    // Copy top layers (last STORED_NODES_COUNT nodes) to our buffer
+    // Root will be at buffer.d_merkle_tree[STORED_NODES_COUNT - 1]
+    size_t top_layers_start_offset = write_offset - STORED_NODES_COUNT;
+    cudaMemcpy(buffer.d_merkle_tree, 
+               d_full_tree_temp + top_layers_start_offset,
+               STORED_NODES_COUNT * sizeof(Digest),
+               cudaMemcpyDeviceToDevice);
+    
+    // Free temporary buffers
+    cudaFree(d_temp_leafs);
+    cudaFree(d_temp_leafs2);
+    cudaFree(d_full_tree_temp);
+    
+    // Precompute index picker preimage
+    buffer.index_picker_preimage = tip5_hash_fixed_host(buffer.merkle_root, commitment);
+    
+    LOG_DEBUG("preprocess_low_vram: complete (stored " << buffer.tree_size << " nodes)");
+    return buffer;
 }
 
 __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
