@@ -5,6 +5,8 @@
 #include "network.cuh"
 #include <string>
 #include <chrono>
+#include <mutex>
+#include <atomic>
 
 class Pow;
 struct Digest;
@@ -37,9 +39,10 @@ struct RpcConfig {
 class XntRpcClient {
 private:
     RpcConfig config;
-    int request_id_counter;
+    std::atomic<int> request_id_counter;
     mutable RpcError last_error;
     mutable std::string last_error_message;
+    mutable std::mutex rpc_mutex;  // Thread-safety for RPC calls
     
     bool send_http_post(const std::string& url,
                         const std::string& body,

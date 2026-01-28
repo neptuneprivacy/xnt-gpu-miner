@@ -209,11 +209,13 @@ XntRpcClient::XntRpcClient(const std::string& url,
 bool XntRpcClient::make_rpc_request(const std::string& method,
                                    const json& params,
                                    json& response) {
+    std::lock_guard<std::mutex> lock(rpc_mutex);
+    
     json request;
     request["jsonrpc"] = "2.0";
     request["method"] = method;
     request["params"] = params;
-    request["id"] = request_id_counter++;
+    request["id"] = request_id_counter.fetch_add(1);
     
     std::string request_body = request.dump();
     std::string auth_header = build_auth_header();

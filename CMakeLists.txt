@@ -99,6 +99,7 @@ set(MODULAR_HEADERS
     include/network.cuh
     include/gpu_resources.cuh
     include/mining.cuh
+    include/connection_multiplexer.cuh
 )
 
 set(MODULAR_SOURCES
@@ -111,6 +112,7 @@ set(MODULAR_SOURCES
     src/network.cu
     src/rpc_client.cu
     src/gpu_resources.cu
+    src/connection_multiplexer.cu
     src/mining.cu
     src/main.cu
 )
@@ -126,10 +128,10 @@ if(BUILD_MONOLITHIC)
     set_target_properties(xnt-miner PROPERTIES
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
-    
+
     # Add NVCC-specific compiler definitions for MSVC compatibility
     if(MSVC)
-        target_compile_definitions(xnt-miner PRIVATE 
+        target_compile_definitions(xnt-miner PRIVATE
             __NVCC__=1
             __CUDACC_VER_MAJOR__=12
             __CUDACC_VER_MINOR__=6

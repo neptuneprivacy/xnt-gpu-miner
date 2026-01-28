@@ -36,6 +36,7 @@ MODULAR_SRCS = src/common.cu \
                src/network.cu \
                src/rpc_client.cu \
                src/gpu_resources.cu \
+               src/connection_multiplexer.cu \
                src/mining.cu \
                src/main.cu
 

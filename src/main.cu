@@ -1,4 +1,5 @@
 #include "mining.cuh"
+#include "connection_multiplexer.cuh"
 
 void print_usage(const char* program_name) {
     std::cerr << "\n" << Color::BOLD << "Usage:" << Color::RESET << std::endl;
@@ -9,7 +10,7 @@ void print_usage(const char* program_name) {
     
     std::cerr << Color::BOLD << "Optional:" << Color::RESET << std::endl;
     std::cerr << "  -d, --device ID       Use specific GPU device ID (default: all GPUs)" << std::endl;
-    std::cerr << "  --rpc-url URL        RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
+    std::cerr << "  --rpc-url URL         RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;

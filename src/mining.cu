@@ -1,120 +1,60 @@
 #include "mining.cuh"
 #include "rpc_client.cuh"
+#include "connection_multiplexer.cuh"
 #include "common.cuh"
 
-UnifiedMiningController* g_mining_controller = nullptr;
+// ============================================================================
+// GpuWorker Implementation
+// ============================================================================
 
-UnifiedMiningController::UnifiedMiningController(
-    int gpu_id,
-    GpuResources* resources,
-    const std::string& rpc_url)
-    : rpc_url(rpc_url)
-    , gpu_id(gpu_id)
-    , gpu_resources(resources) {
+GpuWorker::GpuWorker(int gpu_id, GpuResources* resources)
+    : gpu_id(gpu_id)
+    , gpu_resources(resources)
+    , worker_handle(nullptr) {
 }
 
-UnifiedMiningController::~UnifiedMiningController() {
+GpuWorker::~GpuWorker() {
     stop();
 }
 
-void UnifiedMiningController::start() {
+void GpuWorker::start() {
     gpu_resources->event_handler = std::make_unique<EventHandler>();
     
-    NeptuneCudaMinerClient* new_client = new NeptuneCudaMinerClient(rpc_url, g_miner_wallet_address);
-    {
-        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        gpu_resources->client = new_client;
-    }
+    // Register with the connection multiplexer
+    ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
+    worker_handle = mux.registerWorker(gpu_id, gpu_resources);
     
-    int retry_count = 0;
-    bool connected = false;
-    
-    while (!connected && !stop_mining && !gpu_resources->gpu_stop_flag) {
-        NeptuneCudaMinerClient* client_ptr = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-            client_ptr = gpu_resources->client;
-        }
-        
-        if (!client_ptr) break;
-        
-        if (gpu_id == 0) {
-            std::cout << "Attempting to connect to RPC server at " << rpc_url << "..." << std::endl;
-        }
-        if (client_ptr->connect_to_node()) {
-            connected = true;
-            if (gpu_id == 0) {
-                std::cout << "Successfully connected to RPC server!" << std::endl;
-            }
-            break;
-        }
-        
-        retry_count++;
-        
-        if (gpu_id == 0) {
-            std::cout << "Connection attempt " << retry_count << " failed, retrying in 10 seconds..." << std::endl;
-        }
-        
-        for (int i = 0; i < 10 && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
-    
-    if (!connected) {
-        if (gpu_id == 0) {
-            std::cout << "Connection aborted after " << retry_count << " attempts" << std::endl;
-        }
-        
-        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        delete gpu_resources->client;
-        gpu_resources->client = nullptr;
-        gpu_resources->gpu_node_connected = false;
+    if (!worker_handle) {
+        std::cerr << "[GPU " << gpu_id << "] Failed to register with multiplexer" << std::endl;
         return;
     }
     
-    gpu_resources->gpu_node_connected = true;
-    
-    if (gpu_id == 0) {
-        std::cout << "Initializing CUDA..." << std::endl;
-    }
-    
+    // Initialize CUDA for this GPU
     if (!initializeCuda()) {
-        if (gpu_id == 0) {
-            std::cout << Color::RED << "Failed to initialize CUDA for GPU " << gpu_id << Color::RESET << std::endl;
-        }
-        LOG_DEBUG("Failed to initialize CUDA for GPU " << gpu_id);
+        std::cerr << "[GPU " << gpu_id << "] Failed to initialize CUDA" << std::endl;
         return;
     }
     
     if (gpu_id == 0) {
         std::cout << Color::GREEN << "CUDA initialized successfully" << Color::RESET << std::endl;
-        std::cout << "Starting mining controller..." << std::endl;
-    }
-    
-    controller_running = true;
-    fetcher_thread = std::thread(&UnifiedMiningController::fetcherLoop, this);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
-    if (gpu_id == 0) {
         std::cout << "Mining loop started. Waiting for block proposals..." << std::endl;
     }
     
+    worker_running = true;
+    gpu_resources->gpu_node_connected = true;  // Multiplexer handles connection
+    
+    // Run the mining loop directly (no fetcher thread needed)
     miningLoop();
     
-    if (fetcher_thread.joinable()) {
-        fetcher_thread.join();
-    }
-    {
-        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        if (gpu_resources->client) {
-            delete gpu_resources->client;
-            gpu_resources->client = nullptr;
-        }
+    // Unregister from multiplexer
+    if (worker_handle) {
+        mux.unregisterWorker(worker_handle);
+        worker_handle = nullptr;
     }
 }
 
-void UnifiedMiningController::stop() {
-    controller_running = false;
+void GpuWorker::stop() {
+    worker_running = false;
     gpu_resources->gpu_stop_flag = true;
     
     if (gpu_resources->event_handler) {
@@ -122,14 +62,13 @@ void UnifiedMiningController::stop() {
     }
 }
 
-bool UnifiedMiningController::initializeCuda() {
+bool GpuWorker::initializeCuda() {
     cudaError_t err = cudaSetDevice(gpu_id);
     if (err != cudaSuccess) {
         LOG_ERROR("cudaSetDevice", err);
         return false;
     }
     
-    // Get device properties
     cudaDeviceProp prop;
     err = cudaGetDeviceProperties(&prop, gpu_id);
     if (err != cudaSuccess) {
@@ -137,106 +76,21 @@ bool UnifiedMiningController::initializeCuda() {
         return false;
     }
     
-    // Store GPU info
     gpu_resources->gpu_name = prop.name;
     gpu_resources->gpu_vram_total = prop.totalGlobalMem;
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
-    
-    // Use default values (database removed)
     gpu_resources->optimal_max_nonces = 1000000ULL;
     
     return true;
 }
 
-bool UnifiedMiningController::connectToNode() {
-    NeptuneCudaMinerClient* client_ptr = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        client_ptr = gpu_resources->client;
-    }
-    
-    if (!client_ptr) return false;
-    return client_ptr->connect_to_node();
-}
-
-bool UnifiedMiningController::reconnect_to_node() {
-    // Check if reconnection already in progress
-    bool expected = false;
-    if (!gpu_resources->gpu_reconnection_in_progress.compare_exchange_strong(expected, true)) {
-        // Wait for existing reconnection
-        int wait_count = 0;
-        while (gpu_resources->gpu_reconnection_in_progress && !stop_mining && wait_count < 120) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            wait_count++;
-        }
-        return gpu_resources->gpu_node_connected;
-    }
-    
-    // Pause mining during reconnection
-    gpu_resources->set_paused(true);
-    
-    // RPC doesn't require explicit disconnection
-    
-    gpu_resources->gpu_node_connected = false;
-    
-    // Attempt reconnection with backoff
-    int attempt = 0;
-    bool connected = false;
-    
-    const int MAX_RECONNECT_ATTEMPTS = 10;
-    while (!connected && !stop_mining && !gpu_resources->gpu_stop_flag && attempt < MAX_RECONNECT_ATTEMPTS) {
-        attempt++;
-        
-        // Calculate backoff delay
-        int delay = std::min(MIN_RECONNECT_DELAY_SEC * (1 << (attempt - 1)), MAX_RECONNECT_DELAY_SEC);
-        
-        LOG_DEBUG("[GPU " << gpu_id << "] Reconnection attempt " << attempt 
-                  << " in " << delay << "s...");
-        
-        // Wait with early exit on stop signal
-        for (int i = 0; i < delay && !stop_mining && !gpu_resources->gpu_stop_flag; ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        
-        if (stop_mining || gpu_resources->gpu_stop_flag) break;
-        
-        // Try to connect
-        NeptuneCudaMinerClient* client_ptr = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-            client_ptr = gpu_resources->client;
-        }
-        
-        if (client_ptr && client_ptr->connect_to_node()) {
-            connected = true;
-            gpu_resources->gpu_node_connected = true;
-            LOG_DEBUG("[GPU " << gpu_id << "] Reconnected successfully");
-        }
-    }
-    
-    gpu_resources->gpu_reconnection_in_progress = false;
-    
-    if (connected) {
-        gpu_resources->set_paused(false);
-    }
-    
-    return connected;
-}
-
-void UnifiedMiningController::fetcherLoop() {
-    puzzleFetcher(gpu_resources, this);
-}
-
-void UnifiedMiningController::miningLoop() {
-    while (controller_running && !stop_mining && !gpu_resources->gpu_stop_flag) {
+void GpuWorker::miningLoop() {
+    while (worker_running && !stop_mining && !gpu_resources->gpu_stop_flag) {
         MiningEvent event;
         bool has_event = gpu_resources->event_handler->waitForEvent(
             event, std::chrono::milliseconds(1000));
         
         if (!has_event) {
-            if (!gpu_resources->gpu_node_connected && !gpu_resources->gpu_reconnection_in_progress) {
-                reconnect_to_node();
-            }
             continue;
         }
         
@@ -245,20 +99,8 @@ void UnifiedMiningController::miningLoop() {
                 handleNewPuzzle(event);
                 break;
                 
-            case EventType::SOLUTION_FOUND:
-                handleSolutionFound(event);
-                break;
-                
             case EventType::STOP_MINING:
-                controller_running = false;
-                break;
-                
-            case EventType::ERROR_EVENT:
-                handleError(event);
-                break;
-                
-            case EventType::RECONNECT:
-                reconnect_to_node();
+                worker_running = false;
                 break;
                 
             default:
@@ -267,7 +109,7 @@ void UnifiedMiningController::miningLoop() {
     }
 }
 
-void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
+void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
     if (event.data.empty()) {
         std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Empty puzzle data" << Color::RESET << std::endl;
         return;
@@ -294,11 +136,10 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
             return;  // Same puzzle, skip
         }
         gpu_resources->current_proposal_id = puzzle.id;
-        gpu_resources->current_template = template_obj;  // Store template for this proposal
+        gpu_resources->current_template = template_obj;
         Digest original_target = hex_to_digest(puzzle.threshold);
         gpu_resources->current_real_target = original_target;
         if (g_test_mode) {
-            // Make target 100000x easier for testing
             gpu_resources->current_target = make_target_easier(original_target, 100000);
             std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
                       << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
@@ -312,12 +153,11 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
     Digest prev_block = hex_to_digest(puzzle.prev_block);
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     
-    // Check if we can reuse existing buffer (same prev_block and MAST paths)
+    // Check if we can reuse existing buffer
     bool need_preprocess = true;
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         if (gpu_resources->buffer && gpu_resources->buffer->is_valid()) {
-            // Check if prev_block matches
             bool prev_block_match = true;
             for (int i = 0; i < DIGEST_LEN; ++i) {
                 if (gpu_resources->cached_prev_block.values[i] != prev_block.values[i]) {
@@ -326,7 +166,6 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
                 }
             }
             
-            // Check if MAST paths match (for XNT consensus, commitment depends on MAST paths)
             bool mast_paths_match = true;
             if (prev_block_match) {
                 for (int i = 0; i < 3; ++i) {
@@ -338,34 +177,14 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
                     }
                     if (!mast_paths_match) break;
                 }
-                if (mast_paths_match) {
-                    for (int i = 0; i < 2; ++i) {
-                        for (int j = 0; j < DIGEST_LEN; ++j) {
-                            if (gpu_resources->cached_mast_paths.header[i].values[j] != mast_paths.header[i].values[j]) {
-                                mast_paths_match = false;
-                                break;
-                            }
-                        }
-                        if (!mast_paths_match) break;
-                    }
-                }
-                if (mast_paths_match) {
-                    for (int j = 0; j < DIGEST_LEN; ++j) {
-                        if (gpu_resources->cached_mast_paths.kernel[0].values[j] != mast_paths.kernel[0].values[j]) {
-                            mast_paths_match = false;
-                            break;
-                        }
-                    }
-                }
             }
             
             if (prev_block_match && mast_paths_match) {
                 need_preprocess = false;
-                // Update MAST paths in buffer and cache (for consistency)
                 gpu_resources->buffer->mast_paths = mast_paths;
                 gpu_resources->cached_mast_paths = mast_paths;
                 std::cout << "[GPU " << gpu_id << "] " << Color::GREEN 
-                          << "Reusing cached buffer (same prev_block and MAST paths)" << Color::RESET << std::endl;
+                          << "Reusing cached buffer" << Color::RESET << std::endl;
             }
         }
     }
@@ -385,7 +204,6 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
         std::cout << "[GPU " << gpu_id << "] " << Color::GREEN << "Finished preprocessing" << Color::RESET 
                   << " (" << std::fixed << std::setprecision(2) << preprocess_seconds << "s)" << std::endl;
         
-        // Update cache
         {
             std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
             gpu_resources->cached_prev_block = prev_block;
@@ -396,56 +214,28 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
     gpu_resources->update_job_received();
     gpu_resources->set_paused(false);
     
-    // Log new job received
     std::string short_id = puzzle.id.length() > 20 ? puzzle.id.substr(0, 12) + "..." + puzzle.id.substr(puzzle.id.length() - 8) : puzzle.id;
     std::cout << "[GPU " << gpu_id << "] " << Color::CYAN << Color::BOLD 
-              << "✓ New job received" << Color::RESET 
+              << "New job received" << Color::RESET 
               << " | Template ID: " << Color::CYAN << short_id << Color::RESET << std::endl;
     
+    // Run the continuous mining loop
     continuousMiningLoop(gpu_resources, this);
 }
 
-void UnifiedMiningController::handleSolutionFound(const MiningEvent& event) {
-    LOG_DEBUG("[GPU " << gpu_id << "] Solution found event received");
+std::future<bool> GpuWorker::submitSolution(
+    const std::string& proposal_id,
+    const Pow& pow_solution,
+    const Digest& solution_hash,
+    const json& template_obj) {
+    
+    ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
+    return mux.submitSolution(gpu_id, proposal_id, pow_solution, solution_hash, template_obj);
 }
 
-void UnifiedMiningController::handleError(const MiningEvent& event) {
-    LOG_DEBUG("[GPU " << gpu_id << "] Error: " << event.data);
-    
-    if (event.data.find("connection") != std::string::npos ||
-        event.data.find("disconnect") != std::string::npos) {
-        reconnect_to_node();
-    }
-}
-
-json UnifiedMiningController::requestJob() {
-    NeptuneCudaMinerClient* client_ptr = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        client_ptr = gpu_resources->client;
-    }
-    
-    if (!client_ptr || !client_ptr->is_connected()) {
-        return json();
-    }
-    
-    return client_ptr->getBlockTemplate();
-}
-
-bool UnifiedMiningController::processJobResponse(const json& job_response) {
-    if (job_response.empty()) return false;
-    
-    if (job_response.contains("error")) {
-        LOG_DEBUG("[GPU " << gpu_id << "] Job error: " << job_response["error"].get<std::string>());
-        return false;
-    }
-    std::string job_data = job_response.dump();
-    gpu_resources->event_handler->postEvent(EventType::NEW_PUZZLE, "", job_data);
-    
-    return true;
-}
-
-// ===== MULTI-GPU MANAGER IMPLEMENTATION =====
+// ============================================================================
+// MultiGpuManager Implementation
+// ============================================================================
 
 MultiGpuManager::MultiGpuManager(
     const std::string& rpc_url,
@@ -521,12 +311,10 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
     gpu_res->optimal_max_nonces = 1000000ULL;
     
-    auto controller = std::make_unique<UnifiedMiningController>(
-        device_id, gpu_res.get(), rpc_url
-    );
-    
+    // Create GpuWorker (uses shared connection through multiplexer)
+    auto worker = std::make_unique<GpuWorker>(device_id, gpu_res.get());
     gpu_resources.push_back(std::move(gpu_res));
-    controllers.push_back(std::move(controller));
+    workers.push_back(std::move(worker));
     
     std::cout << "Initialized GPU " << device_id << ": " << prop.name 
               << " (" << vram_gb << " GB)" << std::endl;
@@ -540,9 +328,17 @@ void MultiGpuManager::startAll() {
         return;
     }
     
-    for (size_t i = 0; i < controllers.size(); ++i) {
-        gpu_threads.emplace_back(&MultiGpuManager::gpuMiningThread, this, i);
-        if (i < controllers.size() - 1) {
+    // Initialize the connection multiplexer first
+    ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
+    if (!mux.initialize(rpc_url, g_miner_wallet_address)) {
+        std::cerr << "Failed to initialize connection multiplexer" << std::endl;
+        return;
+    }
+    
+    // Start GPU worker threads
+    for (size_t i = 0; i < workers.size(); ++i) {
+        gpu_threads.emplace_back(&MultiGpuManager::gpuWorkerThread, this, i);
+        if (i < workers.size() - 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
@@ -557,8 +353,9 @@ void MultiGpuManager::startAll() {
 void MultiGpuManager::stopAll() {
     stop_mining = true;
     
-    for (auto& controller : controllers) {
-        controller->stop();
+    // Stop workers first
+    for (auto& worker : workers) {
+        worker->stop();
     }
     
     // Wait for threads
@@ -567,6 +364,9 @@ void MultiGpuManager::stopAll() {
             thread.join();
         }
     }
+    
+    // Shutdown multiplexer after workers are done
+    ConnectionMultiplexer::destroyInstance();
     
     for (auto& res : gpu_resources) {
         if (res->buffer) {
@@ -586,9 +386,9 @@ GpuResources* MultiGpuManager::getGpuResources(size_t index) {
     return gpu_resources[index].get();
 }
 
-void MultiGpuManager::gpuMiningThread(size_t index) {
-    if (index >= controllers.size()) return;
-    controllers[index]->start();
+void MultiGpuManager::gpuWorkerThread(size_t index) {
+    if (index >= workers.size()) return;
+    workers[index]->start();
 }
 
 void startUnifiedMining(
@@ -610,6 +410,142 @@ void startUnifiedMining(
     
     cleanup_gpu_memory();
 }
+
+// ============================================================================
+// Continuous Mining Loop
+// ============================================================================
+
+bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
+    if (!gpu_res || !worker) return false;
+    
+    auto last_status_time = std::chrono::steady_clock::now();
+    const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
+    
+    while (!stop_mining && !gpu_res->gpu_stop_flag) {
+        if (gpu_res->gpu_pause_flag) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
+        // Check for new events (new puzzle)
+        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
+            break;
+        }
+        
+        if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
+            gpu_res->set_paused(true);
+            continue;
+        }
+        
+        std::string proposal_id;
+        {
+            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+            proposal_id = gpu_res->current_proposal_id;
+        }
+        
+        if (proposal_id.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
+        auto start_time = std::chrono::high_resolution_clock::now();
+        uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
+        Digest target;
+        {
+            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+            target = gpu_res->current_target;
+        }
+        
+        auto result = mine_pow_with_buffer(
+            *gpu_res->buffer,
+            target,
+            gpu_res->buffer->mast_paths,
+            start_nonce,
+            gpu_res->optimal_max_nonces,
+            gpu_res->buffer->consensus_rule_set,
+            nullptr
+        );
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        
+        gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
+        
+        if (duration_ms > 0) {
+            double hashrate_ms = static_cast<double>(gpu_res->optimal_max_nonces) / duration_ms;
+            gpu_res->hash_tracker.add(hashrate_ms);
+        }
+        
+        // Periodic status update
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_status_time >= STATUS_UPDATE_INTERVAL) {
+            double avg_hashrate = gpu_res->hash_tracker.get_average();
+            double hashrate_hps = avg_hashrate * 1000.0;
+            std::string hashrate_str = format_hashrate(hashrate_hps);
+            
+            uint64_t total_nonces = gpu_res->total_nonces_tested.load();
+            uint64_t accepted = gpu_res->solutions_accepted.load();
+            uint64_t rejected = gpu_res->solutions_rejected.load();
+            
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
+                      << "Mining..." << Color::RESET 
+                      << " | Hash Rate: " << Color::YELLOW << hashrate_str << Color::RESET
+                      << " | Nonces: " << total_nonces
+                      << " | " << Color::GREEN << accepted << Color::RESET 
+                      << " / " << Color::RED << rejected << Color::RESET 
+                      << " (success / reject)" << std::endl;
+            
+            last_status_time = now;
+        }
+        
+        if (result.has_value()) {
+            gpu_res->solutions_found++;
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
+                      << "*** SOLUTION FOUND! ***" << Color::RESET 
+                      << " Submitting to node..." << std::endl;
+            
+            PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
+            Digest solution_hash = mast_paths.fast_mast_hash(result.value());
+            
+            json template_obj;
+            {
+                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                template_obj = gpu_res->current_template;
+            }
+            
+            // Submit through multiplexer (async, get future)
+            auto future = worker->submitSolution(
+                proposal_id,
+                result.value(),
+                solution_hash,
+                template_obj
+            );
+            
+            // Wait for result (with timeout)
+            if (future.wait_for(std::chrono::seconds(30)) == std::future_status::ready) {
+                bool accepted = future.get();
+                if (accepted) {
+                    gpu_res->solutions_accepted++;
+                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
+                              << "*** BLOCK ACCEPTED! ***" << Color::RESET 
+                              << " | Total blocks mined: " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET << std::endl;
+                } else {
+                    gpu_res->solutions_rejected++;
+                }
+            } else {
+                gpu_res->solutions_rejected++;
+                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
+                          << "Solution submission timed out" << Color::RESET << std::endl;
+            }
+        }
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 bool preprocessPuzzle(const PowPuzzle& puzzle, GpuResources* gpu_res) {
     if (!gpu_res) return false;
@@ -664,139 +600,9 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
     return result.has_value();
 }
 
-bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* controller) {
-    if (!gpu_res || !controller) return false;
-    
-    auto last_status_time = std::chrono::steady_clock::now();
-    const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
-    
-    while (!stop_mining && !gpu_res->gpu_stop_flag) {
-        if (gpu_res->gpu_pause_flag) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        
-        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
-            break;
-        }
-        
-        if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
-            gpu_res->set_paused(true);
-            continue;
-        }
-        
-        std::string proposal_id;
-        {
-            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-            proposal_id = gpu_res->current_proposal_id;
-        }
-        
-        if (proposal_id.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
-        Digest target;
-        {
-            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-            target = gpu_res->current_target;
-        }
-        
-        auto result = mine_pow_with_buffer(
-            *gpu_res->buffer,
-            target,
-            gpu_res->buffer->mast_paths,
-            start_nonce,
-            gpu_res->optimal_max_nonces,
-            gpu_res->buffer->consensus_rule_set,
-            nullptr
-        );
-        
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        
-        // Update nonce counter
-        gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
-        
-        if (duration_ms > 0) {
-            double hashrate_ms = static_cast<double>(gpu_res->optimal_max_nonces) / duration_ms;
-            gpu_res->hash_tracker.add(hashrate_ms);
-        }
-        
-        // Periodic status update
-        auto now = std::chrono::steady_clock::now();
-        if (now - last_status_time >= STATUS_UPDATE_INTERVAL) {
-            double avg_hashrate = gpu_res->hash_tracker.get_average();
-            double hashrate_hps = avg_hashrate * 1000.0; // Convert from K nonces/ms to H/s
-            std::string hashrate_str = format_hashrate(hashrate_hps);
-            
-            uint64_t total_nonces = gpu_res->total_nonces_tested.load();
-            uint64_t accepted = gpu_res->solutions_accepted.load();
-            uint64_t rejected = gpu_res->solutions_rejected.load();
-            
-            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
-                      << "Mining..." << Color::RESET 
-                      << " | Hash Rate: " << Color::YELLOW << hashrate_str << Color::RESET
-                      << " | Nonces: " << total_nonces
-                      << " | " << Color::GREEN << accepted << Color::RESET 
-                      << " / " << Color::RED << rejected << Color::RESET 
-                      << " (success / reject)" << std::endl;
-            
-            last_status_time = now;
-        }
-        
-        if (result.has_value()) {
-            gpu_res->solutions_found++;
-            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
-                      << "*** SOLUTION FOUND! ***" << Color::RESET 
-                      << " Submitting to node..." << std::endl;
-            
-            NeptuneCudaMinerClient* client = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                client = gpu_res->client;
-            }
-            
-            if (client && client->is_connected()) {
-                PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
-                Digest solution_hash = mast_paths.fast_mast_hash(result.value());
-                
-                // Get the template for this proposal
-                json template_obj;
-                {
-                    std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                    template_obj = gpu_res->current_template;
-                }
-                
-                bool accepted = client->submit_solution(
-                    proposal_id,
-                    result.value(),
-                    solution_hash,
-                    template_obj
-                );
-                
-                if (accepted) {
-                    gpu_res->solutions_accepted++;
-                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
-                              << "*** ✓ BLOCK ACCEPTED! ✓ ***" << Color::RESET 
-                      << " | Total blocks mined: " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET << std::endl;
-                } else {
-                    gpu_res->solutions_rejected++;
-                }
-            } else {
-                gpu_res->solutions_rejected++;
-                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                          << "Cannot submit - not connected to node" << Color::RESET << std::endl;
-            }
-        }
-    }
-    
-    return true;
-}
-
-// ===== NONCE MANAGEMENT =====
+// ============================================================================
+// Nonce Management
+// ============================================================================
 
 uint64_t getNextNonceRange(GpuResources* gpu_res, uint64_t batch_size) {
     if (!gpu_res) return 0;
@@ -819,7 +625,9 @@ void resetNonceCounter(GpuResources* gpu_res, const std::string& puzzle_id) {
     gpu_res->gpu_puzzle_nonce_counter = 0;
 }
 
-// ===== SIGNAL HANDLING =====
+// ============================================================================
+// Signal Handling
+// ============================================================================
 
 void signal_handler(int signal) {
     if (signal == SIGINT) {
@@ -840,173 +648,4 @@ void install_signal_handlers() {
 #ifndef _WIN32
     signal(SIGTERM, signal_handler);
 #endif
-}
-
-void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
-    if (!gpu_res || !controller) return;
-    
-    if (gpu_res->gpu_id == 0) {
-        std::cout << "[Fetcher] Block proposal fetcher started" << std::endl;
-    }
-    
-    auto last_poll_time = std::chrono::steady_clock::now();
-    std::string last_template_id;
-    
-    while (!stop_mining && !gpu_res->gpu_stop_flag && controller->isRunning()) {
-        auto now = std::chrono::steady_clock::now();
-        auto time_since_poll = std::chrono::duration_cast<std::chrono::seconds>(
-            now - last_poll_time).count();
-        
-        bool should_poll = false;
-        
-        if (time_since_poll >= g_fetch_interval_sec) {
-            should_poll = true;
-        }
-        
-        {
-            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-            if (gpu_res->current_proposal_id.empty()) {
-                should_poll = true;
-            }
-        }
-        
-        if (gpu_res->get_time_since_last_job() > JOB_STALENESS_THRESHOLD_SEC) {
-            should_poll = true;
-        }
-        
-        if (should_poll) {
-            NeptuneCudaMinerClient* client = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                client = gpu_res->client;
-            }
-            
-            if (client && client->is_connected()) {
-                json template_response = client->getBlockTemplate();
-                
-                if (!template_response.empty() && template_response.contains("result")) {
-                    json result = template_response["result"];
-                    if (!result.contains("template") || result["template"].is_null()) {
-                        // Template is null - node may be syncing
-                        if (gpu_res->gpu_id == 0) {
-                            static auto last_null_log = std::chrono::steady_clock::now();
-                            auto now = std::chrono::steady_clock::now();
-                            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_null_log).count();
-                            if (elapsed >= 30) {  // Log every 30 seconds to avoid spam
-                                std::cout << "[Fetcher] Waiting for block proposal (node may be syncing)..." << std::endl;
-                                last_null_log = now;
-                            }
-                        }
-                        continue;
-                    }
-                    json template_obj = result["template"];
-                    if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
-                        continue;
-                    }
-                    json metadata = template_obj["metadata"];
-                    std::string template_id = metadata.contains("digest") && !metadata["digest"].is_null() 
-                        ? metadata.value("digest", "") : "";
-                    
-                    if (template_id != last_template_id && !template_id.empty()) {
-                        XntRpcClient* rpc_client = client->get_rpc_client();
-                        if (rpc_client) {
-                            std::string tip_digest = rpc_client->getTipDigest();
-                            // Handle both snake_case (prev_block) and camelCase (prevBlock)
-                            std::string prev_block;
-                            if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
-                                prev_block = metadata.value("prev_block", "");
-                            } else if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
-                                prev_block = metadata.value("prevBlock", "");
-                            }
-                            
-                            if (tip_digest == prev_block) {
-                                PowPuzzle puzzle = parseRpcTemplate(template_response);
-                                
-                                if (puzzle.is_valid()) {
-                                    client->cache_puzzle(template_obj);
-                                    // Pass full response so parsePowPuzzle can find result.template
-                                    std::string puzzle_data = template_response.dump();
-                                    gpu_res->event_handler->postEvent(EventType::NEW_PUZZLE, "", puzzle_data);
-                                    gpu_res->update_job_received();
-                                    last_template_id = template_id;
-                                    
-                                } else {
-                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                                              << "✗ Block proposal invalid (missing required fields)" << Color::RESET << std::endl;
-                                }
-                            } else {
-                                LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");
-                            }
-                        }
-                    }
-                } else if (!template_response.empty() && template_response.contains("error")) {
-                    if (gpu_res->gpu_id == 0) {
-                        std::cerr << Color::RED << "[Fetcher] RPC error: " 
-                                  << template_response["error"].value("message", "Unknown error") 
-                                  << Color::RESET << std::endl;
-                    }
-                } else if (template_response.empty()) {
-                    if (gpu_res->gpu_id == 0) {
-                        static auto last_empty_log = std::chrono::steady_clock::now();
-                        auto now = std::chrono::steady_clock::now();
-                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_empty_log).count();
-                        if (elapsed >= 30) {
-                            std::cout << "[Fetcher] " << Color::YELLOW << "Empty response from RPC" << Color::RESET << std::endl;
-                            last_empty_log = now;
-                        }
-                    }
-                }
-                
-                last_poll_time = std::chrono::steady_clock::now();
-            } else {
-                if (!gpu_res->gpu_reconnection_in_progress) {
-                    if (gpu_res->gpu_id == 0) {
-                        static auto last_reconnect_log = std::chrono::steady_clock::now();
-                        auto now = std::chrono::steady_clock::now();
-                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_reconnect_log).count();
-                        if (elapsed >= 10) {
-                            std::cout << "[Fetcher] " << Color::YELLOW << "Not connected, attempting reconnect..." << Color::RESET << std::endl;
-                            last_reconnect_log = now;
-                        }
-                    }
-                    gpu_res->event_handler->postEvent(EventType::RECONNECT);
-                }
-            }
-        }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    
-    if (gpu_res->gpu_id == 0) {
-        std::cout << "[Fetcher] Block proposal fetcher stopped" << std::endl;
-    }
-}
-
-bool verifySolution(
-    const Pow& pow,
-    const PowPuzzle& puzzle,
-    const Digest& commitment,
-    const Digest& target) {
-    
-    auto [index_a, index_b] = Pow::indices(commitment, pow.nonce);
-    Digest leaf_a = Pow::compute_leaf_from_commitment_host(commitment, index_a, MERKLE_NUM_LEAFS);
-    Digest leaf_b = Pow::compute_leaf_from_commitment_host(commitment, index_b, MERKLE_NUM_LEAFS);
-    
-    bool path_a_valid = Pow::verify_merkle_path_host(pow.root, index_a, pow.path_a, leaf_a);
-    bool path_b_valid = Pow::verify_merkle_path_host(pow.root, index_b, pow.path_b, leaf_b);
-    
-    if (!path_a_valid || !path_b_valid) {
-        LOG_DEBUG("Merkle path verification failed");
-        return false;
-    }
-    
-    PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
-    Digest final_hash = mast_paths.fast_mast_hash(pow);
-    
-    if (!digest_less_than_or_equal(final_hash, target)) {
-        LOG_DEBUG("Hash does not meet target");
-        return false;
-    }
-    
-    return true;
 }
