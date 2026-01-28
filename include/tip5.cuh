@@ -39,10 +39,15 @@ enum class Domain : uint64_t {
     VariableLength = BFE_ZERO
 };
 
+// These are defined in tip5.cu
 #ifndef TIP5_DEFINING_CONSTANTS
 extern __constant__ uint32_t MDS_COEFF[STATE_SIZE];
 extern __constant__ uint64_t ROUND_CONSTANTS[NUM_ROUNDS][STATE_SIZE];
 extern __constant__ uint8_t LOOKUP_TABLE[256];
+#endif
+
+// These are defined in kernels.cu
+#ifndef KERNELS_DEFINING_RANGE_CONSTANTS
 extern __constant__ uint64_t d_gpu_range_start;
 extern __constant__ uint64_t d_gpu_range_size;
 #endif

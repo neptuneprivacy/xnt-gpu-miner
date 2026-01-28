@@ -1,6 +1,14 @@
+// Define before including headers to prevent extern declarations of d_gpu_range_*
+#define KERNELS_DEFINING_RANGE_CONSTANTS
+
 #include "kernels.cuh"
 #include "gpu_resources.cuh"
 #include "common.cuh"
+
+// ===== GPU RANGE CONSTANTS =====
+// Define the __constant__ variables here (declared extern in tip5.cuh for other TUs)
+__constant__ uint64_t d_gpu_range_start;
+__constant__ uint64_t d_gpu_range_size;
 
 // ===== SHARED MEMORY LOOKUP TABLE =====
 // Loaded once per block for S-box computation

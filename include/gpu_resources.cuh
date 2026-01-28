@@ -2,8 +2,10 @@
 #define XNT_GPU_RESOURCES_CUH
 
 #include "pow.cuh"
+#include "mining_client.h"
 
 class NeptuneCudaMinerClient;
+class MiningClient;
 class GuesserBuffer;
 
 enum class EventType {
@@ -162,7 +164,8 @@ struct GpuResources {
     
     std::unique_ptr<EventHandler> event_handler;
     std::unique_ptr<GuesserBuffer> buffer;
-    NeptuneCudaMinerClient* client;
+    MiningClient* client;  // Polymorphic client (Solo or Stratum)
+    MiningMode mining_mode;  // Current mining mode
     
     std::atomic<bool> gpu_stop_flag{false};
     std::atomic<bool> gpu_pause_flag{false};
@@ -196,11 +199,17 @@ struct GpuResources {
         : gpu_id(id)
         , gpu_vram_total(0)
         , client(nullptr)
+        , mining_mode(MiningMode::Solo)
         , optimal_max_nonces(1000000ULL) {
         auto now = std::chrono::steady_clock::now();
         last_template_received_time = now;
         session_start_time = now;
         gpu_pause_flag = true;
+    }
+    
+    // Helper to check if using stratum mode
+    bool is_stratum_mode() const {
+        return mining_mode == MiningMode::Stratum;
     }
     
     ~GpuResources() = default;

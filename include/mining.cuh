@@ -13,20 +13,24 @@ extern UnifiedMiningController* g_mining_controller;
 
 class UnifiedMiningController {
 public:
-    std::string rpc_url;
+    std::string endpoint;  // RPC URL or Stratum URL
     int gpu_id;
     GpuResources* gpu_resources;
+    MiningMode mining_mode;  // Solo or Stratum
     
 private:
     std::thread fetcher_thread;
     std::thread mining_thread;
     std::atomic<bool> controller_running{false};
+    std::string stratum_password;  // For stratum mode
     
 public:
     UnifiedMiningController(
         int gpu_id, 
         GpuResources* resources,
-        const std::string& rpc_url = "http://127.0.0.1:9897");
+        const std::string& endpoint = "http://127.0.0.1:9897",
+        MiningMode mode = MiningMode::Solo,
+        const std::string& stratum_pass = "x");
     
     ~UnifiedMiningController();
     
@@ -40,6 +44,7 @@ public:
     
 private:
     void fetcherLoop();
+    void stratumFetcherLoop();  // Stratum-specific fetcher (push-based)
     void miningLoop();
     void handleNewPuzzle(const MiningEvent& event);
     void handleSolutionFound(const MiningEvent& event);
@@ -56,13 +61,17 @@ private:
     std::vector<std::unique_ptr<GpuResources>> gpu_resources;
     std::vector<std::unique_ptr<UnifiedMiningController>> controllers;
     std::vector<std::thread> gpu_threads;
-    std::string rpc_url;
+    std::string endpoint;  // RPC URL or Stratum URL
     int single_gpu_id;
+    MiningMode mining_mode;
+    std::string stratum_password;
     
 public:
     MultiGpuManager(
-        const std::string& rpc_url = "http://127.0.0.1:9897",
-        int specific_gpu = -1);
+        const std::string& endpoint = "http://127.0.0.1:9897",
+        int specific_gpu = -1,
+        MiningMode mode = MiningMode::Solo,
+        const std::string& stratum_pass = "x");
     
     ~MultiGpuManager();
     
@@ -87,8 +96,10 @@ private:
 };
 
 void startUnifiedMining(
-    const std::string& rpc_url = "http://127.0.0.1:9897",
-    int specific_gpu = -1);
+    const std::string& endpoint = "http://127.0.0.1:9897",
+    int specific_gpu = -1,
+    MiningMode mode = MiningMode::Solo,
+    const std::string& stratum_pass = "x");
 
 void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller);
 

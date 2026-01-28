@@ -1,4 +1,18 @@
 cmake_minimum_required(VERSION 3.18)
+
+# Must set CUDA architectures before project() to avoid CMake using default sm_52
+# Support modern GPUs (CUDA 13.0+):
+# Ampere (80, 86), Ada Lovelace (89), Hopper (90), Blackwell (100)
+set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
+
+# For CUDA 13.0+, tell CMake to use a supported architecture for compiler identification
+# Also use gcc-12 as host compiler for better compatibility with glibc
+set(CMAKE_CUDA_FLAGS_INIT "-arch=sm_80 -ccbin=/usr/bin/g++-12")
+set(CMAKE_CUDA_HOST_COMPILER "/usr/bin/g++-12")
+# Use matching C++ compiler to avoid ABI issues
+set(CMAKE_CXX_COMPILER "/usr/bin/g++-12")
+set(CMAKE_C_COMPILER "/usr/bin/gcc-12")
+
 project(xnt-miner LANGUAGES CXX CUDA)
 
 # Set C++ and CUDA standards
@@ -24,9 +38,10 @@ endif()
 
 # CUDA architecture detection
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Support wide range of GPUs:
-    # Pascal (60), Volta (70), Turing (75), Ampere (80, 86), Ada Lovelace (89), Hopper (90), Blackwell (100)
-    set(CMAKE_CUDA_ARCHITECTURES 60 70 75 80 86 89 90)
+    # Support modern GPUs (CUDA 13.0+):
+    # Ampere (80, 86), Ada Lovelace (89), Hopper (90), Blackwell (100)
+    # Note: Pascal (60), Volta (70), Turing (75) dropped in CUDA 13.0
+    set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90 100)
 endif()
 
 # Compiler flags
@@ -96,6 +111,8 @@ set(MODULAR_HEADERS
     include/merkle.cuh
     include/pow.cuh
     include/kernels.cuh
+    include/mining_client.h
+    include/stratum_client.cuh
     include/network.cuh
     include/gpu_resources.cuh
     include/mining.cuh
@@ -110,6 +127,7 @@ set(MODULAR_SOURCES
     src/kernels.cu
     src/network.cu
     src/rpc_client.cu
+    src/stratum_client.cu
     src/gpu_resources.cu
     src/mining.cu
     src/main.cu
@@ -126,10 +144,10 @@ if(BUILD_MONOLITHIC)
     set_target_properties(xnt-miner PROPERTIES
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
-    
+
     # Add NVCC-specific compiler definitions for MSVC compatibility
     if(MSVC)
-        target_compile_definitions(xnt-miner PRIVATE 
+        target_compile_definitions(xnt-miner PRIVATE
             __NVCC__=1
             __CUDACC_VER_MAJOR__=12
             __CUDACC_VER_MINOR__=6

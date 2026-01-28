@@ -1,5 +1,6 @@
 #include "mining.cuh"
 #include "rpc_client.cuh"
+#include "stratum_client.cuh"
 #include "common.cuh"
 
 UnifiedMiningController* g_mining_controller = nullptr;
@@ -7,10 +8,14 @@ UnifiedMiningController* g_mining_controller = nullptr;
 UnifiedMiningController::UnifiedMiningController(
     int gpu_id,
     GpuResources* resources,
-    const std::string& rpc_url)
-    : rpc_url(rpc_url)
+    const std::string& endpoint,
+    MiningMode mode,
+    const std::string& stratum_pass)
+    : endpoint(endpoint)
     , gpu_id(gpu_id)
-    , gpu_resources(resources) {
+    , gpu_resources(resources)
+    , mining_mode(mode)
+    , stratum_password(stratum_pass) {
 }
 
 UnifiedMiningController::~UnifiedMiningController() {
@@ -19,8 +24,29 @@ UnifiedMiningController::~UnifiedMiningController() {
 
 void UnifiedMiningController::start() {
     gpu_resources->event_handler = std::make_unique<EventHandler>();
+    gpu_resources->mining_mode = mining_mode;
     
-    NeptuneCudaMinerClient* new_client = new NeptuneCudaMinerClient(rpc_url, g_miner_wallet_address);
+    // Create appropriate client based on mining mode
+    MiningClient* new_client = nullptr;
+    if (mining_mode == MiningMode::Stratum) {
+        std::string host;
+        int port;
+        if (parse_stratum_url(endpoint, host, port)) {
+            StratumConfig config;
+            config.host = host;
+            config.port = port;
+            config.username = g_miner_wallet_address;
+            config.password = stratum_password;
+            config.worker_name = "xnt-miner-gpu" + std::to_string(gpu_id);
+            new_client = new StratumClient(config);
+        } else {
+            std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
+            return;
+        }
+    } else {
+        new_client = new NeptuneCudaMinerClient(endpoint, g_miner_wallet_address);
+    }
+    
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         gpu_resources->client = new_client;
@@ -30,7 +56,7 @@ void UnifiedMiningController::start() {
     bool connected = false;
     
     while (!connected && !stop_mining && !gpu_resources->gpu_stop_flag) {
-        NeptuneCudaMinerClient* client_ptr = nullptr;
+        MiningClient* client_ptr = nullptr;
         {
             std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
             client_ptr = gpu_resources->client;
@@ -39,12 +65,14 @@ void UnifiedMiningController::start() {
         if (!client_ptr) break;
         
         if (gpu_id == 0) {
-            std::cout << "Attempting to connect to RPC server at " << rpc_url << "..." << std::endl;
+            const char* mode_str = mining_mode == MiningMode::Stratum ? "stratum server" : "RPC server";
+            std::cout << "Attempting to connect to " << mode_str << " at " << endpoint << "..." << std::endl;
         }
-        if (client_ptr->connect_to_node()) {
+        if (client_ptr->connect()) {
             connected = true;
             if (gpu_id == 0) {
-                std::cout << "Successfully connected to RPC server!" << std::endl;
+                const char* mode_str = mining_mode == MiningMode::Stratum ? "stratum server" : "RPC server";
+                std::cout << "Successfully connected to " << mode_str << "!" << std::endl;
             }
             break;
         }
@@ -92,7 +120,13 @@ void UnifiedMiningController::start() {
     }
     
     controller_running = true;
-    fetcher_thread = std::thread(&UnifiedMiningController::fetcherLoop, this);
+    
+    // Use appropriate fetcher based on mining mode
+    if (mining_mode == MiningMode::Stratum) {
+        fetcher_thread = std::thread(&UnifiedMiningController::stratumFetcherLoop, this);
+    } else {
+        fetcher_thread = std::thread(&UnifiedMiningController::fetcherLoop, this);
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
     if (gpu_id == 0) {
@@ -149,14 +183,14 @@ bool UnifiedMiningController::initializeCuda() {
 }
 
 bool UnifiedMiningController::connectToNode() {
-    NeptuneCudaMinerClient* client_ptr = nullptr;
+    MiningClient* client_ptr = nullptr;
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         client_ptr = gpu_resources->client;
     }
     
     if (!client_ptr) return false;
-    return client_ptr->connect_to_node();
+    return client_ptr->connect();
 }
 
 bool UnifiedMiningController::reconnect_to_node() {
@@ -201,13 +235,13 @@ bool UnifiedMiningController::reconnect_to_node() {
         if (stop_mining || gpu_resources->gpu_stop_flag) break;
         
         // Try to connect
-        NeptuneCudaMinerClient* client_ptr = nullptr;
+        MiningClient* client_ptr = nullptr;
         {
             std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
             client_ptr = gpu_resources->client;
         }
         
-        if (client_ptr && client_ptr->connect_to_node()) {
+        if (client_ptr && client_ptr->connect()) {
             connected = true;
             gpu_resources->gpu_node_connected = true;
             LOG_DEBUG("[GPU " << gpu_id << "] Reconnected successfully");
@@ -225,6 +259,61 @@ bool UnifiedMiningController::reconnect_to_node() {
 
 void UnifiedMiningController::fetcherLoop() {
     puzzleFetcher(gpu_resources, this);
+}
+
+void UnifiedMiningController::stratumFetcherLoop() {
+    if (!gpu_resources) return;
+    
+    if (gpu_id == 0) {
+        std::cout << "[Stratum] Job fetcher started (push-based)" << std::endl;
+    }
+    
+    while (!stop_mining && !gpu_resources->gpu_stop_flag && controller_running) {
+        MiningClient* client_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+            client_ptr = gpu_resources->client;
+        }
+        
+        if (!client_ptr || !client_ptr->is_connected()) {
+            if (!gpu_resources->gpu_reconnection_in_progress) {
+                if (gpu_id == 0) {
+                    static auto last_reconnect_log = std::chrono::steady_clock::now();
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_reconnect_log).count();
+                    if (elapsed >= 10) {
+                        std::cout << "[Stratum] " << Color::YELLOW << "Disconnected, attempting reconnect..." << Color::RESET << std::endl;
+                        last_reconnect_log = now;
+                    }
+                }
+                gpu_resources->event_handler->postEvent(EventType::RECONNECT);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
+        
+        // Wait for job notification from stratum server
+        json job_response;
+        if (client_ptr->wait_for_job(job_response, 5000)) {
+            // Got a new job
+            if (!job_response.empty()) {
+                std::string job_data = job_response.dump();
+                gpu_resources->event_handler->postEvent(EventType::NEW_PUZZLE, "", job_data);
+                gpu_resources->update_job_received();
+            }
+        }
+        
+        // Check for job staleness
+        if (gpu_resources->get_time_since_last_job() > JOB_STALENESS_THRESHOLD_SEC * 2) {
+            if (gpu_id == 0) {
+                std::cout << "[Stratum] " << Color::YELLOW << "No jobs received for a while, connection may be stale" << Color::RESET << std::endl;
+            }
+        }
+    }
+    
+    if (gpu_id == 0) {
+        std::cout << "[Stratum] Job fetcher stopped" << std::endl;
+    }
 }
 
 void UnifiedMiningController::miningLoop() {
@@ -419,7 +508,7 @@ void UnifiedMiningController::handleError(const MiningEvent& event) {
 }
 
 json UnifiedMiningController::requestJob() {
-    NeptuneCudaMinerClient* client_ptr = nullptr;
+    MiningClient* client_ptr = nullptr;
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         client_ptr = gpu_resources->client;
@@ -448,10 +537,14 @@ bool UnifiedMiningController::processJobResponse(const json& job_response) {
 // ===== MULTI-GPU MANAGER IMPLEMENTATION =====
 
 MultiGpuManager::MultiGpuManager(
-    const std::string& rpc_url,
-    int specific_gpu)
-    : rpc_url(rpc_url)
-    , single_gpu_id(specific_gpu) {
+    const std::string& endpoint,
+    int specific_gpu,
+    MiningMode mode,
+    const std::string& stratum_pass)
+    : endpoint(endpoint)
+    , single_gpu_id(specific_gpu)
+    , mining_mode(mode)
+    , stratum_password(stratum_pass) {
 }
 
 MultiGpuManager::~MultiGpuManager() {
@@ -520,9 +613,10 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_vram_total = prop.totalGlobalMem;
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
     gpu_res->optimal_max_nonces = 1000000ULL;
+    gpu_res->mining_mode = mining_mode;
     
     auto controller = std::make_unique<UnifiedMiningController>(
-        device_id, gpu_res.get(), rpc_url
+        device_id, gpu_res.get(), endpoint, mining_mode, stratum_password
     );
     
     gpu_resources.push_back(std::move(gpu_res));
@@ -592,10 +686,12 @@ void MultiGpuManager::gpuMiningThread(size_t index) {
 }
 
 void startUnifiedMining(
-    const std::string& rpc_url,
-    int specific_gpu) {
+    const std::string& endpoint,
+    int specific_gpu,
+    MiningMode mode,
+    const std::string& stratum_pass) {
     
-    MultiGpuManager manager(rpc_url, specific_gpu);
+    MultiGpuManager manager(endpoint, specific_gpu, mode, stratum_pass);
     
     if (!manager.detectAndInitGpus()) {
         std::cerr << "Failed to initialize GPUs" << std::endl;
@@ -749,11 +845,12 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
         
         if (result.has_value()) {
             gpu_res->solutions_found++;
+            const char* submit_target = gpu_res->is_stratum_mode() ? "pool" : "node";
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
                       << "*** SOLUTION FOUND! ***" << Color::RESET 
-                      << " Submitting to node..." << std::endl;
+                      << " Submitting to " << submit_target << "..." << std::endl;
             
-            NeptuneCudaMinerClient* client = nullptr;
+            MiningClient* client = nullptr;
             {
                 std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
                 client = gpu_res->client;
@@ -779,16 +876,17 @@ bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* contro
                 
                 if (accepted) {
                     gpu_res->solutions_accepted++;
+                    const char* accepted_msg = gpu_res->is_stratum_mode() ? "SHARE ACCEPTED" : "BLOCK ACCEPTED";
                     std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
-                              << "*** ✓ BLOCK ACCEPTED! ✓ ***" << Color::RESET 
-                      << " | Total blocks mined: " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET << std::endl;
+                              << "*** " << accepted_msg << "! ***" << Color::RESET 
+                      << " | Total: " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET << std::endl;
                 } else {
                     gpu_res->solutions_rejected++;
                 }
             } else {
                 gpu_res->solutions_rejected++;
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                          << "Cannot submit - not connected to node" << Color::RESET << std::endl;
+                          << "Cannot submit - not connected" << Color::RESET << std::endl;
             }
         }
     }
@@ -875,7 +973,7 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
         }
         
         if (should_poll) {
-            NeptuneCudaMinerClient* client = nullptr;
+            MiningClient* client = nullptr;
             {
                 std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
                 client = gpu_res->client;
@@ -908,35 +1006,43 @@ void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller) {
                         ? metadata.value("digest", "") : "";
                     
                     if (template_id != last_template_id && !template_id.empty()) {
-                        XntRpcClient* rpc_client = client->get_rpc_client();
+                        // For solo mode, verify template is not stale by checking against tip
+                        NeptuneCudaMinerClient* solo_client = dynamic_cast<NeptuneCudaMinerClient*>(client);
+                        XntRpcClient* rpc_client = solo_client ? solo_client->get_rpc_client() : nullptr;
+                        
+                        std::string tip_digest;
                         if (rpc_client) {
-                            std::string tip_digest = rpc_client->getTipDigest();
-                            // Handle both snake_case (prev_block) and camelCase (prevBlock)
-                            std::string prev_block;
-                            if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
-                                prev_block = metadata.value("prev_block", "");
-                            } else if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
-                                prev_block = metadata.value("prevBlock", "");
-                            }
+                            tip_digest = rpc_client->getTipDigest();
+                        }
+                        
+                        // Handle both snake_case (prev_block) and camelCase (prevBlock)
+                        std::string prev_block;
+                        if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+                            prev_block = metadata.value("prev_block", "");
+                        } else if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+                            prev_block = metadata.value("prevBlock", "");
+                        }
+                        
+                        // If we can't get tip_digest (no RPC client), skip the staleness check
+                        if (tip_digest.empty() || tip_digest == prev_block) {
+                            PowPuzzle puzzle = parseRpcTemplate(template_response);
                             
-                            if (tip_digest == prev_block) {
-                                PowPuzzle puzzle = parseRpcTemplate(template_response);
-                                
-                                if (puzzle.is_valid()) {
-                                    client->cache_puzzle(template_obj);
-                                    // Pass full response so parsePowPuzzle can find result.template
-                                    std::string puzzle_data = template_response.dump();
-                                    gpu_res->event_handler->postEvent(EventType::NEW_PUZZLE, "", puzzle_data);
-                                    gpu_res->update_job_received();
-                                    last_template_id = template_id;
-                                    
-                                } else {
-                                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                                              << "✗ Block proposal invalid (missing required fields)" << Color::RESET << std::endl;
+                            if (puzzle.is_valid()) {
+                                if (solo_client) {
+                                    solo_client->cache_puzzle(template_obj);
                                 }
+                                // Pass full response so parsePowPuzzle can find result.template
+                                std::string puzzle_data = template_response.dump();
+                                gpu_res->event_handler->postEvent(EventType::NEW_PUZZLE, "", puzzle_data);
+                                gpu_res->update_job_received();
+                                last_template_id = template_id;
+                                
                             } else {
-                                LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");
+                                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
+                                          << "✗ Block proposal invalid (missing required fields)" << Color::RESET << std::endl;
                             }
+                        } else {
+                            LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Template outdated, skipping");
                         }
                     }
                 } else if (!template_response.empty() && template_response.contains("error")) {
