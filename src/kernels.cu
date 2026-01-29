@@ -88,6 +88,9 @@ bool MiningOutputBuffers::reset() {
 }
 
 // ===== HIGH-VRAM MINING KERNEL =====
+// Optimized: uses LUT-aware permutation (no per-call __syncthreads),
+// streams MAST hash directly from Merkle lookups (eliminates ~6KB local memory),
+// inlines index computation (avoids Digest temporaries).
 
 __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     const Digest* __restrict__ d_leafs,
@@ -106,124 +109,270 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
     Digest* __restrict__ d_solution_nonce_digest) {
-    
-    // Load lookup table into shared memory (first warp)
-    if (threadIdx.x < 256) {
-        s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+
+    // Load lookup table into shared memory ONCE for the entire block
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        s_lookup_table[i] = LOOKUP_TABLE[i];
     }
     __syncthreads();
-    
-    // Check if solution already found
+
     if (*d_solution_found) return;
-    
+
+    const uint8_t* __restrict__ lut = s_lookup_table;
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
-    
-    // Process nonces
+
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        // Early exit if solution found
         if (*d_solution_found) return;
-        
-        // Sequential nonce within GPU's range (using original working format)
+
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
-        
-        // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
+
+        // Nonce digest
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
-        nonce_digest.values[1] = (nonce_value >> 32);  // Upper bits in second limb
+        nonce_digest.values[1] = (nonce_value >> 32);
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
-        
-        // Compute indices from index picker preimage and nonce
-        uint64_t index_a, index_b;
-        Pow_indices_device(hash, nonce_digest, index_a, index_b);
-        
-        // Paths are ALWAYS computed using original indices (matching Rust guess())
-        // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
-        // but the tree structure matches the swapped leaves
-        uint64_t path_index_a = index_a;
-        uint64_t path_index_b = index_b;
-        
-        // Compute path for index_a
-        Digest path_a[MERKLE_TREE_HEIGHT_];
-        size_t running_index_a = path_index_a + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
-        size_t sibling_leaf_index_a = path_index_a ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_index_a];
-        
-        // Subsequent levels: internal nodes
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_a >>= 1;
-            size_t sibling_index_a = running_index_a ^ 1;
-            if (sibling_index_a < (MERKLE_NUM_LEAFS)) {
-                path_a[level] = d_internal_nodes[sibling_index_a];
-            } else {
-                path_a[level] = Digest::default_digest();
-            }
-        }
-        
-        // Compute path for index_b
-        Digest path_b[MERKLE_TREE_HEIGHT_];
-        size_t running_index_b = path_index_b + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
-        size_t sibling_leaf_index_b = path_index_b ^ 1;
-        path_b[0] = d_leafs[sibling_leaf_index_b];
-        
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_b >>= 1;
-            size_t sibling_index_b = running_index_b ^ 1;
-            if (sibling_index_b < (MERKLE_NUM_LEAFS)) {
-                path_b[level] = d_internal_nodes[sibling_index_b];
-            } else {
-                path_b[level] = Digest::default_digest();
-            }
-        }
-        
-        // Get Merkle root (stored at last index in sequentially-built tree)
-        // Tree is built sequentially: layer 0 at offset 0, root at last index
-        // Total internal nodes = num_leafs - 1, so root is at index num_leafs - 2
-        Digest merkle_root = d_internal_nodes[num_leafs - 2];
-        
-        // Compute POW hash using correct fast_mast_hash implementation
-        Pow pow;
-        pow.root = merkle_root;
-        pow.nonce = nonce_digest;
+
+        // === Inline index computation (63 permutations) ===
+        uint64_t state[STATE_SIZE];
+        // tip5_hash_fixed(hash, nonce_digest): init FixedLength sponge
         #pragma unroll
-        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-            pow.path_a[i] = path_a[i];
-            pow.path_b[i] = path_b[i];
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE; // FixedLength capacity
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) {
+            state[i] = hash.values[i];
+            state[i + DIGEST_LEN] = nonce_digest.values[i];
         }
-        
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
-        
-        // Check against target
+        tip5_permutation_lut(state, lut);
+
+        // 62 more iterations of hash_fixed_right_zero
+        // Precompute x^7(BFE_ONE) once for the specialized first-round optimization
+        const uint64_t x7_one = x7_computer(BFE_ONE);
+        for (uint32_t iter = 1; iter < NUM_INDEX_REPETITIONS; ++iter) {
+            // Keep state[0..4] (result from previous), zero right half, reset capacity
+            state[5] = 0; state[6] = 0; state[7] = 0; state[8] = 0; state[9] = 0;
+            state[10] = BFE_ONE; state[11] = BFE_ONE; state[12] = BFE_ONE;
+            state[13] = BFE_ONE; state[14] = BFE_ONE; state[15] = BFE_ONE;
+            tip5_permutation_lut_index(state, lut, x7_one);
+        }
+
+        uint64_t index_a = state[0] & MERKLE_INDEX_MASK;
+        uint64_t index_b = state[1] & MERKLE_INDEX_MASK;
+
+        // === Streaming MAST hash ===
+        // Instead of storing path_a[27], path_b[27], Pow, encoding[280] (~6KB),
+        // stream Merkle path data directly into the sponge as we read it.
+        //
+        // Encoding order: nonce(5) + path_b[0..26](135) + path_a[0..26](135) + root(5) = 280 words
+        // RATE = 10 = 2 * DIGEST_LEN, so every 2 Digests fills one sponge block.
+        // 280 / 10 = 28 full blocks -> 28 permutations, then 1 padding -> 29 total.
+
+        // Re-init state for VariableLength sponge
+        #pragma unroll
+        for (int i = 0; i < STATE_SIZE; ++i) state[i] = BFE_ZERO;
+
+        // --- Block 0: nonce + path_b[0] ---
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) state[i] = nonce_digest.values[i];
+        {
+            Digest sib = d_leafs[index_b ^ 1];
+            #pragma unroll
+            for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = sib.values[i];
+        }
+        tip5_permutation_lut(state, lut);
+
+        // --- Blocks 1-13: path_b[1..26] ---
+        {
+            size_t running_b = (index_b + num_leafs) >> 1;
+            for (size_t level = 1; level < merkle_height; ++level) {
+                size_t sibling_b = running_b ^ 1;
+                Digest node;
+                if (sibling_b < MERKLE_NUM_LEAFS) {
+                    node = d_internal_nodes[sibling_b];
+                } else {
+                    node = Digest::default_digest();
+                }
+
+                if (level & 1) {
+                    // Odd level -> first half
+                    #pragma unroll
+                    for (int i = 0; i < DIGEST_LEN; ++i) state[i] = node.values[i];
+                } else {
+                    // Even level -> second half -> permute
+                    #pragma unroll
+                    for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = node.values[i];
+                    tip5_permutation_lut(state, lut);
+                }
+
+                running_b >>= 1;
+            }
+        }
+
+        // --- Blocks 14-27: path_a[0..26] + root ---
+        {
+            // path_a[0] = sibling leaf -> first half
+            Digest sib_a = d_leafs[index_a ^ 1];
+            #pragma unroll
+            for (int i = 0; i < DIGEST_LEN; ++i) state[i] = sib_a.values[i];
+
+            size_t running_a = (index_a + num_leafs) >> 1;
+            for (size_t level = 1; level < merkle_height; ++level) {
+                size_t sibling_a = running_a ^ 1;
+                Digest node;
+                if (sibling_a < MERKLE_NUM_LEAFS) {
+                    node = d_internal_nodes[sibling_a];
+                } else {
+                    node = Digest::default_digest();
+                }
+
+                if (level & 1) {
+                    // Odd level -> second half -> permute
+                    #pragma unroll
+                    for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = node.values[i];
+                    tip5_permutation_lut(state, lut);
+                } else {
+                    // Even level -> first half
+                    #pragma unroll
+                    for (int i = 0; i < DIGEST_LEN; ++i) state[i] = node.values[i];
+                }
+
+                running_a >>= 1;
+            }
+        }
+
+        // --- Root (completes block 28) ---
+        {
+            Digest merkle_root = d_internal_nodes[num_leafs - 2];
+            #pragma unroll
+            for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = merkle_root.values[i];
+        }
+        tip5_permutation_lut(state, lut);
+
+        // --- Padding block (varlen finalization) ---
+        state[0] = BFE_ONE;
+        #pragma unroll
+        for (int i = 1; i < RATE; ++i) state[i] = BFE_ZERO;
+        tip5_permutation_lut(state, lut);
+        // state[0..4] = pow_encoding_digest (29 permutations done)
+
+        // === Continue MAST hash tree ===
+        // header_mast_hash = hash_fixed(pow_encoding_digest, mast_paths.pow[0])
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = mast_paths.pow[0].values[i];
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE; // FixedLength capacity
+        tip5_permutation_lut(state, lut);
+
+        // header_mast_hash = hash_fixed(result, mast_paths.pow[1])
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = mast_paths.pow[1].values[i];
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE;
+        tip5_permutation_lut(state, lut);
+
+        // header_mast_hash = hash_fixed(mast_paths.pow[2], result)
+        // NOTE: pow[2] is LEFT, result is RIGHT
+        {
+            uint64_t tmp[DIGEST_LEN];
+            #pragma unroll
+            for (int i = 0; i < DIGEST_LEN; ++i) tmp[i] = state[i];
+            #pragma unroll
+            for (int i = 0; i < DIGEST_LEN; ++i) {
+                state[i] = mast_paths.pow[2].values[i];
+                state[DIGEST_LEN + i] = tmp[i];
+            }
+        }
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE;
+        tip5_permutation_lut(state, lut);
+        // state[0..4] = header_mast_hash
+
+        // kernel_mast_hash = hash_fixed(hash_varlen(header_mast_hash, 5), header[0])
+        // First: hash_varlen of 5 words (VariableLength sponge, 1 block + padding)
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ZERO; // VariableLength
+        // state[0..4] already has header_mast_hash
+        state[DIGEST_LEN] = BFE_ONE; // padding at position 5
+        #pragma unroll
+        for (int i = DIGEST_LEN + 1; i < RATE; ++i) state[i] = BFE_ZERO;
+        tip5_permutation_lut(state, lut);
+
+        // hash_fixed(result, header[0])
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = mast_paths.header[0].values[i];
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE;
+        tip5_permutation_lut(state, lut);
+
+        // hash_fixed(result, header[1])
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = mast_paths.header[1].values[i];
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE;
+        tip5_permutation_lut(state, lut);
+        // state[0..4] = kernel_mast_hash
+
+        // Final: hash_fixed(hash_varlen(kernel_mast_hash, 5), kernel[0])
+        // hash_varlen of 5 words
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ZERO;
+        state[DIGEST_LEN] = BFE_ONE;
+        #pragma unroll
+        for (int i = DIGEST_LEN + 1; i < RATE; ++i) state[i] = BFE_ZERO;
+        tip5_permutation_lut(state, lut);
+
+        // hash_fixed(result, kernel[0])
+        #pragma unroll
+        for (int i = 0; i < DIGEST_LEN; ++i) state[DIGEST_LEN + i] = mast_paths.kernel[0].values[i];
+        #pragma unroll
+        for (int i = RATE; i < STATE_SIZE; ++i) state[i] = BFE_ONE;
+        tip5_permutation_lut(state, lut);
+        // state[0..4] = final_hash
+
+        // === Target comparison ===
         bool is_solution = true;
+        #pragma unroll
         for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
+            if (state[i] > target.values[i]) {
                 is_solution = false;
                 break;
             }
-            if (final_hash.values[i] < target.values[i]) {
+            if (state[i] < target.values[i]) {
                 break;
             }
         }
-        
+
         if (is_solution) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
-                // Store first limb of nonce for basic tracking
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_digest.values[0]);
-                // Store full nonce digest so host can submit all 5 limbs
                 *d_solution_nonce_digest = nonce_digest;
-                
-                // Copy the already-computed paths
-                #pragma unroll
-                for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-                    d_solution_path_a[i] = path_a[i];
-                    d_solution_path_b[i] = path_b[i];
+
+                // Re-read paths from the Merkle tree for the solution output.
+                // This only happens on solution found (extremely rare), so cost is negligible.
+                {
+                    size_t running_a = index_a + num_leafs;
+                    d_solution_path_a[0] = d_leafs[index_a ^ 1];
+                    for (size_t level = 1; level < merkle_height; ++level) {
+                        running_a >>= 1;
+                        size_t sibling_a = running_a ^ 1;
+                        d_solution_path_a[level] = (sibling_a < MERKLE_NUM_LEAFS) ?
+                            d_internal_nodes[sibling_a] : Digest::default_digest();
+                    }
                 }
-                
+                {
+                    size_t running_b = index_b + num_leafs;
+                    d_solution_path_b[0] = d_leafs[index_b ^ 1];
+                    for (size_t level = 1; level < merkle_height; ++level) {
+                        running_b >>= 1;
+                        size_t sibling_b = running_b ^ 1;
+                        d_solution_path_b[level] = (sibling_b < MERKLE_NUM_LEAFS) ?
+                            d_internal_nodes[sibling_b] : Digest::default_digest();
+                    }
+                }
+
                 return;
             }
         }
@@ -408,12 +557,7 @@ void calculate_mining_launch_config(
     cudaGetDeviceProperties(&prop, gpu_id);
     
     threads_per_block = MINING_THREADS_PER_BLOCK;
-    
-    // Calculate optimal number of blocks
-    int min_grid_size, optimal_block_size;
-    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
-                                        parallel_mining_kernel_high_vram, 0, 0);
-    
+
     // Use multiple of SM count for good occupancy
     int num_sms = prop.multiProcessorCount;
     int blocks_per_sm = 4; // Target occupancy
@@ -431,7 +575,8 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
     
-    uint64_t optimal = 1000000ULL;
+    // Larger batches amortize launch overhead and improve GPU utilization
+    uint64_t optimal = 4000000ULL;
     
     // Apply bounds
     const uint64_t min_batch = 100000;

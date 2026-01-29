@@ -301,7 +301,12 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
         }
     }
     __syncthreads();
-    
+
+    sbox_layer_lut(state_in, state_out, shared_lut);
+}
+
+// LUT-aware version: uses pre-loaded LUT pointer, no __syncthreads()
+__device__ void sbox_layer_lut(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out, const uint8_t* __restrict__ lut) {
     ulonglong2 v0 = *reinterpret_cast<const ulonglong2*>(&state_in[0]);
     ulonglong2 v1 = *reinterpret_cast<const ulonglong2*>(&state_in[2]);
     ulonglong2 v2 = *reinterpret_cast<const ulonglong2*>(&state_in[4]);
@@ -320,10 +325,10 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     uint64_t e12 = v6.x, e13 = v6.y;
     uint64_t e14 = v7.x, e15 = v7.y;
     
-    e0 = split_lookup_shared(e0, shared_lut);
-    e1 = split_lookup_shared(e1, shared_lut);
-    e2 = split_lookup_shared(e2, shared_lut);
-    e3 = split_lookup_shared(e3, shared_lut);
+    e0 = split_lookup_shared(e0, lut);
+    e1 = split_lookup_shared(e1, lut);
+    e2 = split_lookup_shared(e2, lut);
+    e3 = split_lookup_shared(e3, lut);
     e4 = x7_computer(e4);
     e5 = x7_computer(e5);
     e6 = x7_computer(e6);
@@ -485,6 +490,64 @@ __device__ void tip5_permutation(uint64_t* state) {
         mds_layer(temp_state, state);
         
         // Fused round constants addition
+        #pragma unroll
+        for (int i = 0; i < STATE_SIZE; ++i) {
+            state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
+        }
+    }
+}
+
+// LUT-aware permutation: avoids redundant shared memory loads and __syncthreads()
+// The caller must pre-load the LUT into shared memory and pass the pointer.
+__device__ void tip5_permutation_lut(uint64_t* state, const uint8_t* __restrict__ lut) {
+    uint64_t temp_state[STATE_SIZE];
+
+    #pragma unroll 1
+    for (int round = 0; round < NUM_ROUNDS; ++round) {
+        sbox_layer_lut(state, temp_state, lut);
+        mds_layer(temp_state, state);
+
+        #pragma unroll
+        for (int i = 0; i < STATE_SIZE; ++i) {
+            state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
+        }
+    }
+}
+
+// Specialized permutation for index loop iterations 1-62.
+// At the start of each iteration, state[5..9] = 0 and state[10..15] = BFE_ONE.
+// In the first round's sbox, x^7(0) = 0 and x^7(BFE_ONE) = x7_bfe_one (precomputed).
+// This skips 11 out of 12 x^7 computations in the first round.
+__device__ void tip5_permutation_lut_index(uint64_t* state, const uint8_t* __restrict__ lut, uint64_t x7_bfe_one) {
+    uint64_t temp_state[STATE_SIZE];
+
+    // Round 0: specialized sbox - only compute for unknown positions 0-4
+    temp_state[0] = split_lookup_shared(state[0], lut);
+    temp_state[1] = split_lookup_shared(state[1], lut);
+    temp_state[2] = split_lookup_shared(state[2], lut);
+    temp_state[3] = split_lookup_shared(state[3], lut);
+    temp_state[4] = x7_computer(state[4]);
+    // x^7(0) = 0 for positions 5-9
+    temp_state[5] = 0; temp_state[6] = 0; temp_state[7] = 0;
+    temp_state[8] = 0; temp_state[9] = 0;
+    // x^7(BFE_ONE) = precomputed constant for positions 10-15
+    temp_state[10] = x7_bfe_one; temp_state[11] = x7_bfe_one;
+    temp_state[12] = x7_bfe_one; temp_state[13] = x7_bfe_one;
+    temp_state[14] = x7_bfe_one; temp_state[15] = x7_bfe_one;
+
+    mds_layer(temp_state, state);
+
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        state[i] = fast_field_add(state[i], ROUND_CONSTANTS[0][i]);
+    }
+
+    // Rounds 1-4: normal permutation
+    #pragma unroll 1
+    for (int round = 1; round < NUM_ROUNDS; ++round) {
+        sbox_layer_lut(state, temp_state, lut);
+        mds_layer(temp_state, state);
+
         #pragma unroll
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);

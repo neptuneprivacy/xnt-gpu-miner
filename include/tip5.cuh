@@ -64,13 +64,12 @@ __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl
     uint64_t a = xl + shifted;
     bool e = (a < xl) | (a < shifted);
 
-    uint64_t b = a - (a >> 32);
-    if (e) b -= 1;
+    uint64_t b = a - (a >> 32) - (uint64_t)e;
 
     bool c = (xh < b);
     a = xh - b;
 
-    return a - (0xFFFFFFFFULL & (c ? 0xFFFFFFFFFFFFFFFFULL : 0));
+    return a - ((uint64_t)c * 0xFFFFFFFFULL);
 }
 
 #ifdef _WIN32
@@ -234,6 +233,7 @@ __host__ inline uint32_t get_mds_coeff_host(int i, int j) {
 }
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out);
+__device__ void sbox_layer_lut(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out, const uint8_t* __restrict__ lut);
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out);
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out);
 __device__ void generated_function(const uint64_t* input, uint64_t* output);
@@ -243,6 +243,10 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void round_constants_layer_host(int round_index, const uint64_t* state_in, uint64_t* state_out);
 
 __device__ void tip5_permutation(uint64_t* state);
+__device__ void tip5_permutation_lut(uint64_t* state, const uint8_t* __restrict__ lut);
+// Specialized permutation for index loop: skips x^7 for known-value positions 5-15
+// in the first round (positions 5-9 are zero, positions 10-15 are BFE_ONE).
+__device__ void tip5_permutation_lut_index(uint64_t* state, const uint8_t* __restrict__ lut, uint64_t x7_bfe_one);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {
