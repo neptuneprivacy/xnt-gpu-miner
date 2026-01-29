@@ -20,7 +20,7 @@ CXX_FLAGS = -O3 -march=native -std=c++17
 INCLUDES = -I./include
 
 # Libraries
-LIBS = -lcudart -lpthread
+LIBS = -lcudart -lpthread -lssl -lcrypto
 
 
 # Output binary

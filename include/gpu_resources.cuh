@@ -200,7 +200,7 @@ struct GpuResources {
         , gpu_vram_total(0)
         , client(nullptr)
         , mining_mode(MiningMode::Solo)
-        , optimal_max_nonces(1000000ULL) {
+        , optimal_max_nonces(10000000ULL) { // Default 10M, will be updated based on GPU
         auto now = std::chrono::steady_clock::now();
         last_template_received_time = now;
         session_start_time = now;

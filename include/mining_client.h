@@ -58,6 +58,7 @@ public:
 inline MiningMode detect_mining_mode(const std::string& url) {
     if (url.find("stratum://") == 0 || 
         url.find("stratum+tcp://") == 0 ||
+        url.find("stratum+ssl://") == 0 ||
         url.find("tcp://") == 0) {
         return MiningMode::Stratum;
     }

@@ -5,18 +5,33 @@
 #include <iomanip>
 #include <algorithm>
 
+// OpenSSL includes
+#ifndef _WIN32
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#else
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#endif
+
 // Parse stratum URL into host and port
-bool parse_stratum_url(const std::string& url, std::string& host, int& port) {
+bool parse_stratum_url(const std::string& url, std::string& host, int& port, bool& use_ssl) {
     std::string work_url = url;
+    use_ssl = false;
     
     // Remove protocol prefix
     const std::vector<std::string> prefixes = {
-        "stratum+tcp://", "stratum://", "tcp://"
+        "stratum+ssl://", "stratum+tcp://", "stratum://", "tcp://"
     };
     
     for (const auto& prefix : prefixes) {
         if (work_url.find(prefix) == 0) {
             work_url = work_url.substr(prefix.length());
+            if (prefix == "stratum+ssl://") {
+                use_ssl = true;
+            }
             break;
         }
     }
@@ -40,20 +55,42 @@ bool parse_stratum_url(const std::string& url, std::string& host, int& port) {
 
 StratumClient::StratumClient(const StratumConfig& cfg)
     : config(cfg)
-    , sock(INVALID_SOCKET_VALUE) {
+    , sock(INVALID_SOCKET_VALUE)
+    , use_ssl(false)
+    , ssl_ctx(nullptr)
+    , ssl(nullptr) {
     platform_socket_init();
+    // Initialize OpenSSL
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    use_ssl = config.use_ssl;
+    current_difficulty.clear();
 }
 
 StratumClient::StratumClient(const std::string& url, const std::string& address,
                              const std::string& worker_name,
                              const std::string& password)
-    : sock(INVALID_SOCKET_VALUE) {
+    : sock(INVALID_SOCKET_VALUE)
+    , use_ssl(false)
+    , ssl_ctx(nullptr)
+    , ssl(nullptr) {
     platform_socket_init();
+    // Initialize OpenSSL
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
     
-    if (!parse_stratum_url(url, config.host, config.port)) {
+    bool url_use_ssl = false;
+    if (!parse_stratum_url(url, config.host, config.port, url_use_ssl)) {
         config.host = "127.0.0.1";
         config.port = 3333;
     }
+    use_ssl = url_use_ssl;
+    config.use_ssl = url_use_ssl;
+    current_difficulty.clear();
+    
     config.address = address;
     config.name = worker_name;
     config.password = password;
@@ -61,6 +98,7 @@ StratumClient::StratumClient(const std::string& url, const std::string& address,
 
 StratumClient::~StratumClient() {
     disconnect();
+    cleanup_ssl();
     platform_socket_cleanup();
 }
 
@@ -123,10 +161,86 @@ bool StratumClient::connect_tcp() {
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     #endif
     
+    // Initialize SSL if needed
+    if (use_ssl) {
+        if (!init_ssl()) {
+            disconnect_tcp();
+            return false;
+        }
+    }
+    
     return true;
 }
 
+bool StratumClient::init_ssl() {
+    if (!use_ssl) return true;
+    
+    // Create SSL context
+    const SSL_METHOD* method = TLS_client_method();
+    ssl_ctx = SSL_CTX_new(method);
+    if (!ssl_ctx) {
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to create SSL context";
+        return false;
+    }
+    
+    // Set options
+    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+    
+    // Create SSL object
+    ssl = SSL_new(ssl_ctx);
+    if (!ssl) {
+        cleanup_ssl();
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to create SSL object";
+        return false;
+    }
+    
+    // Attach socket to SSL
+    if (SSL_set_fd(ssl, sock) != 1) {
+        cleanup_ssl();
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to set SSL file descriptor";
+        return false;
+    }
+    
+    // Perform SSL handshake
+    int ssl_result = SSL_connect(ssl);
+    if (ssl_result != 1) {
+        int ssl_error = SSL_get_error(ssl, ssl_result);
+        std::string error_msg = "SSL handshake failed: ";
+        char error_buf[256];
+        ERR_error_string_n(ERR_get_error(), error_buf, sizeof(error_buf));
+        error_msg += error_buf;
+        
+        cleanup_ssl();
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = error_msg;
+        return false;
+    }
+    
+    std::cout << "[Pool] " << Color::GREEN << "SSL/TLS connection established" << Color::RESET << std::endl;
+    return true;
+}
+
+void StratumClient::cleanup_ssl() {
+    if (ssl) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        ssl = nullptr;
+    }
+    if (ssl_ctx) {
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = nullptr;
+    }
+}
+
 void StratumClient::disconnect_tcp() {
+    if (use_ssl && ssl) {
+        SSL_shutdown(ssl);
+    }
+    
     if (sock != INVALID_SOCKET_VALUE) {
         #ifdef _WIN32
             shutdown(sock, SD_BOTH);
@@ -150,11 +264,25 @@ bool StratumClient::send_line(const std::string& line) {
     
     size_t total_sent = 0;
     while (total_sent < msg.length()) {
-        ssize_t sent = send(sock, msg.c_str() + total_sent, msg.length() - total_sent, 0);
-        if (sent <= 0) {
-            last_error = StratumError::ConnectionLost;
-            last_error_message = "Failed to send data";
-            return false;
+        ssize_t sent;
+        if (use_ssl && ssl) {
+            sent = SSL_write(ssl, msg.c_str() + total_sent, msg.length() - total_sent);
+            if (sent <= 0) {
+                int ssl_error = SSL_get_error(ssl, sent);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    continue;  // Retry
+                }
+                last_error = StratumError::ConnectionLost;
+                last_error_message = "SSL write failed";
+                return false;
+            }
+        } else {
+            sent = send(sock, msg.c_str() + total_sent, msg.length() - total_sent, 0);
+            if (sent <= 0) {
+                last_error = StratumError::ConnectionLost;
+                last_error_message = "Failed to send data";
+                return false;
+            }
         }
         total_sent += sent;
     }
@@ -184,16 +312,48 @@ std::string StratumClient::read_line(int timeout_ms) {
     
     std::string line;
     char c;
+    int bytes_received = 0;
     
     while (true) {
-        ssize_t received = recv(sock, &c, 1, 0);
-        if (received <= 0) {
-            if (received == 0) {
-                // Connection closed
-                connected = false;
+        ssize_t received;
+        if (use_ssl && ssl) {
+            received = SSL_read(ssl, &c, 1);
+            if (received <= 0) {
+                int ssl_error = SSL_get_error(ssl, received);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    continue;  // Retry
+                }
+                if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                    // Connection closed
+                    connected = false;
+                    return "";
+                }
+                // SSL error
+                return "";
             }
-            break;
+        } else {
+            received = recv(sock, &c, 1, 0);
+            if (received <= 0) {
+                if (received == 0) {
+                    // Connection closed by peer
+                    connected = false;
+                    if (bytes_received == 0) {
+                        return "";
+                    }
+                } else {
+                    // Error or timeout
+                    #ifndef _WIN32
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // Timeout
+                        return "";
+                    }
+                    #endif
+                }
+                break;
+            }
         }
+        
+        bytes_received++;
         
         if (c == '\n') {
             break;
@@ -281,8 +441,8 @@ bool StratumClient::is_connected() const {
 }
 
 bool StratumClient::do_login() {
-    // Build login request matching pool schema:
-    // { "id": N, "method": "login", "params": { "name": "...", "address": "...", "password": "...", "agent": "..." } }
+    // Build login request matching pool schema (JSON-RPC 2.0 format):
+    // { "id": N, "jsonrpc": "2.0", "method": "login", "params": { "name": "...", "address": "...", "password": "...", "agent": "..." } }
     json params;
     params["name"] = config.name;
     params["address"] = config.address;
@@ -293,22 +453,26 @@ bool StratumClient::do_login() {
     
     json request;
     request["id"] = request_id_counter++;
+    request["jsonrpc"] = "2.0";
     request["method"] = "login";
     request["params"] = params;
     
+    std::cout << "[Pool] Sending login request..." << std::endl;
     if (!send_json(request)) {
         last_error = StratumError::AuthenticationFailed;
         last_error_message = "Failed to send login request";
         return false;
     }
     
-    // Wait for response
+    // Wait for response with longer timeout
     std::string line = read_line(config.connect_timeout_sec * 1000);
     if (line.empty()) {
-        last_error = StratumError::Timeout;
-        last_error_message = "Timeout waiting for login response";
-        return false;
+        // Fallback: some pools use Stratum v1 (mining.subscribe/authorize)
+        std::cout << "[Pool] Login timeout, trying Stratum v1 subscribe/authorize..." << std::endl;
+        return do_stratum_v1_login();
     }
+    
+    std::cout << "[Pool] Received response: " << (line.length() > 200 ? line.substr(0, 200) + "..." : line) << std::endl;
     
     try {
         json response = json::parse(line);
@@ -366,18 +530,108 @@ bool StratumClient::do_login() {
         
         last_error = StratumError::InvalidResponse;
         last_error_message = "Invalid login response format";
-        return false;
+        // If login rejected, try Stratum v1 fallback
+        std::cout << "[Pool] Login rejected, trying Stratum v1 subscribe/authorize..." << std::endl;
+        return do_stratum_v1_login();
         
     } catch (const std::exception& e) {
         last_error = StratumError::InvalidResponse;
         last_error_message = std::string("Failed to parse login response: ") + e.what();
-        return false;
+        std::cout << "[Pool] Invalid login response, trying Stratum v1 subscribe/authorize..." << std::endl;
+        return do_stratum_v1_login();
+        std::cout << "[Pool] Failed to parse login response, trying Stratum v1 subscribe/authorize..." << std::endl;
+        return do_stratum_v1_login();
     }
 }
 
+bool StratumClient::do_stratum_v1_login() {
+    // If the connection was closed, reconnect before trying v1
+    if (!connected.load() || sock == INVALID_SOCKET_VALUE) {
+        disconnect_tcp();
+        if (!connect_tcp()) {
+            last_error = StratumError::ConnectionFailed;
+            last_error_message = "Failed to reconnect for Stratum v1 login";
+            return false;
+        }
+        connected = true;
+    }
+    
+    // 1) mining.subscribe
+    json subscribe;
+    subscribe["id"] = request_id_counter++;
+    subscribe["method"] = "mining.subscribe";
+    subscribe["params"] = json::array({config.agent, "1.0"});
+    
+    std::cout << "[Pool] Sending mining.subscribe..." << std::endl;
+    if (!send_json(subscribe)) {
+        last_error = StratumError::AuthenticationFailed;
+        last_error_message = "Failed to send mining.subscribe";
+        return false;
+    }
+    
+    std::string subscribe_resp = read_line(config.connect_timeout_sec * 1000);
+    if (subscribe_resp.empty()) {
+        last_error = StratumError::Timeout;
+        last_error_message = "Timeout waiting for mining.subscribe response";
+        return false;
+    }
+    
+    // 2) mining.authorize
+    json authorize;
+    authorize["id"] = request_id_counter++;
+    authorize["method"] = "mining.authorize";
+    
+    // Typical Stratum username format: address.worker
+    std::string username = config.address;
+    if (!config.name.empty()) {
+        username += "." + config.name;
+    }
+    authorize["params"] = json::array({username, config.password});
+    
+    std::cout << "[Pool] Sending mining.authorize..." << std::endl;
+    if (!send_json(authorize)) {
+        last_error = StratumError::AuthenticationFailed;
+        last_error_message = "Failed to send mining.authorize";
+        return false;
+    }
+    
+    std::string auth_resp = read_line(config.connect_timeout_sec * 1000);
+    if (auth_resp.empty()) {
+        last_error = StratumError::Timeout;
+        last_error_message = "Timeout waiting for mining.authorize response";
+        return false;
+    }
+    
+    try {
+        json response = json::parse(auth_resp);
+        if (response.contains("result") && response["result"].is_boolean()) {
+            bool ok = response["result"].get<bool>();
+            if (!ok) {
+                last_error = StratumError::AuthenticationFailed;
+                last_error_message = "mining.authorize rejected";
+                return false;
+            }
+        } else if (response.contains("error") && !response["error"].is_null()) {
+            last_error = StratumError::AuthenticationFailed;
+            last_error_message = "mining.authorize error";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        last_error = StratumError::InvalidResponse;
+        last_error_message = std::string("Failed to parse mining.authorize response: ") + e.what();
+        return false;
+    }
+    
+    logged_in = true;
+    worker_id = 0; // Stratum v1 doesn't return a worker id
+    std::cout << "[Pool] Logged in via Stratum v1 as: " << config.name << " (address: " << config.address << ")" << std::endl;
+    return true;
+}
+
 bool StratumClient::send_keepalive() {
-    // Build keepalive request: { "method": "keepalived", "params": {} }
+    // Build keepalive request: { "jsonrpc": "2.0", "method": "keepalived", "params": {} }
     json request;
+    request["jsonrpc"] = "2.0";
     request["method"] = "keepalived";
     request["params"] = json::object();
     // Note: keepalived is a notification, no id needed
@@ -468,6 +722,60 @@ void StratumClient::handle_notification(const std::string& method, const json& p
                       << "New job received" << Color::RESET 
                       << " | Job ID: " << short_id 
                       << " | Difficulty: " << job.difficulty << std::endl;
+        }
+    } else if (method == "mining.notify") {
+        // Stratum v1 job notification (may be array or object)
+        json job_params = params;
+        
+        // Some servers wrap job params in an array; try to find an object with "paths"
+        if (params.is_array()) {
+            for (const auto& item : params) {
+                if (item.is_object() && item.contains("paths")) {
+                    job_params = item;
+                    break;
+                }
+            }
+        }
+        
+        StratumJob job = parse_job_notification(job_params);
+        // If difficulty not included in job, use last set_difficulty value
+        if (job.difficulty.empty() && !current_difficulty.empty()) {
+            job.difficulty = current_difficulty;
+        }
+        
+        if (job.is_valid()) {
+            {
+                std::lock_guard<std::mutex> lock(current_job_mutex);
+                current_job = job;
+            }
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                while (!job_queue.empty()) {
+                    job_queue.pop();
+                }
+                job_queue.push(job);
+            }
+            job_cv.notify_one();
+            
+            std::string short_id = job.job_id.length() > 20
+                ? job.job_id.substr(0, 12) + "..." + job.job_id.substr(job.job_id.length() - 8)
+                : job.job_id;
+            std::cout << "[Pool] " << Color::CYAN << Color::BOLD
+                      << "New stratum job received" << Color::RESET
+                      << " | Job ID: " << short_id
+                      << " | Difficulty: " << job.difficulty << std::endl;
+        } else {
+            std::cout << "[Pool] mining.notify received (unparsed format)" << std::endl;
+        }
+    } else if (method == "mining.set_difficulty") {
+        // Stratum v1 difficulty update
+        if (params.is_array() && !params.empty()) {
+            if (params[0].is_number()) {
+                current_difficulty = std::to_string(params[0].get<double>());
+            } else if (params[0].is_string()) {
+                current_difficulty = params[0].get<std::string>();
+            }
+            std::cout << "[Pool] Difficulty set to " << current_difficulty << std::endl;
         }
     } else if (method == "pause") {
         // Pause notification: stop mining temporarily
@@ -774,6 +1082,7 @@ bool StratumClient::submit_solution(
     json request;
     uint64_t req_id = request_id_counter++;
     request["id"] = req_id;
+    request["jsonrpc"] = "2.0";
     request["method"] = "submit";
     request["params"] = params;
     

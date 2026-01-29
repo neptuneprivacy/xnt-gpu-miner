@@ -199,7 +199,8 @@ bool UnifiedMinerClient::initialize() {
         // Create stratum client
         std::string host;
         int port;
-        if (!parse_stratum_url(endpoint, host, port)) {
+        bool use_ssl = false;
+        if (!parse_stratum_url(endpoint, host, port, use_ssl)) {
             std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
             return false;
         }
@@ -207,6 +208,7 @@ bool UnifiedMinerClient::initialize() {
         StratumConfig config;
         config.host = host;
         config.port = port;
+        config.use_ssl = use_ssl;
         config.address = wallet_address;
         config.name = "xnt-miner";
         config.password = stratum_password;

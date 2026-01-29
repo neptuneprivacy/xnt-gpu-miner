@@ -31,10 +31,12 @@ void UnifiedMiningController::start() {
     if (mining_mode == MiningMode::Stratum) {
         std::string host;
         int port;
-        if (parse_stratum_url(endpoint, host, port)) {
+        bool use_ssl = false;
+        if (parse_stratum_url(endpoint, host, port, use_ssl)) {
             StratumConfig config;
             config.host = host;
             config.port = port;
+            config.use_ssl = use_ssl;
             config.address = g_miner_wallet_address;
             config.name = "xnt-miner-gpu" + std::to_string(gpu_id);
             config.password = stratum_password;
@@ -177,8 +179,26 @@ bool UnifiedMiningController::initializeCuda() {
     gpu_resources->gpu_vram_total = prop.totalGlobalMem;
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
     
-    // Use default values (database removed)
-    gpu_resources->optimal_max_nonces = 1000000ULL;
+    // Calculate optimal batch size based on GPU capabilities
+    // For high-end GPUs (RTX 5090, etc.), use larger batches for better performance
+    // Target: ~900ms batch duration at ~16-20 MH/s = ~15-20M nonces per batch
+    int num_sms = prop.multiProcessorCount;
+    
+    // Scale by SM count (RTX 5090 has ~256 SMs, older GPUs have fewer)
+    // For modern high-end GPUs, use 15-20M nonces per batch
+    if (num_sms >= 200) {
+        // High-end GPU (RTX 5090, A100, H100, etc.)
+        gpu_resources->optimal_max_nonces = 20000000ULL; // 20M nonces
+    } else if (num_sms >= 100) {
+        // Mid-high end GPU (RTX 4090, A6000, etc.)
+        gpu_resources->optimal_max_nonces = 15000000ULL; // 15M nonces
+    } else if (num_sms >= 50) {
+        // Mid-range GPU
+        gpu_resources->optimal_max_nonces = 10000000ULL; // 10M nonces
+    } else {
+        // Lower-end GPU
+        gpu_resources->optimal_max_nonces = 5000000ULL; // 5M nonces
+    }
     
     return true;
 }
@@ -613,7 +633,22 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_name = prop.name;
     gpu_res->gpu_vram_total = prop.totalGlobalMem;
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
-    gpu_res->optimal_max_nonces = 1000000ULL;
+    
+    // Calculate optimal batch size based on GPU capabilities
+    int num_sms = prop.multiProcessorCount;
+    if (num_sms >= 200) {
+        // High-end GPU (RTX 5090, A100, H100, etc.)
+        gpu_res->optimal_max_nonces = 20000000ULL; // 20M nonces
+    } else if (num_sms >= 100) {
+        // Mid-high end GPU (RTX 4090, A6000, etc.)
+        gpu_res->optimal_max_nonces = 15000000ULL; // 15M nonces
+    } else if (num_sms >= 50) {
+        // Mid-range GPU
+        gpu_res->optimal_max_nonces = 10000000ULL; // 10M nonces
+    } else {
+        // Lower-end GPU
+        gpu_res->optimal_max_nonces = 5000000ULL; // 5M nonces
+    }
     gpu_res->mining_mode = mining_mode;
     
     auto controller = std::make_unique<UnifiedMiningController>(

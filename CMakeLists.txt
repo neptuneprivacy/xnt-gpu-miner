@@ -83,6 +83,9 @@ set(INCLUDE_DIRS
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
+# Find OpenSSL for SSL/TLS support
+find_package(OpenSSL REQUIRED)
+
 # Link libraries
 set(LINK_LIBS
     CUDA::cudart
@@ -94,6 +97,9 @@ if(WIN32)
 else()
     list(APPEND LINK_LIBS pthread)
 endif()
+
+# Add OpenSSL libraries
+list(APPEND LINK_LIBS OpenSSL::SSL OpenSSL::Crypto)
 
 if(nlohmann_json_FOUND)
     list(APPEND LINK_LIBS nlohmann_json::nlohmann_json)

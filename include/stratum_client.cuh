@@ -71,6 +71,7 @@ struct StratumJob {
 struct StratumConfig {
     std::string host;
     int port;
+    bool use_ssl;               // Use SSL/TLS for stratum connection
     std::string name;           // Worker name (login.name)
     std::string address;        // Wallet address (login.address)
     std::string password;       // Pool password (optional, login.password)
@@ -83,6 +84,7 @@ struct StratumConfig {
     
     StratumConfig()
         : port(3333)
+        , use_ssl(false)
         , name("default")
         , password("")
         , agent("xnt-gpu-miner/1.0")
@@ -93,11 +95,20 @@ struct StratumConfig {
         , keepalive_interval_sec(30) {}
 };
 
+// Forward declarations for OpenSSL
+struct ssl_ctx_st;
+struct ssl_st;
+typedef ssl_ctx_st SSL_CTX;
+typedef ssl_st SSL;
+
 // TCP-based Stratum client implementing pool schema protocol
 class StratumClient : public MiningClient {
 private:
     StratumConfig config;
     socket_t sock;
+    bool use_ssl{false};
+    SSL_CTX* ssl_ctx{nullptr};
+    SSL* ssl{nullptr};
     std::atomic<bool> connected{false};
     std::atomic<bool> logged_in{false};
     std::atomic<bool> running{false};
@@ -131,8 +142,13 @@ private:
     // Worker ID from login response
     size_t worker_id{0};
     
+    // Track difficulty for stratum-v1 pools (mining.set_difficulty)
+    std::string current_difficulty;
+    
     // Internal methods
     bool connect_tcp();
+    bool init_ssl();
+    void cleanup_ssl();
     void disconnect_tcp();
     void receive_loop();
     void keepalive_loop();
@@ -145,6 +161,7 @@ private:
     
     // Pool protocol methods
     bool do_login();
+    bool do_stratum_v1_login();
     
     // Parse job notification from pool
     StratumJob parse_job_notification(const json& params);
@@ -194,8 +211,9 @@ public:
 // Supported formats:
 //   stratum://host:port
 //   stratum+tcp://host:port
+//   stratum+ssl://host:port (SSL not yet implemented, will use TCP)
 //   tcp://host:port
 //   host:port
-bool parse_stratum_url(const std::string& url, std::string& host, int& port);
+bool parse_stratum_url(const std::string& url, std::string& host, int& port, bool& use_ssl);
 
 #endif // XNT_STRATUM_CLIENT_CUH
