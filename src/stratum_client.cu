@@ -4,6 +4,8 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 // OpenSSL includes
 #ifndef _WIN32
@@ -66,7 +68,6 @@ StratumClient::StratumClient(const StratumConfig& cfg)
     OpenSSL_add_all_algorithms();
 
     use_ssl = config.use_ssl;
-    current_difficulty.clear();
 }
 
 StratumClient::StratumClient(const std::string& url, const std::string& address,
@@ -89,7 +90,6 @@ StratumClient::StratumClient(const std::string& url, const std::string& address,
     }
     use_ssl = url_use_ssl;
     config.use_ssl = url_use_ssl;
-    current_difficulty.clear();
     
     config.address = address;
     config.name = worker_name;
@@ -205,6 +205,10 @@ bool StratumClient::init_ssl() {
         return false;
     }
     
+    // Set SNI for virtual-hosted TLS endpoints
+    SSL_set_tlsext_host_name(ssl, config.host.c_str());
+    SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
+    
     // Perform SSL handshake
     int ssl_result = SSL_connect(ssl);
     if (ssl_result != 1) {
@@ -296,10 +300,11 @@ bool StratumClient::send_json(const json& message) {
 
 std::string StratumClient::read_line(int timeout_ms) {
     if (sock == INVALID_SOCKET_VALUE) {
+        std::cerr << "[Pool] read_line: invalid socket" << std::endl;
         return "";
     }
     
-    // Set timeout
+    // Set timeout on the underlying socket (for non-SSL recv)
     #ifdef _WIN32
         DWORD timeout = timeout_ms;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
@@ -313,42 +318,54 @@ std::string StratumClient::read_line(int timeout_ms) {
     std::string line;
     char c;
     int bytes_received = 0;
+    auto start_time = std::chrono::steady_clock::now();
     
     while (true) {
+        // Check timeout
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        if (elapsed > timeout_ms) {
+            std::cerr << "[Pool] read_line: timeout after " << elapsed << "ms, received " << bytes_received << " bytes" << std::endl;
+            break;
+        }
+        
         ssize_t received;
         if (use_ssl && ssl) {
+            // For SSL, we need to handle non-blocking differently
             received = SSL_read(ssl, &c, 1);
             if (received <= 0) {
                 int ssl_error = SSL_get_error(ssl, received);
                 if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-                    continue;  // Retry
+                    // Would block, sleep briefly and retry
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
                 }
                 if (ssl_error == SSL_ERROR_ZERO_RETURN) {
-                    // Connection closed
+                    // Connection closed cleanly
+                    std::cerr << "[Pool] read_line: SSL connection closed" << std::endl;
                     connected = false;
-                    return "";
+                    break;
                 }
-                // SSL error
-                return "";
+                // Other SSL error
+                char err_buf[256];
+                ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+                std::cerr << "[Pool] read_line: SSL error " << ssl_error << ": " << err_buf << std::endl;
+                break;
             }
         } else {
             received = recv(sock, &c, 1, 0);
             if (received <= 0) {
                 if (received == 0) {
                     // Connection closed by peer
+                    std::cerr << "[Pool] read_line: connection closed by peer" << std::endl;
                     connected = false;
-                    if (bytes_received == 0) {
-                        return "";
-                    }
-                } else {
-                    // Error or timeout
-                    #ifndef _WIN32
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // Timeout
-                        return "";
-                    }
-                    #endif
                 }
+                #ifndef _WIN32
+                else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Timeout - return what we have
+                    break;
+                }
+                #endif
                 break;
             }
         }
@@ -441,8 +458,11 @@ bool StratumClient::is_connected() const {
 }
 
 bool StratumClient::do_login() {
-    // Build login request matching pool schema (JSON-RPC 2.0 format):
-    // { "id": N, "jsonrpc": "2.0", "method": "login", "params": { "name": "...", "address": "...", "password": "...", "agent": "..." } }
+    // Build login request matching pool schema (schema.rs):
+    // JsonRequest { id: Option<u64>, request: Request::Login { name, address, password, agent } }
+    // Serializes to: { "id": N, "method": "login", "params": { "name": "...", "address": "...", "password": "...", "agent": "..." } }
+    // Note: No "jsonrpc" field - this is NOT standard JSON-RPC 2.0
+    
     json params;
     params["name"] = config.name;
     params["address"] = config.address;
@@ -453,26 +473,27 @@ bool StratumClient::do_login() {
     
     json request;
     request["id"] = request_id_counter++;
-    request["jsonrpc"] = "2.0";
     request["method"] = "login";
     request["params"] = params;
     
-    std::cout << "[Pool] Sending login request..." << std::endl;
+    std::string request_str = request.dump();
+    std::cout << "[Pool] Sending login: " << request_str << std::endl;
+    
     if (!send_json(request)) {
         last_error = StratumError::AuthenticationFailed;
         last_error_message = "Failed to send login request";
         return false;
     }
     
-    // Wait for response with longer timeout
-    std::string line = read_line(config.connect_timeout_sec * 1000);
+    // Wait for response with longer timeout (60 seconds)
+    std::string line = read_line(60000);
     if (line.empty()) {
-        // Fallback: some pools use Stratum v1 (mining.subscribe/authorize)
-        std::cout << "[Pool] Login timeout, trying Stratum v1 subscribe/authorize..." << std::endl;
-        return do_stratum_v1_login();
+        last_error = StratumError::Timeout;
+        last_error_message = "Timeout waiting for login response";
+        return false;
     }
     
-    std::cout << "[Pool] Received response: " << (line.length() > 200 ? line.substr(0, 200) + "..." : line) << std::endl;
+    std::cout << "[Pool] Received: " << (line.length() > 500 ? line.substr(0, 500) + "..." : line) << std::endl;
     
     try {
         json response = json::parse(line);
@@ -486,155 +507,68 @@ bool StratumClient::do_login() {
             } else if (err.is_string()) {
                 last_error_message = err.get<std::string>();
             } else {
-                last_error_message = "Login rejected by pool";
+                last_error_message = response.dump();
             }
             return false;
         }
         
         // Parse login response: { "id": N, "jsonrpc": "2.0", "result": { "id": worker_id, "job": {...} } }
-        if (response.contains("result") && response["result"].is_object()) {
-            auto& result = response["result"];
+        if (response.contains("result")) {
+            json result = response["result"];
             
-            // Get worker ID
-            if (result.contains("id") && result["id"].is_number()) {
-                worker_id = result["id"].get<size_t>();
-            } else {
-                last_error = StratumError::InvalidResponse;
-                last_error_message = "Login response missing worker id";
-                return false;
-            }
-            
-            logged_in = true;
-            std::cout << "[Pool] Logged in as: " << config.name << " (address: " << config.address << ")" << std::endl;
-            std::cout << "[Pool] Worker ID: " << worker_id << std::endl;
-            
-            // Check for initial job in login response
-            if (result.contains("job") && !result["job"].is_null()) {
-                StratumJob job = parse_job_notification(result["job"]);
-                if (job.is_valid()) {
-                    std::lock_guard<std::mutex> lock(current_job_mutex);
-                    current_job = job;
-                    
-                    {
-                        std::lock_guard<std::mutex> job_lock(job_mutex);
-                        job_queue.push(job);
-                    }
-                    job_cv.notify_one();
-                    
-                    std::cout << "[Pool] Received initial job: " << job.job_id.substr(0, 16) << "..." << std::endl;
+            // Handle case where result might be nested or direct
+            if (result.is_object()) {
+                // Get worker ID
+                if (result.contains("id") && result["id"].is_number()) {
+                    worker_id = result["id"].get<size_t>();
+                } else {
+                    // Some pools might not return worker id, use 0
+                    worker_id = 0;
                 }
+                
+                logged_in = true;
+                std::cout << "[Pool] Logged in as: " << config.name << " (address: " << config.address.substr(0, 20) << "...)" << std::endl;
+                std::cout << "[Pool] Worker ID: " << worker_id << std::endl;
+                
+                // Check for initial job in login response
+                if (result.contains("job") && !result["job"].is_null()) {
+                    StratumJob job = parse_job_notification(result["job"]);
+                    if (job.is_valid()) {
+                        std::lock_guard<std::mutex> lock(current_job_mutex);
+                        current_job = job;
+                        
+                        {
+                            std::lock_guard<std::mutex> job_lock(job_mutex);
+                            job_queue.push(job);
+                        }
+                        job_cv.notify_one();
+                        
+                        std::cout << "[Pool] Received initial job: " << job.job_id.substr(0, 16) << "..." << std::endl;
+                    }
+                }
+                
+                return true;
             }
-            
-            return true;
         }
         
         last_error = StratumError::InvalidResponse;
-        last_error_message = "Invalid login response format";
-        // If login rejected, try Stratum v1 fallback
-        std::cout << "[Pool] Login rejected, trying Stratum v1 subscribe/authorize..." << std::endl;
-        return do_stratum_v1_login();
+        last_error_message = "Invalid login response: " + response.dump().substr(0, 200);
+        return false;
         
     } catch (const std::exception& e) {
         last_error = StratumError::InvalidResponse;
-        last_error_message = std::string("Failed to parse login response: ") + e.what();
-        std::cout << "[Pool] Invalid login response, trying Stratum v1 subscribe/authorize..." << std::endl;
-        return do_stratum_v1_login();
-        std::cout << "[Pool] Failed to parse login response, trying Stratum v1 subscribe/authorize..." << std::endl;
-        return do_stratum_v1_login();
-    }
-}
-
-bool StratumClient::do_stratum_v1_login() {
-    // If the connection was closed, reconnect before trying v1
-    if (!connected.load() || sock == INVALID_SOCKET_VALUE) {
-        disconnect_tcp();
-        if (!connect_tcp()) {
-            last_error = StratumError::ConnectionFailed;
-            last_error_message = "Failed to reconnect for Stratum v1 login";
-            return false;
-        }
-        connected = true;
-    }
-    
-    // 1) mining.subscribe
-    json subscribe;
-    subscribe["id"] = request_id_counter++;
-    subscribe["method"] = "mining.subscribe";
-    subscribe["params"] = json::array({config.agent, "1.0"});
-    
-    std::cout << "[Pool] Sending mining.subscribe..." << std::endl;
-    if (!send_json(subscribe)) {
-        last_error = StratumError::AuthenticationFailed;
-        last_error_message = "Failed to send mining.subscribe";
+        last_error_message = std::string("Failed to parse response: ") + e.what() + " - Raw: " + line.substr(0, 200);
         return false;
     }
-    
-    std::string subscribe_resp = read_line(config.connect_timeout_sec * 1000);
-    if (subscribe_resp.empty()) {
-        last_error = StratumError::Timeout;
-        last_error_message = "Timeout waiting for mining.subscribe response";
-        return false;
-    }
-    
-    // 2) mining.authorize
-    json authorize;
-    authorize["id"] = request_id_counter++;
-    authorize["method"] = "mining.authorize";
-    
-    // Typical Stratum username format: address.worker
-    std::string username = config.address;
-    if (!config.name.empty()) {
-        username += "." + config.name;
-    }
-    authorize["params"] = json::array({username, config.password});
-    
-    std::cout << "[Pool] Sending mining.authorize..." << std::endl;
-    if (!send_json(authorize)) {
-        last_error = StratumError::AuthenticationFailed;
-        last_error_message = "Failed to send mining.authorize";
-        return false;
-    }
-    
-    std::string auth_resp = read_line(config.connect_timeout_sec * 1000);
-    if (auth_resp.empty()) {
-        last_error = StratumError::Timeout;
-        last_error_message = "Timeout waiting for mining.authorize response";
-        return false;
-    }
-    
-    try {
-        json response = json::parse(auth_resp);
-        if (response.contains("result") && response["result"].is_boolean()) {
-            bool ok = response["result"].get<bool>();
-            if (!ok) {
-                last_error = StratumError::AuthenticationFailed;
-                last_error_message = "mining.authorize rejected";
-                return false;
-            }
-        } else if (response.contains("error") && !response["error"].is_null()) {
-            last_error = StratumError::AuthenticationFailed;
-            last_error_message = "mining.authorize error";
-            return false;
-        }
-    } catch (const std::exception& e) {
-        last_error = StratumError::InvalidResponse;
-        last_error_message = std::string("Failed to parse mining.authorize response: ") + e.what();
-        return false;
-    }
-    
-    logged_in = true;
-    worker_id = 0; // Stratum v1 doesn't return a worker id
-    std::cout << "[Pool] Logged in via Stratum v1 as: " << config.name << " (address: " << config.address << ")" << std::endl;
-    return true;
 }
 
 bool StratumClient::send_keepalive() {
-    // Build keepalive request: { "jsonrpc": "2.0", "method": "keepalived", "params": {} }
+    // Build keepalive request matching schema.rs:
+    // Request::Keepalived {} -> { "method": "keepalived", "params": {} }
+    // Note: keepalived is a notification, no id needed
     json request;
-    request["jsonrpc"] = "2.0";
     request["method"] = "keepalived";
     request["params"] = json::object();
-    // Note: keepalived is a notification, no id needed
     
     return send_json(request);
 }
@@ -722,60 +656,6 @@ void StratumClient::handle_notification(const std::string& method, const json& p
                       << "New job received" << Color::RESET 
                       << " | Job ID: " << short_id 
                       << " | Difficulty: " << job.difficulty << std::endl;
-        }
-    } else if (method == "mining.notify") {
-        // Stratum v1 job notification (may be array or object)
-        json job_params = params;
-        
-        // Some servers wrap job params in an array; try to find an object with "paths"
-        if (params.is_array()) {
-            for (const auto& item : params) {
-                if (item.is_object() && item.contains("paths")) {
-                    job_params = item;
-                    break;
-                }
-            }
-        }
-        
-        StratumJob job = parse_job_notification(job_params);
-        // If difficulty not included in job, use last set_difficulty value
-        if (job.difficulty.empty() && !current_difficulty.empty()) {
-            job.difficulty = current_difficulty;
-        }
-        
-        if (job.is_valid()) {
-            {
-                std::lock_guard<std::mutex> lock(current_job_mutex);
-                current_job = job;
-            }
-            {
-                std::lock_guard<std::mutex> lock(job_mutex);
-                while (!job_queue.empty()) {
-                    job_queue.pop();
-                }
-                job_queue.push(job);
-            }
-            job_cv.notify_one();
-            
-            std::string short_id = job.job_id.length() > 20
-                ? job.job_id.substr(0, 12) + "..." + job.job_id.substr(job.job_id.length() - 8)
-                : job.job_id;
-            std::cout << "[Pool] " << Color::CYAN << Color::BOLD
-                      << "New stratum job received" << Color::RESET
-                      << " | Job ID: " << short_id
-                      << " | Difficulty: " << job.difficulty << std::endl;
-        } else {
-            std::cout << "[Pool] mining.notify received (unparsed format)" << std::endl;
-        }
-    } else if (method == "mining.set_difficulty") {
-        // Stratum v1 difficulty update
-        if (params.is_array() && !params.empty()) {
-            if (params[0].is_number()) {
-                current_difficulty = std::to_string(params[0].get<double>());
-            } else if (params[0].is_string()) {
-                current_difficulty = params[0].get<std::string>();
-            }
-            std::cout << "[Pool] Difficulty set to " << current_difficulty << std::endl;
         }
     } else if (method == "pause") {
         // Pause notification: stop mining temporarily
@@ -1051,7 +931,8 @@ bool StratumClient::submit_solution(
     }
     pow_obj["root"] = root_arr;
     
-    // Authentication path A - array of MERKLE_TREE_HEIGHT_ digests
+    // Path A - array of MERKLE_TREE_HEIGHT_ digests
+    // Match BlockPow serialization in schema.rs (authentication_path_a / authentication_path_b)
     json path_a = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         json digest_arr = json::array();
@@ -1062,7 +943,7 @@ bool StratumClient::submit_solution(
     }
     pow_obj["authentication_path_a"] = path_a;
     
-    // Authentication path B - array of MERKLE_TREE_HEIGHT_ digests
+    // Path B - array of MERKLE_TREE_HEIGHT_ digests
     json path_b = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         json digest_arr = json::array();
@@ -1082,7 +963,6 @@ bool StratumClient::submit_solution(
     json request;
     uint64_t req_id = request_id_counter++;
     request["id"] = req_id;
-    request["jsonrpc"] = "2.0";
     request["method"] = "submit";
     request["params"] = params;
     

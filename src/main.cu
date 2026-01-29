@@ -15,7 +15,8 @@ void print_usage(const char* program_name) {
     
     std::cerr << Color::BOLD << "Pool Mining (Stratum):" << Color::RESET << std::endl;
     std::cerr << "  --stratum URL         Stratum pool URL (e.g., stratum://pool.example.com:3333)" << std::endl;
-    std::cerr << "  --stratum-pass PASS   Stratum password (default: x)\n" << std::endl;
+    std::cerr << "  --stratum-pass PASS   Stratum password (default: x)" << std::endl;
+    std::cerr << "  --stratum-worker NAME Stratum worker name (default: xnt-miner)\n" << std::endl;
     
     std::cerr << Color::BOLD << "General Options:" << Color::RESET << std::endl;
     std::cerr << "  -d, --device ID       Use specific GPU device ID (default: all GPUs)" << std::endl;
@@ -66,6 +67,7 @@ int main(int argc, char* argv[]) {
     
     std::string endpoint = "http://127.0.0.1:9897";
     std::string stratum_password = "x";
+    std::string stratum_worker_name = "xnt-miner";
     MiningMode mining_mode = MiningMode::Solo;
     bool show_help = false;
     
@@ -128,6 +130,8 @@ int main(int argc, char* argv[]) {
             mining_mode = MiningMode::Stratum;
         } else if ((arg == "--stratum-pass") && i + 1 < argc) {
             stratum_password = argv[++i];
+        } else if ((arg == "--stratum-worker") && i + 1 < argc) {
+            stratum_worker_name = argv[++i];
         } else if (arg == "--test-mode") {
             g_test_mode = true;
         } else if ((arg == "--fetch-interval") && i + 1 < argc) {
@@ -170,12 +174,14 @@ int main(int argc, char* argv[]) {
         mining_mode = detect_mining_mode(endpoint);
     }
     
+    g_miner_worker_name = stratum_worker_name;
     print_system_info();
     
     std::cout << Color::BOLD << "Configuration:" << Color::RESET << std::endl;
     std::cout << "  Mining Mode:   " << mining_mode_name(mining_mode) << std::endl;
     if (mining_mode == MiningMode::Stratum) {
         std::cout << "  Pool:          " << endpoint << std::endl;
+        std::cout << "  Worker:        " << g_miner_worker_name << std::endl;
     } else {
         std::cout << "  RPC Endpoint:  " << endpoint << std::endl;
     }

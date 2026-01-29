@@ -210,7 +210,7 @@ bool UnifiedMinerClient::initialize() {
         config.port = port;
         config.use_ssl = use_ssl;
         config.address = wallet_address;
-        config.name = "xnt-miner";
+        config.name = g_miner_worker_name.empty() ? "xnt-miner" : g_miner_worker_name;
         config.password = stratum_password;
         
         client = std::make_unique<StratumClient>(config);

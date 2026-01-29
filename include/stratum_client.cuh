@@ -142,9 +142,6 @@ private:
     // Worker ID from login response
     size_t worker_id{0};
     
-    // Track difficulty for stratum-v1 pools (mining.set_difficulty)
-    std::string current_difficulty;
-    
     // Internal methods
     bool connect_tcp();
     bool init_ssl();
@@ -159,11 +156,10 @@ private:
     void handle_notification(const std::string& method, const json& params);
     void handle_response(uint64_t id, const json& result, const json& error);
     
-    // Pool protocol methods
+    // Pool protocol methods (schema.rs based)
     bool do_login();
-    bool do_stratum_v1_login();
     
-    // Parse job notification from pool
+    // Parse job notification from pool (schema.rs Job format)
     StratumJob parse_job_notification(const json& params);
     
 public:

@@ -129,6 +129,7 @@ constexpr int CONSENSUS_XNT = 2;
 
 extern std::atomic<bool> stop_mining;
 extern std::string g_miner_wallet_address;
+extern std::string g_miner_worker_name;
 extern std::atomic<int> g_total_gpu_count;
 extern int g_gpu_device_id;
 extern bool g_test_mode;
