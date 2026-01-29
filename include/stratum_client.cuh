@@ -23,8 +23,9 @@ enum class StratumError {
     Unknown
 };
 
-// PowMastPaths structure matching pool schema
-struct PowMastPaths {
+// StratumPowMastPaths structure matching pool schema (Job.paths in schema.rs)
+// This is separate from PowMastPaths in pow.cuh which uses Digest types for GPU computation
+struct StratumPowMastPaths {
     std::vector<std::string> pow_kernel_body;      // pow.kernel_body
     std::vector<std::string> pow_type_scripts;     // pow.type_scripts
     std::vector<std::string> pow_kernel;           // pow.kernel
@@ -36,7 +37,7 @@ struct PowMastPaths {
 // Stratum job structure matching pool schema (Job in schema.rs)
 struct StratumJob {
     std::string job_id;              // id: Digest (hex string)
-    PowMastPaths paths;              // paths: PowMastPaths
+    StratumPowMastPaths paths;       // paths: PowMastPaths (from schema.rs)
     std::string difficulty;          // difficulty: String
     bool clean_jobs;                 // If true, discard previous jobs (implicit on new job)
     
@@ -51,7 +52,7 @@ struct StratumJob {
         PowPuzzle puzzle;
         puzzle.id = job_id;
         puzzle.threshold = difficulty;
-        // Map PowMastPaths to legacy AuthPaths format
+        // Map StratumPowMastPaths to legacy AuthPaths format
         puzzle.auth_paths.pow = paths.pow_kernel_body;
         puzzle.auth_paths.pow.insert(puzzle.auth_paths.pow.end(), 
             paths.pow_type_scripts.begin(), paths.pow_type_scripts.end());
