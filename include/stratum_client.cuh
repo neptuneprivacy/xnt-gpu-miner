@@ -23,70 +23,89 @@ enum class StratumError {
     Unknown
 };
 
-// Stratum job structure (parsed from mining.notify)
+// PowMastPaths structure matching pool schema
+struct PowMastPaths {
+    std::vector<std::string> pow_kernel_body;      // pow.kernel_body
+    std::vector<std::string> pow_type_scripts;     // pow.type_scripts
+    std::vector<std::string> pow_kernel;           // pow.kernel
+    std::vector<std::string> header_body;          // header.body
+    std::vector<std::string> header_appendix;      // header.appendix
+    std::vector<std::string> kernel;               // kernel
+};
+
+// Stratum job structure matching pool schema (Job in schema.rs)
 struct StratumJob {
-    std::string job_id;
-    std::string prev_block_hash;
-    std::string threshold;           // Target difficulty
-    std::string total_guesser_reward;
-    AuthPaths auth_paths;
-    int consensus_rule_set;
-    uint64_t height;
-    bool clean_jobs;                 // If true, discard previous jobs
+    std::string job_id;              // id: Digest (hex string)
+    PowMastPaths paths;              // paths: PowMastPaths
+    std::string difficulty;          // difficulty: String
+    bool clean_jobs;                 // If true, discard previous jobs (implicit on new job)
     
-    StratumJob() : consensus_rule_set(CONSENSUS_XNT), height(0), clean_jobs(false) {}
+    StratumJob() : clean_jobs(true) {}
     
     bool is_valid() const {
-        return !job_id.empty() && !prev_block_hash.empty() && !threshold.empty() &&
-               !auth_paths.pow.empty() && !auth_paths.header.empty() && !auth_paths.kernel.empty();
+        return !job_id.empty() && !difficulty.empty();
     }
     
     // Convert to PowPuzzle for compatibility with existing mining code
     PowPuzzle to_pow_puzzle() const {
         PowPuzzle puzzle;
         puzzle.id = job_id;
-        puzzle.threshold = threshold;
-        puzzle.total_guesser_reward = total_guesser_reward;
-        puzzle.prev_block = prev_block_hash;
-        puzzle.auth_paths = auth_paths;
-        puzzle.consensus_rule_set = consensus_rule_set;
+        puzzle.threshold = difficulty;
+        // Map PowMastPaths to legacy AuthPaths format
+        puzzle.auth_paths.pow = paths.pow_kernel_body;
+        puzzle.auth_paths.pow.insert(puzzle.auth_paths.pow.end(), 
+            paths.pow_type_scripts.begin(), paths.pow_type_scripts.end());
+        puzzle.auth_paths.pow.insert(puzzle.auth_paths.pow.end(),
+            paths.pow_kernel.begin(), paths.pow_kernel.end());
+        puzzle.auth_paths.header = paths.header_body;
+        puzzle.auth_paths.header.insert(puzzle.auth_paths.header.end(),
+            paths.header_appendix.begin(), paths.header_appendix.end());
+        puzzle.auth_paths.kernel = paths.kernel;
+        puzzle.consensus_rule_set = CONSENSUS_XNT;
         return puzzle;
     }
 };
 
-// Stratum client configuration
+// Stratum client configuration (matches pool Login request)
 struct StratumConfig {
     std::string host;
     int port;
-    std::string username;       // Wallet address or pool username
-    std::string password;       // Pool password (optional)
-    std::string worker_name;    // Worker identifier
+    std::string name;           // Worker name (login.name)
+    std::string address;        // Wallet address (login.address)
+    std::string password;       // Pool password (optional, login.password)
+    std::string agent;          // Miner agent string (login.agent)
     int connect_timeout_sec;
     int read_timeout_sec;
     int reconnect_delay_sec;
     int max_reconnect_attempts;
+    int keepalive_interval_sec; // Interval for keepalive requests
     
     StratumConfig()
         : port(3333)
-        , password("x")
-        , worker_name("xnt-miner")
+        , name("default")
+        , password("")
+        , agent("xnt-gpu-miner/1.0")
         , connect_timeout_sec(30)
         , read_timeout_sec(60)
         , reconnect_delay_sec(5)
-        , max_reconnect_attempts(10) {}
+        , max_reconnect_attempts(10)
+        , keepalive_interval_sec(30) {}
 };
 
-// TCP-based Stratum client implementing JSON-RPC over TCP
+// TCP-based Stratum client implementing pool schema protocol
 class StratumClient : public MiningClient {
 private:
     StratumConfig config;
     socket_t sock;
     std::atomic<bool> connected{false};
-    std::atomic<bool> authorized{false};
+    std::atomic<bool> logged_in{false};
     std::atomic<bool> running{false};
     
     // Receive thread for async notifications
     std::thread receive_thread;
+    
+    // Keepalive thread
+    std::thread keepalive_thread;
     
     // Job queue (thread-safe)
     std::queue<StratumJob> job_queue;
@@ -98,44 +117,42 @@ private:
     std::mutex current_job_mutex;
     
     // Request ID counter for JSON-RPC
-    std::atomic<int> request_id_counter{1};
+    std::atomic<uint64_t> request_id_counter{1};
     
     // Pending responses (for request-response matching)
-    std::map<int, std::promise<json>> pending_requests;
+    std::map<uint64_t, std::promise<json>> pending_requests;
     std::mutex pending_mutex;
     
     // Error tracking
     mutable StratumError last_error{StratumError::None};
     mutable std::string last_error_message;
     
-    // Subscription data
-    std::string session_id;
-    std::string extranonce1;
-    int extranonce2_size;
-    double current_difficulty;
+    // Worker ID from login response
+    size_t worker_id{0};
     
     // Internal methods
     bool connect_tcp();
     void disconnect_tcp();
     void receive_loop();
+    void keepalive_loop();
     bool send_json(const json& message);
     bool send_line(const std::string& line);
     std::string read_line(int timeout_ms = 5000);
     void handle_message(const json& message);
     void handle_notification(const std::string& method, const json& params);
-    void handle_response(int id, const json& result, const json& error);
+    void handle_response(uint64_t id, const json& result, const json& error);
     
-    // Stratum protocol methods
-    bool do_subscribe();
-    bool do_authorize();
+    // Pool protocol methods
+    bool do_login();
     
-    // Parse stratum job notification
+    // Parse job notification from pool
     StratumJob parse_job_notification(const json& params);
     
 public:
     StratumClient(const StratumConfig& cfg);
-    StratumClient(const std::string& url, const std::string& username, 
-                  const std::string& password = "x");
+    StratumClient(const std::string& url, const std::string& address, 
+                  const std::string& worker_name = "default",
+                  const std::string& password = "");
     ~StratumClient() override;
     
     // Disable copy
@@ -155,10 +172,12 @@ public:
     MiningMode get_mode() const override { return MiningMode::Stratum; }
     bool wait_for_job(json& job, int timeout_ms = 5000) override;
     
-    // Stratum-specific methods
-    bool is_authorized() const { return authorized.load(); }
-    double get_difficulty() const { return current_difficulty; }
-    const std::string& get_session_id() const { return session_id; }
+    // Pool-specific methods
+    bool is_logged_in() const { return logged_in.load(); }
+    size_t get_worker_id() const { return worker_id; }
+    
+    // Send keepalive (can be called manually if needed)
+    bool send_keepalive();
     
     // Error handling
     StratumError get_last_error() const { return last_error; }

@@ -35,9 +35,10 @@ void UnifiedMiningController::start() {
             StratumConfig config;
             config.host = host;
             config.port = port;
-            config.username = g_miner_wallet_address;
+            config.address = g_miner_wallet_address;
+            config.name = "xnt-miner-gpu" + std::to_string(gpu_id);
             config.password = stratum_password;
-            config.worker_name = "xnt-miner-gpu" + std::to_string(gpu_id);
+            config.agent = "xnt-gpu-miner/1.0";
             new_client = new StratumClient(config);
         } else {
             std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
