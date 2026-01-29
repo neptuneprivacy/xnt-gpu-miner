@@ -152,37 +152,37 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
     
     Digest prev_block = hex_to_digest(puzzle.prev_block);
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
+    Digest commitment = mast_paths.commit();
     
-    // Check if we can reuse existing buffer
+    // Check if we can reuse existing buffer (XNT uses commitment only)
     bool need_preprocess = true;
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         if (gpu_resources->buffer && gpu_resources->buffer->is_valid()) {
-            bool prev_block_match = true;
+            bool commitment_match = true;
             for (int i = 0; i < DIGEST_LEN; ++i) {
-                if (gpu_resources->cached_prev_block.values[i] != prev_block.values[i]) {
-                    prev_block_match = false;
+                if (gpu_resources->cached_commitment.values[i] != commitment.values[i]) {
+                    commitment_match = false;
                     break;
                 }
             }
-            
-            bool mast_paths_match = true;
-            if (prev_block_match) {
-                for (int i = 0; i < 3; ++i) {
-                    for (int j = 0; j < DIGEST_LEN; ++j) {
-                        if (gpu_resources->cached_mast_paths.pow[i].values[j] != mast_paths.pow[i].values[j]) {
-                            mast_paths_match = false;
-                            break;
-                        }
+
+            bool prev_block_match = true;
+            if (puzzle.consensus_rule_set != CONSENSUS_XNT) {
+                for (int i = 0; i < DIGEST_LEN; ++i) {
+                    if (gpu_resources->cached_prev_block.values[i] != prev_block.values[i]) {
+                        prev_block_match = false;
+                        break;
                     }
-                    if (!mast_paths_match) break;
                 }
             }
-            
-            if (prev_block_match && mast_paths_match) {
+
+            if (commitment_match && prev_block_match) {
                 need_preprocess = false;
                 gpu_resources->buffer->mast_paths = mast_paths;
+                gpu_resources->buffer->prev_block_digest = prev_block;
                 gpu_resources->cached_mast_paths = mast_paths;
+                gpu_resources->cached_commitment = commitment;
                 std::cout << "[GPU " << gpu_id << "] " << Color::GREEN 
                           << "Reusing cached buffer" << Color::RESET << std::endl;
             }
@@ -208,6 +208,7 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
             std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
             gpu_resources->cached_prev_block = prev_block;
             gpu_resources->cached_mast_paths = mast_paths;
+            gpu_resources->cached_commitment = commitment;
         }
     }
     
