@@ -458,7 +458,7 @@ bool StratumClient::is_connected() const {
 }
 
 bool StratumClient::do_login() {
-    // Build login request matching pool schema (schema.rs):
+    // Build login request matching pool protocol:
     // JsonRequest { id: Option<u64>, request: Request::Login { name, address, password, agent } }
     // Serializes to: { "id": N, "method": "login", "params": { "name": "...", "address": "...", "password": "...", "agent": "..." } }
     // Note: No "jsonrpc" field - this is NOT standard JSON-RPC 2.0
@@ -563,7 +563,7 @@ bool StratumClient::do_login() {
 }
 
 bool StratumClient::send_keepalive() {
-    // Build keepalive request matching schema.rs:
+    // Build keepalive request matching pool protocol:
     // Request::Keepalived {} -> { "method": "keepalived", "params": {} }
     // Note: keepalived is a notification, no id needed
     json request;
@@ -691,7 +691,7 @@ void StratumClient::handle_response(uint64_t id, const json& result, const json&
 StratumJob StratumClient::parse_job_notification(const json& params) {
     StratumJob job;
     
-    // Pool schema Job format (from schema.rs):
+    // Pool protocol Job format:
     // {
     //   "id": "digest_hex_string",
     //   "paths": {
@@ -724,7 +724,7 @@ StratumJob StratumClient::parse_job_notification(const json& params) {
             }
         }
         
-        // Difficulty
+        // Difficulty (pool difficulty - easier than RPC threshold for share validation)
         if (params.contains("difficulty") && params["difficulty"].is_string()) {
             job.difficulty = params["difficulty"].get<std::string>();
         }
@@ -810,10 +810,11 @@ json StratumClient::getBlockTemplate() {
     json template_obj;
     json metadata;
     
-    metadata["digest"] = current_job.job_id;
-    metadata["threshold"] = current_job.difficulty;
-    
-    // Build pow_mast_paths from pool paths structure
+            metadata["digest"] = current_job.job_id;
+            metadata["threshold"] = current_job.difficulty;  // Pool difficulty (for share validation)
+            // Note: No total_guesser_reward in pool mode
+            
+            // Build pow_mast_paths from pool paths structure
     json pow_mast_paths;
     
     // Combine pow paths into single array for legacy format
@@ -864,7 +865,8 @@ bool StratumClient::wait_for_job(json& job, int timeout_ms) {
             json metadata;
             
             metadata["digest"] = puzzle.id;
-            metadata["threshold"] = puzzle.threshold;
+            metadata["threshold"] = puzzle.threshold;  // Pool difficulty (for share validation)
+            // Note: No total_guesser_reward in pool mode
             
             json pow_mast_paths;
             pow_mast_paths["pow"] = puzzle.auth_paths.pow;
@@ -932,7 +934,7 @@ bool StratumClient::submit_solution(
     pow_obj["root"] = root_arr;
     
     // Path A - array of MERKLE_TREE_HEIGHT_ digests
-    // Match BlockPow serialization in schema.rs (authentication_path_a / authentication_path_b)
+    // Match BlockPow serialization (authentication_path_a / authentication_path_b)
     json path_a = json::array();
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         json digest_arr = json::array();
