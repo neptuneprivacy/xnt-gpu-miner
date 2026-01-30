@@ -23,7 +23,7 @@ enum class StratumError {
     Unknown
 };
 
-// StratumPowMastPaths structure matching pool schema (Job.paths in schema.rs)
+// StratumPowMastPaths structure matching pool protocol
 // This is separate from PowMastPaths in pow.cuh which uses Digest types for GPU computation
 struct StratumPowMastPaths {
     std::vector<std::string> pow_kernel_body;      // pow.kernel_body
@@ -34,11 +34,11 @@ struct StratumPowMastPaths {
     std::vector<std::string> kernel;               // kernel
 };
 
-// Stratum job structure matching pool schema (Job in schema.rs)
+// Stratum job structure matching pool protocol
 struct StratumJob {
     std::string job_id;              // id: Digest (hex string)
-    StratumPowMastPaths paths;       // paths: PowMastPaths (from schema.rs)
-    std::string difficulty;          // difficulty: String
+    StratumPowMastPaths paths;       // paths: PowMastPaths
+    std::string difficulty;          // difficulty: String (pool difficulty, easier than RPC threshold)
     bool clean_jobs;                 // If true, discard previous jobs (implicit on new job)
     
     StratumJob() : clean_jobs(true) {}
@@ -48,10 +48,12 @@ struct StratumJob {
     }
     
     // Convert to PowPuzzle for compatibility with existing mining code
+    // Note: In pool mode, difficulty is easier (for shares), not the full block threshold
     PowPuzzle to_pow_puzzle() const {
         PowPuzzle puzzle;
         puzzle.id = job_id;
-        puzzle.threshold = difficulty;
+        puzzle.threshold = difficulty;  // Pool difficulty (easier, for share validation)
+        puzzle.total_guesser_reward = "";  // No reward in pool mode
         // Map StratumPowMastPaths to legacy AuthPaths format
         puzzle.auth_paths.pow = paths.pow_kernel_body;
         puzzle.auth_paths.pow.insert(puzzle.auth_paths.pow.end(), 
@@ -156,10 +158,10 @@ private:
     void handle_notification(const std::string& method, const json& params);
     void handle_response(uint64_t id, const json& result, const json& error);
     
-    // Pool protocol methods (schema.rs based)
+    // Pool protocol methods
     bool do_login();
     
-    // Parse job notification from pool (schema.rs Job format)
+    // Parse job notification from pool (Job format)
     StratumJob parse_job_notification(const json& params);
     
 public:

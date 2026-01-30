@@ -512,8 +512,11 @@ PowPuzzle parseRpcTemplate(const json& template_response) {
             std::cout << "[RPC] " << Color::GREEN << Color::BOLD << "✓ Block proposal received" << Color::RESET << std::endl
                       << "  Proposal ID: " << Color::CYAN << short_id << Color::RESET << std::endl
                       << "  Threshold: " << puzzle.threshold.substr(0, 16) << "..." << std::endl
-                      << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl
-                      << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl;
+                      << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl;
+            // Only show reward in solo mode (pool mode doesn't include reward)
+            if (!puzzle.total_guesser_reward.empty()) {
+                std::cout << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl;
+            }
         }
         
     } catch (const std::exception& e) {

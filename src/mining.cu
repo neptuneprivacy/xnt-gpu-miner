@@ -404,9 +404,14 @@ void UnifiedMiningController::handleNewPuzzle(const MiningEvent& event) {
     
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        if (puzzle.id == gpu_resources->current_proposal_id) {
-            return;  // Same puzzle, skip
+        // For stratum mode, always process job notifications even if same ID
+        // (pool may resend same job, and we should restart mining)
+        // For solo mode, skip duplicates to avoid unnecessary restarts
+        bool is_duplicate = (puzzle.id == gpu_resources->current_proposal_id);
+        if (is_duplicate && mining_mode == MiningMode::Solo) {
+            return;  // Same puzzle in solo mode, skip
         }
+        // In stratum mode, always update to restart mining (even if same ID)
         gpu_resources->current_proposal_id = puzzle.id;
         gpu_resources->current_template = template_obj;  // Store template for this proposal
         Digest original_target = hex_to_digest(puzzle.threshold);
