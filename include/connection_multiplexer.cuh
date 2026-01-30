@@ -4,6 +4,7 @@
 #include "common.cuh"
 #include "gpu_resources.cuh"
 #include "pow.cuh"
+#include "mining_client.h"
 #include <memory>
 #include <vector>
 #include <queue>
@@ -16,39 +17,6 @@
 
 class XntRpcClient;
 struct PowPuzzle;
-
-// ============================================================================
-// MiningClient Interface (Abstract Base)
-// ============================================================================
-// Unified interface for Solo (HTTP) and Stratum (TCP) modes
-
-class MiningClient {
-public:
-    virtual ~MiningClient() = default;
-    
-    // Connection management
-    virtual bool connect() = 0;
-    virtual void disconnect() = 0;
-    virtual bool is_connected() const = 0;
-    virtual bool reconnect() = 0;
-    
-    // Job fetching
-    virtual json getBlockTemplate(const std::string& wallet_address) = 0;
-    
-    // Solution submission
-    virtual bool submitSolution(
-        const std::string& proposal_id,
-        const Pow& pow_solution,
-        const Digest& solution_hash,
-        const json& template_obj) = 0;
-    
-    // Chain queries
-    virtual std::string getTipDigest() = 0;
-    virtual uint64_t getChainHeight() = 0;
-    
-    // Mode identification
-    virtual bool isPushBased() const = 0;  // true for Stratum, false for Solo
-};
 
 // ============================================================================
 // SoloMiningClient (Thread-safe HTTP JSON-RPC wrapper)
@@ -71,8 +39,13 @@ public:
     bool connect() override;
     void disconnect() override;
     bool is_connected() const override;
-    bool reconnect() override;
+    bool reconnect() override {
+        return MiningClient::reconnect();
+    }
     
+    MiningMode get_mode() const override { return MiningMode::Solo; }
+    
+    json getBlockTemplate() override;
     json getBlockTemplate(const std::string& wallet_address) override;
     
     bool submitSolution(
@@ -81,10 +54,19 @@ public:
         const Digest& solution_hash,
         const json& template_obj) override;
     
+    // Alias for compatibility
+    bool submit_solution(
+        const std::string& proposal_id,
+        const Pow& pow_solution,
+        const Digest& solution_hash,
+        const json& template_obj) override {
+        return submitSolution(proposal_id, pow_solution, solution_hash, template_obj);
+    }
+    
     std::string getTipDigest() override;
     uint64_t getChainHeight() override;
     
-    bool isPushBased() const override { return false; }
+    bool is_push_based() const override { return false; }
 };
 
 // ============================================================================

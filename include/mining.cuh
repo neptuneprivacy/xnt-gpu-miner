@@ -32,18 +32,7 @@ private:
 public:
     GpuWorker(int gpu_id, GpuResources* resources);
     ~GpuWorker();
-    std::atomic<bool> controller_running{false};
     std::string stratum_password;  // For stratum mode
-    
-public:
-    UnifiedMiningController(
-        int gpu_id, 
-        GpuResources* resources,
-        const std::string& endpoint = "http://127.0.0.1:9897",
-        MiningMode mode = MiningMode::Solo,
-        const std::string& stratum_pass = "x");
-    
-    ~UnifiedMiningController();
     
     GpuWorker(const GpuWorker&) = delete;
     GpuWorker& operator=(const GpuWorker&) = delete;
@@ -60,8 +49,6 @@ public:
     
 private:
     bool initializeCuda();
-    void fetcherLoop();
-    void stratumFetcherLoop();  // Stratum-specific fetcher (push-based)
     void miningLoop();
     void handleNewPuzzle(const MiningEvent& event);
 };

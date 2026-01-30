@@ -23,11 +23,21 @@ public:
     virtual bool connect() = 0;
     virtual void disconnect() = 0;
     virtual bool is_connected() const = 0;
+    virtual bool reconnect() {
+        disconnect();
+        return connect();
+    }
     
     // Job fetching
     // For Solo mode: polls for new block template
     // For Stratum mode: returns cached job from push notification
     virtual json getBlockTemplate() = 0;
+    
+    // Overload with wallet address (optional, not all clients use it)
+    virtual json getBlockTemplate(const std::string& wallet_address) {
+        (void)wallet_address;  // Ignore if not used
+        return getBlockTemplate();
+    }
     
     // Solution submission
     virtual bool submit_solution(
@@ -35,6 +45,15 @@ public:
         const Pow& pow_solution,
         const Digest& solution_hash,
         const json& template_obj) = 0;
+    
+    // Alias for compatibility (camelCase)
+    virtual bool submitSolution(
+        const std::string& proposal_id,
+        const Pow& pow_solution,
+        const Digest& solution_hash,
+        const json& template_obj) {
+        return submit_solution(proposal_id, pow_solution, solution_hash, template_obj);
+    }
     
     // Get mining mode
     virtual MiningMode get_mode() const = 0;
@@ -51,6 +70,15 @@ public:
     // Check if this client uses push-based job notifications
     virtual bool is_push_based() const {
         return get_mode() == MiningMode::Stratum;
+    }
+    
+    // Optional chain queries (not all clients support these)
+    virtual std::string getTipDigest() {
+        return "";  // Default: not supported
+    }
+    
+    virtual uint64_t getChainHeight() {
+        return 0;  // Default: not supported
     }
 };
 
