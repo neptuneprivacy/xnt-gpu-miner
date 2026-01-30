@@ -58,6 +58,11 @@ public:
         const json& template_obj) override;
     
     json getBlockTemplate() override;
+    // Also support the new interface with optional parameter
+    json getBlockTemplate(const std::string& wallet_address) {
+        (void)wallet_address;  // Not used in solo mode
+        return getBlockTemplate();
+    }
     
     // Solo-specific methods
     bool connect_to_node();

@@ -180,6 +180,7 @@ public:
     void disconnect() override;
     bool is_connected() const override;
     json getBlockTemplate() override;
+    json getBlockTemplate(const std::string& wallet_address) override;
     bool submit_solution(
         const std::string& proposal_id,
         const Pow& pow_solution,

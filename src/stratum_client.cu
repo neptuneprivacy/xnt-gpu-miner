@@ -847,6 +847,11 @@ json StratumClient::getBlockTemplate() {
     return response;
 }
 
+json StratumClient::getBlockTemplate(const std::string& wallet_address) {
+    (void)wallet_address;  // Stratum uses address from login, ignore parameter
+    return getBlockTemplate();
+}
+
 bool StratumClient::wait_for_job(json& job, int timeout_ms) {
     std::unique_lock<std::mutex> lock(job_mutex);
     

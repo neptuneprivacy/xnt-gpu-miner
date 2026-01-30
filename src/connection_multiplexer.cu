@@ -1,5 +1,6 @@
 #include "connection_multiplexer.cuh"
 #include "rpc_client.cuh"
+#include "stratum_client.cuh"
 #include "network.cuh"
 #include "mining.cuh"
 #include "pow.cuh"
@@ -64,8 +65,14 @@ bool SoloMiningClient::is_connected() const {
     return connected.load();
 }
 
-bool SoloMiningClient::reconnect() {
-    return connect();
+// reconnect() is now implemented inline in the header
+
+json SoloMiningClient::getBlockTemplate() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    if (!rpc_client) {
+        return json();
+    }
+    return rpc_client->getBlockTemplate("");
 }
 
 json SoloMiningClient::getBlockTemplate(const std::string& wallet_address) {
@@ -215,7 +222,8 @@ ConnectionMultiplexer::~ConnectionMultiplexer() {
     shutdown();
 }
 
-bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string& wallet) {
+bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string& wallet, 
+                                       const std::string& stratum_password) {
     if (initialized.load()) {
         return true;
     }
@@ -223,10 +231,34 @@ bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string&
     endpoint = ep;
     wallet_address = wallet;
     
-    // Create the mining client (Solo mode for now)
-    client = std::make_unique<SoloMiningClient>(endpoint);
+    // Detect mining mode from endpoint URL
+    MiningMode mode = detect_mining_mode(endpoint);
+    mining_mode = mode;
     
-    std::cout << "Attempting to connect to RPC server at " << endpoint << "..." << std::endl;
+    // Create the appropriate mining client based on mode
+    if (mode == MiningMode::Stratum) {
+        std::string host;
+        int port;
+        bool use_ssl = false;
+        if (parse_stratum_url(endpoint, host, port, use_ssl)) {
+            StratumConfig config;
+            config.host = host;
+            config.port = port;
+            config.use_ssl = use_ssl;
+            config.address = wallet_address;
+            config.name = g_miner_worker_name.empty() ? "xnt-miner" : g_miner_worker_name;
+            config.password = stratum_password;
+            config.agent = "xnt-gpu-miner/1.0";
+            client = std::make_unique<StratumClient>(config);
+            std::cout << "Attempting to connect to stratum server at " << endpoint << "..." << std::endl;
+        } else {
+            std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
+            return false;
+        }
+    } else {
+        client = std::make_unique<SoloMiningClient>(endpoint);
+        std::cout << "Attempting to connect to RPC server at " << endpoint << "..." << std::endl;
+    }
     
     // Initial connection attempt
     int retry_count = 0;
@@ -235,7 +267,8 @@ bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string&
     while (!conn_success && !stop_mining && retry_count < 10) {
         if (client->connect()) {
             conn_success = true;
-            std::cout << Color::GREEN << "Successfully connected to RPC server!" << Color::RESET << std::endl;
+            const char* server_type = (mining_mode == MiningMode::Stratum) ? "stratum server" : "RPC server";
+            std::cout << Color::GREEN << "Successfully connected to " << server_type << "!" << Color::RESET << std::endl;
             break;
         }
         
@@ -313,6 +346,9 @@ void ConnectionMultiplexer::shutdown() {
 GpuWorkerHandle* ConnectionMultiplexer::registerWorker(int gpu_id, GpuResources* resources) {
     std::unique_lock<std::shared_mutex> lock(workers_mutex);
     
+    if (!resources->event_handler) {
+        resources->event_handler = std::make_unique<EventHandler>();
+    }
     auto handle = std::make_unique<GpuWorkerHandle>(gpu_id, resources);
     GpuWorkerHandle* ptr = handle.get();
     workers.push_back(std::move(handle));
@@ -403,106 +439,116 @@ void ConnectionMultiplexer::updateAllWorkersConnectionState(bool is_connected) {
 // ============================================================================
 
 void ConnectionMultiplexer::jobBroadcasterLoop() {
-    LOG_DEBUG("[JobBroadcaster] Started");
-    
-    auto last_poll_time = std::chrono::steady_clock::now();
-    
-    // Wait for at least one worker to register
-    while (running.load()) {
-        if (getActiveWorkerCount() > 0) {
-            break;
+    try {
+        LOG_DEBUG("[JobBroadcaster] Started");
+
+        auto last_poll_time = std::chrono::steady_clock::now();
+
+        // Wait for at least one worker to register
+        while (running.load()) {
+            if (getActiveWorkerCount() > 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    
-    std::cout << "[JobBroadcaster] Block proposal fetcher started" << std::endl;
-    
-    while (running.load() && !stop_mining) {
-        // Check connection
-        if (!client || !client->is_connected()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
-        }
-        
-        auto now = std::chrono::steady_clock::now();
-        auto time_since_poll = std::chrono::duration_cast<std::chrono::seconds>(
-            now - last_poll_time).count();
-        
-        bool should_poll = false;
-        
-        // Check if it's time to poll
-        if (time_since_poll >= g_fetch_interval_sec) {
-            should_poll = true;
-        }
-        
-        // Also poll if we have no template yet
-        {
-            std::lock_guard<std::mutex> lock(job_mutex);
-            if (last_template_id.empty()) {
+
+        std::cout << "[JobBroadcaster] Block proposal fetcher started" << std::endl;
+
+        while (running.load() && !stop_mining) {
+            // Check connection
+            if (!client || !client->is_connected()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto time_since_poll = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_poll_time).count();
+
+            bool should_poll = false;
+
+            // Check if it's time to poll
+            if (time_since_poll >= g_fetch_interval_sec) {
                 should_poll = true;
             }
-        }
-        
-        if (should_poll) {
-            json template_response = client->getBlockTemplate(wallet_address);
-            last_poll_time = std::chrono::steady_clock::now();
-            
-            if (!template_response.empty() && template_response.contains("result")) {
-                json result = template_response["result"];
-                
-                if (!result.contains("template") || result["template"].is_null()) {
-                    // Template null, node may be syncing
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    continue;
+
+            // Also poll if we have no template yet
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                if (last_template_id.empty()) {
+                    should_poll = true;
                 }
-                
-                json template_obj = result["template"];
-                if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    continue;
-                }
-                
-                json metadata = template_obj["metadata"];
-                std::string template_id = metadata.contains("digest") 
-                    ? metadata.value("digest", "") : "";
-                
-                bool is_new_template = false;
-                {
-                    std::lock_guard<std::mutex> lock(job_mutex);
-                    if (!template_id.empty() && template_id != last_template_id) {
-                        // Verify prev_block matches tip
-                        std::string prev_block;
-                        if (metadata.contains("prevBlock")) {
-                            prev_block = metadata.value("prevBlock", "");
-                        } else if (metadata.contains("prev_block")) {
-                            prev_block = metadata.value("prev_block", "");
-                        }
-                        
-                        std::string tip_digest = client->getTipDigest();
-                        
-                        if (prev_block.empty() || prev_block == tip_digest) {
-                            last_template_id = template_id;
-                            is_new_template = true;
-                            
-                            stats.total_jobs_fetched++;
-                            {
-                                std::lock_guard<std::mutex> time_lock(stats.time_mutex);
-                                stats.last_job_time = std::chrono::steady_clock::now();
+            }
+
+            if (should_poll) {
+                json template_response = client->getBlockTemplate(wallet_address);
+                last_poll_time = std::chrono::steady_clock::now();
+
+                if (!template_response.empty() && template_response.contains("result")) {
+                    json result = template_response["result"];
+
+                    if (!result.contains("template") || result["template"].is_null()) {
+                        // Template null, node may be syncing
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        continue;
+                    }
+
+                    json template_obj = result["template"];
+                    if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        continue;
+                    }
+
+                    json metadata = template_obj["metadata"];
+                    std::string template_id = metadata.contains("digest")
+                        ? metadata.value("digest", "") : "";
+
+                    bool is_new_template = false;
+                    {
+                        std::lock_guard<std::mutex> lock(job_mutex);
+                        if (!template_id.empty() && template_id != last_template_id) {
+                            // Verify prev_block matches tip
+                            std::string prev_block;
+                            if (metadata.contains("prevBlock")) {
+                                prev_block = metadata.value("prevBlock", "");
+                            } else if (metadata.contains("prev_block")) {
+                                prev_block = metadata.value("prev_block", "");
+                            }
+
+                            std::string tip_digest = client->getTipDigest();
+
+                            if (prev_block.empty() || prev_block == tip_digest) {
+                                last_template_id = template_id;
+                                is_new_template = true;
+
+                                stats.total_jobs_fetched++;
+                                {
+                                    std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                                    stats.last_job_time = std::chrono::steady_clock::now();
+                                }
                             }
                         }
                     }
-                }
-                
-                if (is_new_template) {
-                    broadcastJobToWorkers(template_response);
+
+                    if (is_new_template) {
+                        broadcastJobToWorkers(template_response);
+                    }
                 }
             }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        LOG_DEBUG("[JobBroadcaster] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[JobBroadcaster] Exception: " << e.what() << std::endl;
+        running.store(false);
+        connected.store(false);
+    } catch (...) {
+        std::cerr << "[JobBroadcaster] Unknown exception" << std::endl;
+        running.store(false);
+        connected.store(false);
     }
-    
-    LOG_DEBUG("[JobBroadcaster] Stopped");
 }
 
 void ConnectionMultiplexer::broadcastJobToWorkers(const json& job) {
@@ -522,34 +568,44 @@ void ConnectionMultiplexer::broadcastJobToWorkers(const json& job) {
 }
 
 void ConnectionMultiplexer::solutionSubmitterLoop() {
-    LOG_DEBUG("[SolutionSubmitter] Started");
-    
-    while (running.load() && !stop_mining) {
-        std::unique_ptr<SolutionSubmission> submission;
-        
-        {
-            std::unique_lock<std::mutex> lock(submission_mutex);
-            submission_cv.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return !submission_queue.empty() || !running.load() || stop_mining;
-            });
-            
-            if ((!running.load() || stop_mining) && submission_queue.empty()) {
-                break;
+    try {
+        LOG_DEBUG("[SolutionSubmitter] Started");
+
+        while (running.load() && !stop_mining) {
+            std::unique_ptr<SolutionSubmission> submission;
+
+            {
+                std::unique_lock<std::mutex> lock(submission_mutex);
+                submission_cv.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return !submission_queue.empty() || !running.load() || stop_mining;
+                });
+
+                if ((!running.load() || stop_mining) && submission_queue.empty()) {
+                    break;
+                }
+
+                if (!submission_queue.empty()) {
+                    submission = std::move(submission_queue.front());
+                    submission_queue.pop();
+                }
             }
-            
-            if (!submission_queue.empty()) {
-                submission = std::move(submission_queue.front());
-                submission_queue.pop();
+
+            if (submission) {
+                bool result = processSubmission(*submission);
+                submission->result_promise->set_value(result);
             }
         }
-        
-        if (submission) {
-            bool result = processSubmission(*submission);
-            submission->result_promise->set_value(result);
-        }
+
+        LOG_DEBUG("[SolutionSubmitter] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[SolutionSubmitter] Exception: " << e.what() << std::endl;
+        running.store(false);
+        connected.store(false);
+    } catch (...) {
+        std::cerr << "[SolutionSubmitter] Unknown exception" << std::endl;
+        running.store(false);
+        connected.store(false);
     }
-    
-    LOG_DEBUG("[SolutionSubmitter] Stopped");
 }
 
 bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
@@ -560,12 +616,20 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
     }
     
     stats.total_solutions_submitted++;
-    
-    bool accepted = client->submitSolution(
-        submission.proposal_id,
-        submission.pow_solution,
-        submission.solution_hash,
-        submission.template_obj);
+    bool accepted = false;
+    try {
+        accepted = client->submitSolution(
+            submission.proposal_id,
+            submission.pow_solution,
+            submission.solution_hash,
+            submission.template_obj);
+    } catch (const std::exception& e) {
+        std::cerr << "[Submit] Exception: " << e.what() << std::endl;
+        accepted = false;
+    } catch (...) {
+        std::cerr << "[Submit] Unknown exception" << std::endl;
+        accepted = false;
+    }
     
     if (accepted) {
         stats.total_solutions_accepted++;
@@ -582,51 +646,61 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
 }
 
 void ConnectionMultiplexer::healthMonitorLoop() {
-    LOG_DEBUG("[HealthMonitor] Started");
-    
-    while (running.load() && !stop_mining) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        
-        if (!running.load() || stop_mining) break;
-        
-        // Check connection health
-        if (client) {
-            bool was_connected = connected.load();
-            bool is_now_connected = client->is_connected();
-            
-            if (was_connected && !is_now_connected) {
-                // Lost connection
-                std::cout << "[HealthMonitor] " << Color::YELLOW 
-                          << "Connection lost, attempting reconnection..." << Color::RESET << std::endl;
-                
-                connected.store(false);
-                updateAllWorkersConnectionState(false);
-                
-                if (attemptReconnection()) {
+    try {
+        LOG_DEBUG("[HealthMonitor] Started");
+
+        while (running.load() && !stop_mining) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            if (!running.load() || stop_mining) break;
+
+            // Check connection health
+            if (client) {
+                bool was_connected = connected.load();
+                bool is_now_connected = client->is_connected();
+
+                if (was_connected && !is_now_connected) {
+                    // Lost connection
+                    std::cout << "[HealthMonitor] " << Color::YELLOW
+                              << "Connection lost, attempting reconnection..." << Color::RESET << std::endl;
+
+                    connected.store(false);
+                    updateAllWorkersConnectionState(false);
+
+                    if (attemptReconnection()) {
+                        connected.store(true);
+                        updateAllWorkersConnectionState(true);
+                    }
+                } else if (!was_connected && is_now_connected) {
+                    // Connection restored (shouldn't happen normally)
                     connected.store(true);
                     updateAllWorkersConnectionState(true);
                 }
-            } else if (!was_connected && is_now_connected) {
-                // Connection restored (shouldn't happen normally)
-                connected.store(true);
-                updateAllWorkersConnectionState(true);
+            }
+
+            // Check for stale jobs
+            {
+                std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                auto now = std::chrono::steady_clock::now();
+                auto time_since_job = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - stats.last_job_time).count();
+
+                if (time_since_job > JOB_STALENESS_THRESHOLD_SEC && connected.load()) {
+                    LOG_DEBUG("[HealthMonitor] Jobs stale (" << time_since_job << "s), will refresh on next poll");
+                }
             }
         }
-        
-        // Check for stale jobs
-        {
-            std::lock_guard<std::mutex> time_lock(stats.time_mutex);
-            auto now = std::chrono::steady_clock::now();
-            auto time_since_job = std::chrono::duration_cast<std::chrono::seconds>(
-                now - stats.last_job_time).count();
-            
-            if (time_since_job > JOB_STALENESS_THRESHOLD_SEC && connected.load()) {
-                LOG_DEBUG("[HealthMonitor] Jobs stale (" << time_since_job << "s), will refresh on next poll");
-            }
-        }
+
+        LOG_DEBUG("[HealthMonitor] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[HealthMonitor] Exception: " << e.what() << std::endl;
+        running.store(false);
+        connected.store(false);
+    } catch (...) {
+        std::cerr << "[HealthMonitor] Unknown exception" << std::endl;
+        running.store(false);
+        connected.store(false);
     }
-    
-    LOG_DEBUG("[HealthMonitor] Stopped");
 }
 
 bool ConnectionMultiplexer::attemptReconnection() {
