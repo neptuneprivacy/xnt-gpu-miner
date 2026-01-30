@@ -1,5 +1,6 @@
 #include "connection_multiplexer.cuh"
 #include "rpc_client.cuh"
+#include "stratum_client.cuh"
 #include "network.cuh"
 #include "mining.cuh"
 #include "pow.cuh"
@@ -221,7 +222,8 @@ ConnectionMultiplexer::~ConnectionMultiplexer() {
     shutdown();
 }
 
-bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string& wallet) {
+bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string& wallet, 
+                                       const std::string& stratum_password) {
     if (initialized.load()) {
         return true;
     }
@@ -229,10 +231,34 @@ bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string&
     endpoint = ep;
     wallet_address = wallet;
     
-    // Create the mining client (Solo mode for now)
-    client = std::make_unique<SoloMiningClient>(endpoint);
+    // Detect mining mode from endpoint URL
+    MiningMode mode = detect_mining_mode(endpoint);
+    mining_mode = mode;
     
-    std::cout << "Attempting to connect to RPC server at " << endpoint << "..." << std::endl;
+    // Create the appropriate mining client based on mode
+    if (mode == MiningMode::Stratum) {
+        std::string host;
+        int port;
+        bool use_ssl = false;
+        if (parse_stratum_url(endpoint, host, port, use_ssl)) {
+            StratumConfig config;
+            config.host = host;
+            config.port = port;
+            config.use_ssl = use_ssl;
+            config.address = wallet_address;
+            config.name = g_miner_worker_name.empty() ? "xnt-miner" : g_miner_worker_name;
+            config.password = stratum_password;
+            config.agent = "xnt-gpu-miner/1.0";
+            client = std::make_unique<StratumClient>(config);
+            std::cout << "Attempting to connect to stratum server at " << endpoint << "..." << std::endl;
+        } else {
+            std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
+            return false;
+        }
+    } else {
+        client = std::make_unique<SoloMiningClient>(endpoint);
+        std::cout << "Attempting to connect to RPC server at " << endpoint << "..." << std::endl;
+    }
     
     // Initial connection attempt
     int retry_count = 0;
@@ -241,7 +267,8 @@ bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string&
     while (!conn_success && !stop_mining && retry_count < 10) {
         if (client->connect()) {
             conn_success = true;
-            std::cout << Color::GREEN << "Successfully connected to RPC server!" << Color::RESET << std::endl;
+            const char* server_type = (mining_mode == MiningMode::Stratum) ? "stratum server" : "RPC server";
+            std::cout << Color::GREEN << "Successfully connected to " << server_type << "!" << Color::RESET << std::endl;
             break;
         }
         

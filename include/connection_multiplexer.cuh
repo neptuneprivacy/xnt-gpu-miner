@@ -126,7 +126,8 @@ public:
     
     // ========== Initialization ==========
     
-    bool initialize(const std::string& endpoint, const std::string& wallet_address);
+    bool initialize(const std::string& endpoint, const std::string& wallet_address, 
+                    const std::string& stratum_password = "");
     void shutdown();
     bool isInitialized() const { return initialized.load(); }
     
@@ -178,6 +179,7 @@ private:
     std::unique_ptr<MiningClient> client;
     std::string endpoint;
     std::string wallet_address;
+    MiningMode mining_mode{MiningMode::Solo};
     
     // Worker registry
     std::vector<std::unique_ptr<GpuWorkerHandle>> workers;

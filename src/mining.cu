@@ -373,7 +373,7 @@ void MultiGpuManager::startAll() {
     
     // Initialize the connection multiplexer first
     ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
-    if (!mux.initialize(endpoint, g_miner_wallet_address)) {
+    if (!mux.initialize(endpoint, g_miner_wallet_address, stratum_password)) {
         std::cerr << "Failed to initialize connection multiplexer" << std::endl;
         return;
     }
