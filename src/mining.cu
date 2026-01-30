@@ -21,7 +21,7 @@ GpuWorker::~GpuWorker() {
 
 void GpuWorker::start() {
     if (!gpu_resources->event_handler) {
-    gpu_resources->event_handler = std::make_unique<EventHandler>();
+        gpu_resources->event_handler = std::make_unique<EventHandler>();
     }
     // GpuWorker doesn't manage clients directly - ConnectionMultiplexer does
     // Just register with the multiplexer
@@ -107,15 +107,15 @@ void GpuWorker::miningLoop() {
             event, std::chrono::milliseconds(100));
         
         if (has_event) {
-        switch (event.type) {
-            case EventType::NEW_PUZZLE:
-                handleNewPuzzle(event);
-                break;
-            case EventType::STOP_MINING:
+            switch (event.type) {
+                case EventType::NEW_PUZZLE:
+                    handleNewPuzzle(event);
+                    break;
+                case EventType::STOP_MINING:
                     worker_running = false;
-                break;
-            default:
-                break;
+                    break;
+                default:
+                    break;
             }
         }
     }
@@ -189,7 +189,7 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
                 for (int i = 0; i < DIGEST_LEN; ++i) {
                     if (gpu_resources->cached_prev_block.values[i] != prev_block.values[i]) {
                         prev_block_match = false;
-                            break;
+                        break;
                     }
                 }
             }
@@ -432,6 +432,11 @@ GpuResources* MultiGpuManager::getGpuResources(size_t index) {
 void MultiGpuManager::gpuWorkerThread(size_t index) {
     if (index >= workers.size()) return;
     workers[index]->start();
+    
+    // Wait for the worker to finish (blocks until mining stops)
+    while (!stop_mining && workers[index]->isRunning()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 void startUnifiedMining(
