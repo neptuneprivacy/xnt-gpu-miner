@@ -118,6 +118,7 @@ set(HEADERS
     include/network.cuh
     include/gpu_resources.cuh
     include/mining.cuh
+    include/connection_multiplexer.cuh
 )
 
 set(SOURCES
@@ -131,6 +132,7 @@ set(SOURCES
     src/rpc_client.cu
     src/stratum_client.cu
     src/gpu_resources.cu
+    src/connection_multiplexer.cu
     src/mining.cu
     src/main.cu
 )

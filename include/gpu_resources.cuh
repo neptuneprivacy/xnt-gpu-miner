@@ -180,6 +180,7 @@ struct GpuResources {
     Digest current_target;
     Digest current_real_target;
     Digest cached_prev_block;  // Track last preprocessed prev_block to avoid re-preprocessing
+    Digest cached_commitment;  // Track last preprocessed commitment (XNT)
     PowMastPaths cached_mast_paths;  // Track MAST paths used for preprocessing
     
     std::atomic<uint64_t> gpu_puzzle_random_start{0};

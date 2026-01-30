@@ -4,14 +4,20 @@
 #include "gpu_resources.cuh"
 #include "kernels.cuh"
 #include "network.cuh"
+#include <future>
 
-class UnifiedMiningController;
 class MultiGpuManager;
+class GpuWorker;
 struct PowPuzzle;
+struct GpuWorkerHandle;
 
-extern UnifiedMiningController* g_mining_controller;
+// ============================================================================
+// GpuWorker - Per-GPU controller using shared ConnectionMultiplexer
+// ============================================================================
+// GpuWorker does NOT manage connections - it receives jobs via EventHandler
+// and submits solutions through the ConnectionMultiplexer
 
-class UnifiedMiningController {
+class GpuWorker {
 public:
     std::string endpoint;  // RPC URL or Stratum URL
     int gpu_id;
@@ -19,8 +25,13 @@ public:
     MiningMode mining_mode;  // Solo or Stratum
     
 private:
-    std::thread fetcher_thread;
     std::thread mining_thread;
+    std::atomic<bool> worker_running{false};
+    GpuWorkerHandle* worker_handle;  // Registration with multiplexer
+    
+public:
+    GpuWorker(int gpu_id, GpuResources* resources);
+    ~GpuWorker();
     std::atomic<bool> controller_running{false};
     std::string stratum_password;  // For stratum mode
     
@@ -34,32 +45,36 @@ public:
     
     ~UnifiedMiningController();
     
-    UnifiedMiningController(const UnifiedMiningController&) = delete;
-    UnifiedMiningController& operator=(const UnifiedMiningController&) = delete;
+    GpuWorker(const GpuWorker&) = delete;
+    GpuWorker& operator=(const GpuWorker&) = delete;
     
     void start();
     void stop();
-    bool isRunning() const { return controller_running.load(); }
-    bool reconnect_to_node();
+    bool isRunning() const { return worker_running.load(); }
+    
+    // Submit solution through multiplexer (non-blocking, returns future)
+    std::future<bool> submitSolution(const std::string& proposal_id,
+                                      const Pow& pow_solution,
+                                      const Digest& solution_hash,
+                                      const json& template_obj);
     
 private:
+    bool initializeCuda();
     void fetcherLoop();
     void stratumFetcherLoop();  // Stratum-specific fetcher (push-based)
     void miningLoop();
     void handleNewPuzzle(const MiningEvent& event);
-    void handleSolutionFound(const MiningEvent& event);
-    void handleError(const MiningEvent& event);
-    bool initializeCuda();
-    bool connectToNode();
-    json requestJob();
-    bool processJobResponse(const json& job_response);
 };
+
+// ============================================================================
+// MultiGpuManager - Coordinates multiple GPU workers with shared connection
+// ============================================================================
 
 class MultiGpuManager {
 private:
     std::vector<int> gpu_ids;
     std::vector<std::unique_ptr<GpuResources>> gpu_resources;
-    std::vector<std::unique_ptr<UnifiedMiningController>> controllers;
+    std::vector<std::unique_ptr<GpuWorker>> workers;
     std::vector<std::thread> gpu_threads;
     std::string endpoint;  // RPC URL or Stratum URL
     int single_gpu_id;
@@ -92,7 +107,7 @@ public:
     
 private:
     bool initializeGpu(int device_id);
-    void gpuMiningThread(size_t index);
+    void gpuWorkerThread(size_t index);
 };
 
 void startUnifiedMining(
@@ -101,15 +116,14 @@ void startUnifiedMining(
     MiningMode mode = MiningMode::Solo,
     const std::string& stratum_pass = "x");
 
-void puzzleFetcher(GpuResources* gpu_res, UnifiedMiningController* controller);
+// Continuous mining loop (uses GpuWorker)
+bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker);
 
 bool preprocessPuzzle(const PowPuzzle& puzzle, GpuResources* gpu_res);
 
 bool minePuzzleWithCuda(
     const PowPuzzle& puzzle, 
     GpuResources* gpu_res);
-
-bool continuousMiningLoop(GpuResources* gpu_res, UnifiedMiningController* controller);
 
 bool verifySolution(
     const Pow& pow,
