@@ -20,7 +20,7 @@ CXX_FLAGS = -O3 -march=native -std=c++17
 INCLUDES = -I./include
 
 # Libraries
-LIBS = -lcudart -lpthread
+LIBS = -lcudart -lpthread -lssl -lcrypto
 
 
 # Output binary
@@ -35,6 +35,7 @@ MODULAR_SRCS = src/common.cu \
                src/kernels.cu \
                src/network.cu \
                src/rpc_client.cu \
+               src/stratum_client.cu \
                src/gpu_resources.cu \
                src/connection_multiplexer.cu \
                src/mining.cu \

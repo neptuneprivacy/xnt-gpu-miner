@@ -19,8 +19,10 @@ struct GpuWorkerHandle;
 
 class GpuWorker {
 public:
+    std::string endpoint;  // RPC URL or Stratum URL
     int gpu_id;
     GpuResources* gpu_resources;
+    MiningMode mining_mode;  // Solo or Stratum
     
 private:
     std::thread mining_thread;
@@ -30,6 +32,18 @@ private:
 public:
     GpuWorker(int gpu_id, GpuResources* resources);
     ~GpuWorker();
+    std::atomic<bool> controller_running{false};
+    std::string stratum_password;  // For stratum mode
+    
+public:
+    UnifiedMiningController(
+        int gpu_id, 
+        GpuResources* resources,
+        const std::string& endpoint = "http://127.0.0.1:9897",
+        MiningMode mode = MiningMode::Solo,
+        const std::string& stratum_pass = "x");
+    
+    ~UnifiedMiningController();
     
     GpuWorker(const GpuWorker&) = delete;
     GpuWorker& operator=(const GpuWorker&) = delete;
@@ -46,6 +60,8 @@ public:
     
 private:
     bool initializeCuda();
+    void fetcherLoop();
+    void stratumFetcherLoop();  // Stratum-specific fetcher (push-based)
     void miningLoop();
     void handleNewPuzzle(const MiningEvent& event);
 };
@@ -60,13 +76,17 @@ private:
     std::vector<std::unique_ptr<GpuResources>> gpu_resources;
     std::vector<std::unique_ptr<GpuWorker>> workers;
     std::vector<std::thread> gpu_threads;
-    std::string rpc_url;
+    std::string endpoint;  // RPC URL or Stratum URL
     int single_gpu_id;
+    MiningMode mining_mode;
+    std::string stratum_password;
     
 public:
     MultiGpuManager(
-        const std::string& rpc_url = "http://127.0.0.1:9897",
-        int specific_gpu = -1);
+        const std::string& endpoint = "http://127.0.0.1:9897",
+        int specific_gpu = -1,
+        MiningMode mode = MiningMode::Solo,
+        const std::string& stratum_pass = "x");
     
     ~MultiGpuManager();
     
@@ -91,8 +111,10 @@ private:
 };
 
 void startUnifiedMining(
-    const std::string& rpc_url = "http://127.0.0.1:9897",
-    int specific_gpu = -1);
+    const std::string& endpoint = "http://127.0.0.1:9897",
+    int specific_gpu = -1,
+    MiningMode mode = MiningMode::Solo,
+    const std::string& stratum_pass = "x");
 
 // Continuous mining loop (uses GpuWorker)
 bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker);

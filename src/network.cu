@@ -1,5 +1,6 @@
 #include "network.cuh"
 #include "rpc_client.cuh"
+#include "stratum_client.cuh"
 #include "pow.cuh"
 #include "digest.cuh"
 #include "common.cuh"
@@ -175,6 +176,53 @@ PowPuzzle parsePowPuzzle(const std::string& jsonStr) {
         LOG_DEBUG("Failed to parse puzzle JSON: " << e.what());
         return PowPuzzle();
     }
+}
+
+// ===== UnifiedMinerClient Implementation =====
+
+UnifiedMinerClient::UnifiedMinerClient(
+    const std::string& endpoint,
+    const std::string& wallet_addr,
+    const std::string& stratum_pass)
+    : endpoint(endpoint)
+    , wallet_address(wallet_addr)
+    , stratum_password(stratum_pass) {
+    mode = detect_mining_mode(endpoint);
+}
+
+bool UnifiedMinerClient::initialize() {
+    if (client) {
+        return true;  // Already initialized
+    }
+    
+    if (mode == MiningMode::Stratum) {
+        // Create stratum client
+        std::string host;
+        int port;
+        bool use_ssl = false;
+        if (!parse_stratum_url(endpoint, host, port, use_ssl)) {
+            std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
+            return false;
+        }
+        
+        StratumConfig config;
+        config.host = host;
+        config.port = port;
+        config.use_ssl = use_ssl;
+        config.address = wallet_address;
+        config.name = g_miner_worker_name.empty() ? "xnt-miner" : g_miner_worker_name;
+        config.password = stratum_password;
+        
+        client = std::make_unique<StratumClient>(config);
+        
+        std::cout << "Initialized stratum client for " << host << ":" << port << std::endl;
+    } else {
+        // Create solo (HTTP RPC) client
+        client = std::make_unique<NeptuneCudaMinerClient>(endpoint, wallet_address);
+        std::cout << "Initialized solo mining client for " << endpoint << std::endl;
+    }
+    
+    return client != nullptr;
 }
 
 

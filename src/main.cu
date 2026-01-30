@@ -1,5 +1,6 @@
 #include "mining.cuh"
 #include "connection_multiplexer.cuh"
+#include "mining_client.h"
 
 void print_usage(const char* program_name) {
     std::cerr << "\n" << Color::BOLD << "Usage:" << Color::RESET << std::endl;
@@ -8,15 +9,33 @@ void print_usage(const char* program_name) {
     std::cerr << Color::BOLD << "Required:" << Color::RESET << std::endl;
     std::cerr << "  -w, --wallet ADDRESS  Your Neptune wallet address\n" << std::endl;
     
-    std::cerr << Color::BOLD << "Optional:" << Color::RESET << std::endl;
+    std::cerr << Color::BOLD << "Solo Mining (default):" << Color::RESET << std::endl;
+    std::cerr << "  --rpc-url URL         RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
+    std::cerr << "  -H, --host HOST       RPC host" << std::endl;
+    std::cerr << "  -p, --port PORT       RPC port\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "Pool Mining (Stratum):" << Color::RESET << std::endl;
+    std::cerr << "  --stratum URL         Stratum pool URL (e.g., stratum://pool.example.com:3333)" << std::endl;
+    std::cerr << "  --stratum-pass PASS   Stratum password (default: x)" << std::endl;
+    std::cerr << "  --stratum-worker NAME Stratum worker name (default: xnt-miner)\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "General Options:" << Color::RESET << std::endl;
     std::cerr << "  -d, --device ID       Use specific GPU device ID (default: all GPUs)" << std::endl;
     std::cerr << "  --rpc-url URL         RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
+    std::cerr << "  --test-mode           Enable test mode (100,000x easier target)" << std::endl;
+    std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
+    std::cerr << "  " << Color::DIM << "# Solo mining to local node" << Color::RESET << std::endl;
     std::cerr << "  " << program_name << " -w nolgam..." << std::endl;
-    std::cerr << "  " << program_name << " --wallet nolgam... --device 0" << std::endl;
-    std::cerr << "  " << program_name << " -w nolgam... --rpc-url http://192.168.1.100:9897\n" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  " << Color::DIM << "# Solo mining to remote node" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --rpc-url http://192.168.1.100:9897" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  " << Color::DIM << "# Pool mining via stratum" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --stratum stratum://pool.example.com:3333" << std::endl;
+    std::cerr << std::endl;
 }
 
 void print_system_info() {
@@ -48,7 +67,10 @@ int main(int argc, char* argv[]) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     
-    std::string rpc_url = "http://127.0.0.1:9897";
+    std::string endpoint = "http://127.0.0.1:9897";
+    std::string stratum_password = "x";
+    std::string stratum_worker_name = "xnt-miner";
+    MiningMode mining_mode = MiningMode::Solo;
     bool show_help = false;
     
     for (int i = 1; i < argc; ++i) {
@@ -71,12 +93,15 @@ int main(int argc, char* argv[]) {
             }
         } else if ((arg == "--host" || arg == "-H") && i + 1 < argc) {
             std::string host = argv[++i];
-            size_t port_start = rpc_url.find(":", 7);
-            if (port_start != std::string::npos) {
-                std::string port = rpc_url.substr(port_start + 1);
-                rpc_url = "http://" + host + ":" + port;
-            } else {
-                rpc_url = "http://" + host + ":9897";
+            // Only modify if we're in solo mode (not stratum)
+            if (mining_mode == MiningMode::Solo) {
+                size_t port_start = endpoint.find(":", 7);
+                if (port_start != std::string::npos) {
+                    std::string port = endpoint.substr(port_start + 1);
+                    endpoint = "http://" + host + ":" + port;
+                } else {
+                    endpoint = "http://" + host + ":9897";
+                }
             }
         } else if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
             try {
@@ -85,19 +110,30 @@ int main(int argc, char* argv[]) {
                     std::cerr << Color::RED << "Error: Port must be between 1 and 65535" << Color::RESET << std::endl;
                     return 1;
                 }
-                size_t host_start = rpc_url.find("://") + 3;
-                size_t port_start = rpc_url.find(":", host_start);
-                if (port_start != std::string::npos) {
-                    rpc_url = rpc_url.substr(0, port_start + 1) + std::to_string(port);
-                } else {
-                    rpc_url = rpc_url + ":" + std::to_string(port);
+                // Only modify if we're in solo mode (not stratum)
+                if (mining_mode == MiningMode::Solo) {
+                    size_t host_start = endpoint.find("://") + 3;
+                    size_t port_start = endpoint.find(":", host_start);
+                    if (port_start != std::string::npos) {
+                        endpoint = endpoint.substr(0, port_start + 1) + std::to_string(port);
+                    } else {
+                        endpoint = endpoint + ":" + std::to_string(port);
+                    }
                 }
             } catch (const std::exception& e) {
                 std::cerr << Color::RED << "Error: Invalid port number: " << argv[i] << Color::RESET << std::endl;
                 return 1;
             }
         } else if ((arg == "--rpc-url") && i + 1 < argc) {
-            rpc_url = argv[++i];
+            endpoint = argv[++i];
+            mining_mode = MiningMode::Solo;  // Explicit solo mode
+        } else if ((arg == "--stratum") && i + 1 < argc) {
+            endpoint = argv[++i];
+            mining_mode = MiningMode::Stratum;
+        } else if ((arg == "--stratum-pass") && i + 1 < argc) {
+            stratum_password = argv[++i];
+        } else if ((arg == "--stratum-worker") && i + 1 < argc) {
+            stratum_worker_name = argv[++i];
         } else if (arg == "--test-mode") {
             g_test_mode = true;
         } else if ((arg == "--fetch-interval") && i + 1 < argc) {
@@ -135,16 +171,30 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    // Auto-detect mode from URL if not explicitly set
+    if (mining_mode == MiningMode::Solo) {
+        mining_mode = detect_mining_mode(endpoint);
+    }
+    
+    g_miner_worker_name = stratum_worker_name;
     print_system_info();
     
     std::cout << Color::BOLD << "Configuration:" << Color::RESET << std::endl;
-    std::cout << "  Mining Mode:   SOLO" << std::endl;
-    std::cout << "  RPC Endpoint:  " << rpc_url << std::endl;
-    std::cout << "  Wallet:        " << g_miner_wallet_address.substr(0, 20) << "..." << std::endl;
+    std::cout << "  Mining Mode:   " << mining_mode_name(mining_mode) << std::endl;
+    if (mining_mode == MiningMode::Stratum) {
+        std::cout << "  Pool:          " << endpoint << std::endl;
+        std::cout << "  Worker:        " << g_miner_worker_name << std::endl;
+    } else {
+        std::cout << "  RPC Endpoint:  " << endpoint << std::endl;
+    }
+    std::cout << "  Wallet:        " << shorten_address(g_miner_wallet_address) << std::endl;
     if (g_gpu_device_id >= 0) {
         std::cout << "  Device:        GPU " << g_gpu_device_id << std::endl;
     } else {
         std::cout << "  Device:        All available GPUs" << std::endl;
+    }
+    if (g_test_mode) {
+        std::cout << "  Test Mode:     " << Color::YELLOW << "ENABLED" << Color::RESET << std::endl;
     }
     std::cout << std::endl;
     
@@ -152,9 +202,8 @@ int main(int argc, char* argv[]) {
     install_signal_handlers();
     
     try {
-        startUnifiedMining(rpc_url, g_gpu_device_id);
+        startUnifiedMining(endpoint, g_gpu_device_id, mining_mode, stratum_password);
     } catch (const std::exception& e) {
-        
         std::string error_msg = e.what();
         // Replace full wallet address with shortened version in error messages
         if (!g_miner_wallet_address.empty() && error_msg.find(g_miner_wallet_address) != std::string::npos) {
@@ -167,7 +216,6 @@ int main(int argc, char* argv[]) {
         std::cerr << Color::RED << "Error: " << error_msg << Color::RESET << std::endl;
         return 1;
     }
-    
     
     cudaDeviceReset();
     std::cout << "\n" << Color::GREEN << "Mining stopped" << Color::RESET << std::endl;

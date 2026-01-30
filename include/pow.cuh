@@ -204,8 +204,7 @@ struct GpuNonceRange {
 
 GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus = 8);
 
-extern __constant__ uint64_t d_gpu_range_start;
-extern __constant__ uint64_t d_gpu_range_size;
+// d_gpu_range_start and d_gpu_range_size are declared in tip5.cuh
 
 bool verify_pow_solution(
     const Pow& pow, const Digest& hash, 

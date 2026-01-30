@@ -1,8 +1,8 @@
 #include "pow.cuh"
 #include <cstdlib>
 
-__constant__ uint64_t d_gpu_range_start;
-__constant__ uint64_t d_gpu_range_size;
+// d_gpu_range_start and d_gpu_range_size are defined via extern in tip5.cuh
+// CUDA 13+ treats extern __constant__ as static definition
 
 __device__ Digest PowMastPaths::commit_device() const {
     // Match Rust: Tip5::hash_varlen over flattened pow, header, kernel digests
