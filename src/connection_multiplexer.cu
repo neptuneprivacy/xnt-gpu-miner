@@ -135,14 +135,21 @@ bool SoloMiningClient::submitSolution(
     
     json kernel_obj = block_obj["kernel"];
     
-    // Debug: Log the kernel structure
+    // Debug: Log the kernel structure and appendix content
     bool has_appendix = kernel_obj.contains("appendix") && !kernel_obj["appendix"].is_null();
     if (has_appendix && kernel_obj["appendix"].is_array()) {
-        LOG_DEBUG("[SUBMIT] kernel.appendix has " << kernel_obj["appendix"].size() << " claims");
+        std::cout << "[SUBMIT] kernel.appendix has " << kernel_obj["appendix"].size() << " claims" << std::endl;
+        // Print first claim structure for debugging
+        if (kernel_obj["appendix"].size() > 0) {
+            json first_claim = kernel_obj["appendix"][0];
+            std::cout << "[SUBMIT] First claim keys: ";
+            for (auto it = first_claim.begin(); it != first_claim.end(); ++it) {
+                std::cout << it.key() << " ";
+            }
+            std::cout << std::endl;
+        }
     } else {
         std::cout << "[SUBMIT] " << Color::YELLOW << "WARNING: Block kernel missing valid 'appendix' - template may be incomplete" << Color::RESET << std::endl;
-        // Don't override with empty array - the node requires the proper appendix claims
-        // If appendix is missing, the template from the node is likely incomplete
     }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
