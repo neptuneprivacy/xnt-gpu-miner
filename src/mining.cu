@@ -142,6 +142,36 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
         template_obj = template_response["template"];
     }
     
+    // Debug: Check template structure
+    std::cout << "[GPU " << gpu_id << "] Template keys: ";
+    for (auto it = template_obj.begin(); it != template_obj.end(); ++it) {
+        std::cout << it.key() << " ";
+    }
+    std::cout << std::endl;
+    
+    if (template_obj.contains("block")) {
+        json block = template_obj["block"];
+        std::cout << "[GPU " << gpu_id << "] Block keys: ";
+        for (auto it = block.begin(); it != block.end(); ++it) {
+            std::cout << it.key() << " ";
+        }
+        std::cout << std::endl;
+        
+        if (block.contains("kernel")) {
+            json kernel = block["kernel"];
+            if (kernel.contains("appendix") && kernel["appendix"].is_array()) {
+                std::cout << "[GPU " << gpu_id << "] kernel.appendix has " 
+                    << kernel["appendix"].size() << " claims" << std::endl;
+            } else {
+                std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+                    << "WARNING: kernel.appendix missing or not array!" << Color::RESET << std::endl;
+            }
+        }
+    } else {
+        std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+            << "WARNING: Template has NO 'block' field!" << Color::RESET << std::endl;
+    }
+    
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         // For stratum mode, always process job notifications even if same ID

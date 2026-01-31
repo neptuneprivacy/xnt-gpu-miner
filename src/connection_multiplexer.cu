@@ -135,12 +135,14 @@ bool SoloMiningClient::submitSolution(
     
     json kernel_obj = block_obj["kernel"];
     
-    if (!kernel_obj.contains("appendix") || kernel_obj["appendix"].is_null()) {
-        kernel_obj["appendix"] = json::array();
-        block_obj["kernel"] = kernel_obj;
-    } else if (!kernel_obj["appendix"].is_array()) {
-        kernel_obj["appendix"] = json::array();
-        block_obj["kernel"] = kernel_obj;
+    // Debug: Log the kernel structure
+    bool has_appendix = kernel_obj.contains("appendix") && !kernel_obj["appendix"].is_null();
+    if (has_appendix && kernel_obj["appendix"].is_array()) {
+        LOG_DEBUG("[SUBMIT] kernel.appendix has " << kernel_obj["appendix"].size() << " claims");
+    } else {
+        std::cout << "[SUBMIT] " << Color::YELLOW << "WARNING: Block kernel missing valid 'appendix' - template may be incomplete" << Color::RESET << std::endl;
+        // Don't override with empty array - the node requires the proper appendix claims
+        // If appendix is missing, the template from the node is likely incomplete
     }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
@@ -531,6 +533,24 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                     }
 
                     if (is_new_template) {
+                        // Debug: Show template keys
+                        std::cout << "[JobBroadcaster] Template keys: ";
+                        for (auto it = template_obj.begin(); it != template_obj.end(); ++it) {
+                            std::cout << it.key() << " ";
+                        }
+                        std::cout << std::endl;
+                        
+                        if (template_obj.contains("block")) {
+                            json block = template_obj["block"];
+                            std::cout << "[JobBroadcaster] Block keys: ";
+                            for (auto it = block.begin(); it != block.end(); ++it) {
+                                std::cout << it.key() << " ";
+                            }
+                            std::cout << std::endl;
+                        } else {
+                            std::cout << "[JobBroadcaster] " << Color::YELLOW 
+                                << "WARNING: Template has NO 'block' field!" << Color::RESET << std::endl;
+                        }
                         broadcastJobToWorkers(template_response);
                     }
                 }
