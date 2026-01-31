@@ -142,18 +142,6 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
         template_obj = template_response["template"];
     }
     
-    // Debug: Check appendix when template is received
-    if (template_obj.contains("block") && template_obj["block"].contains("kernel")) {
-        json kernel = template_obj["block"]["kernel"];
-        if (kernel.contains("appendix") && kernel["appendix"].is_array()) {
-            std::cout << "[GPU " << gpu_id << "] Template received with " 
-                      << kernel["appendix"].size() << " appendix claims" << std::endl;
-        } else {
-            std::cout << "[GPU " << gpu_id << "] " << Color::RED 
-                      << "WARNING: Template has no appendix!" << Color::RESET << std::endl;
-        }
-    }
-    
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         // For stratum mode, always process job notifications even if same ID
@@ -564,6 +552,21 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         
         if (result.has_value()) {
             gpu_res->solutions_found++;
+            
+            // Check if proposal has changed - if so, this solution is for a stale template
+            std::string current_proposal_id;
+            {
+                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                current_proposal_id = gpu_res->current_proposal_id;
+            }
+            
+            if (current_proposal_id != proposal_id) {
+                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
+                          << "Solution discarded - template changed during mining" << Color::RESET << std::endl;
+                // Don't count as rejected since we caught it ourselves
+                continue;
+            }
+            
             const char* submit_target = gpu_res->is_stratum_mode() ? "pool" : "node";
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
                       << "*** SOLUTION FOUND! ***" << Color::RESET 

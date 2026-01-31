@@ -100,7 +100,7 @@ bool SoloMiningClient::submitSolution(
         return false;
     }
     
-    // Check if template is stale
+    // Check if template is stale by comparing prev_block with current tip
     std::string tip_digest = rpc_client->getTipDigest();
     
     std::string prev_block;
@@ -112,15 +112,9 @@ bool SoloMiningClient::submitSolution(
             prev_block = metadata.value("prev_block", "");
         }
     }
-    
-    // Debug: Always show what we're comparing
-    std::string short_prev = prev_block.length() > 20 ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) : prev_block;
-    std::string short_tip = tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest;
-    std::cout << "[SUBMIT DEBUG] prev_block=" << (prev_block.empty() ? "(empty)" : short_prev) 
-              << " tip=" << short_tip << std::endl;
 
     if (!prev_block.empty() && tip_digest != prev_block) {
-        std::cout << "[SUBMIT] " << Color::RED << "STALE: Template stale" << Color::RESET << std::endl;
+        std::cout << "[SUBMIT] " << Color::RED << "STALE: Template stale (new block arrived)" << Color::RESET << std::endl;
         return false;
     }
     
@@ -135,23 +129,6 @@ bool SoloMiningClient::submitSolution(
     if (!block_obj.contains("kernel") || block_obj["kernel"].is_null()) {
         std::cout << "[SUBMIT] ERROR: Block missing 'kernel' field" << std::endl;
         return false;
-    }
-    
-    // Debug: Log appendix structure being sent
-    json kernel_obj = block_obj["kernel"];
-    if (kernel_obj.contains("appendix") && kernel_obj["appendix"].is_array()) {
-        std::cout << "[SUBMIT DEBUG] Appendix has " << kernel_obj["appendix"].size() << " claims" << std::endl;
-        for (size_t i = 0; i < kernel_obj["appendix"].size(); ++i) {
-            json claim = kernel_obj["appendix"][i];
-            std::cout << "[SUBMIT DEBUG] Claim " << i << ": " << claim.dump() << std::endl;
-        }
-    } else {
-        std::cout << "[SUBMIT DEBUG] " << Color::RED << "ERROR: No appendix or appendix not array!" << Color::RESET << std::endl;
-        std::cout << "[SUBMIT DEBUG] kernel keys: ";
-        for (auto it = kernel_obj.begin(); it != kernel_obj.end(); ++it) {
-            std::cout << it.key() << " ";
-        }
-        std::cout << std::endl;
     }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
