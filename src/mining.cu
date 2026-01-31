@@ -472,14 +472,14 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
     
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
+        // Check for new events (new puzzle) - even when paused
+        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
+            break; // Break to let handleNewPuzzle process the new job
+        }
+        
         if (gpu_res->gpu_pause_flag) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
-        }
-        
-        // Check for new events (new puzzle)
-        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
-            break;
         }
         
         if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
