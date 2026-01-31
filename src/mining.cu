@@ -142,6 +142,18 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
         template_obj = template_response["template"];
     }
     
+    // Debug: Check appendix when template is received
+    if (template_obj.contains("block") && template_obj["block"].contains("kernel")) {
+        json kernel = template_obj["block"]["kernel"];
+        if (kernel.contains("appendix") && kernel["appendix"].is_array()) {
+            std::cout << "[GPU " << gpu_id << "] Template received with " 
+                      << kernel["appendix"].size() << " appendix claims" << std::endl;
+        } else {
+            std::cout << "[GPU " << gpu_id << "] " << Color::RED 
+                      << "WARNING: Template has no appendix!" << Color::RESET << std::endl;
+        }
+    }
+    
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         // For stratum mode, always process job notifications even if same ID
@@ -488,9 +500,11 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         }
         
         std::string proposal_id;
+        json template_for_this_batch;
         {
             std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
             proposal_id = gpu_res->current_proposal_id;
+            template_for_this_batch = gpu_res->current_template;  // Capture template with proposal_id
         }
         
         if (proposal_id.empty()) {
@@ -558,18 +572,13 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
                 Digest solution_hash = mast_paths.fast_mast_hash(result.value());
                 
-                json template_obj;
-                {
-                    std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                    template_obj = gpu_res->current_template;
-                }
-                
-            // Submit through multiplexer (async, get future)
+            // Use the template captured at the start of this mining batch
+            // This ensures we submit with the same template we were mining for
             auto future = worker->submitSolution(
                     proposal_id,
                     result.value(),
                     solution_hash,
-                    template_obj
+                    template_for_this_batch
                 );
                 
             // Wait for result (with timeout)
