@@ -194,12 +194,14 @@ private:
     std::thread job_broadcaster_thread;
     std::thread solution_submitter_thread;
     std::thread health_monitor_thread;
+    std::thread tip_monitor_thread;  // Fast tip change detection
     std::atomic<bool> running{false};
     std::atomic<bool> initialized{false};
     std::atomic<bool> connected{false};
     
     // Current job state
     std::string last_template_id;
+    std::string current_tip_digest;  // Track current chain tip for stale detection
     mutable std::mutex job_mutex;
     
     // Statistics
@@ -210,6 +212,7 @@ private:
     void jobBroadcasterLoop();
     void solutionSubmitterLoop();
     void healthMonitorLoop();
+    void tipMonitorLoop();  // Fast tip monitoring for stale detection
     
     // ========== Internal Helpers ==========
     

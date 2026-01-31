@@ -133,25 +133,6 @@ bool SoloMiningClient::submitSolution(
         return false;
     }
     
-    json kernel_obj = block_obj["kernel"];
-    
-    // Debug: Log the kernel structure and appendix content
-    bool has_appendix = kernel_obj.contains("appendix") && !kernel_obj["appendix"].is_null();
-    if (has_appendix && kernel_obj["appendix"].is_array()) {
-        std::cout << "[SUBMIT] kernel.appendix has " << kernel_obj["appendix"].size() << " claims" << std::endl;
-        // Print first claim structure for debugging
-        if (kernel_obj["appendix"].size() > 0) {
-            json first_claim = kernel_obj["appendix"][0];
-            std::cout << "[SUBMIT] First claim keys: ";
-            for (auto it = first_claim.begin(); it != first_claim.end(); ++it) {
-                std::cout << it.key() << " ";
-            }
-            std::cout << std::endl;
-        }
-    } else {
-        std::cout << "[SUBMIT] " << Color::YELLOW << "WARNING: Block kernel missing valid 'appendix' - template may be incomplete" << Color::RESET << std::endl;
-    }
-    
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
     
     json response = rpc_client->submitBlock(block_obj, pow_json);
@@ -303,6 +284,11 @@ bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string&
     solution_submitter_thread = std::thread(&ConnectionMultiplexer::solutionSubmitterLoop, this);
     health_monitor_thread = std::thread(&ConnectionMultiplexer::healthMonitorLoop, this);
     
+    // Start tip monitor for solo mode (fast stale detection)
+    if (mining_mode == MiningMode::Solo) {
+        tip_monitor_thread = std::thread(&ConnectionMultiplexer::tipMonitorLoop, this);
+    }
+    
     std::cout << Color::GREEN << "Connection multiplexer started" << Color::RESET << std::endl;
     
     return true;
@@ -328,6 +314,9 @@ void ConnectionMultiplexer::shutdown() {
     }
     if (health_monitor_thread.joinable()) {
         health_monitor_thread.join();
+    }
+    if (tip_monitor_thread.joinable()) {
+        tip_monitor_thread.join();
     }
     
     // Clear workers
@@ -528,6 +517,7 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
 
                             if (prev_block.empty() || prev_block == tip_digest) {
                                 last_template_id = template_id;
+                                current_tip_digest = tip_digest;  // Track current tip for stale detection
                                 is_new_template = true;
 
                                 stats.total_jobs_fetched++;
@@ -540,24 +530,6 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                     }
 
                     if (is_new_template) {
-                        // Debug: Show template keys
-                        std::cout << "[JobBroadcaster] Template keys: ";
-                        for (auto it = template_obj.begin(); it != template_obj.end(); ++it) {
-                            std::cout << it.key() << " ";
-                        }
-                        std::cout << std::endl;
-                        
-                        if (template_obj.contains("block")) {
-                            json block = template_obj["block"];
-                            std::cout << "[JobBroadcaster] Block keys: ";
-                            for (auto it = block.begin(); it != block.end(); ++it) {
-                                std::cout << it.key() << " ";
-                            }
-                            std::cout << std::endl;
-                        } else {
-                            std::cout << "[JobBroadcaster] " << Color::YELLOW 
-                                << "WARNING: Template has NO 'block' field!" << Color::RESET << std::endl;
-                        }
                         broadcastJobToWorkers(template_response);
                     }
                 }
@@ -760,4 +732,102 @@ bool ConnectionMultiplexer::attemptReconnection() {
     std::cout << Color::RED << "[Multiplexer] Failed to reconnect after " 
               << attempt << " attempts" << Color::RESET << std::endl;
     return false;
+}
+
+void ConnectionMultiplexer::tipMonitorLoop() {
+    try {
+        LOG_DEBUG("[TipMonitor] Started");
+        
+        // Check tip every 500ms for fast stale detection
+        const auto TIP_CHECK_INTERVAL = std::chrono::milliseconds(500);
+        
+        while (running.load() && !stop_mining) {
+            std::this_thread::sleep_for(TIP_CHECK_INTERVAL);
+            
+            if (!client || !client->is_connected()) {
+                continue;
+            }
+            
+            // Get current tip from node
+            std::string new_tip = client->getTipDigest();
+            if (new_tip.empty()) {
+                continue;
+            }
+            
+            bool tip_changed = false;
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                if (!current_tip_digest.empty() && current_tip_digest != new_tip) {
+                    tip_changed = true;
+                    std::string short_old = current_tip_digest.length() > 16 ? 
+                        current_tip_digest.substr(0, 8) + "..." + current_tip_digest.substr(current_tip_digest.length() - 8) : 
+                        current_tip_digest;
+                    std::string short_new = new_tip.length() > 16 ? 
+                        new_tip.substr(0, 8) + "..." + new_tip.substr(new_tip.length() - 8) : 
+                        new_tip;
+                    std::cout << "[TipMonitor] " << Color::YELLOW << "New block detected!" << Color::RESET
+                              << " Tip: " << short_old << " -> " << short_new << std::endl;
+                }
+                current_tip_digest = new_tip;
+            }
+            
+            if (tip_changed) {
+                // Immediately pause all workers - their templates are now stale
+                {
+                    std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                    for (const auto& worker : workers) {
+                        if (worker && worker->active && worker->resources) {
+                            worker->resources->set_paused(true);
+                            if (worker->resources->event_handler) {
+                                worker->resources->event_handler->postEvent(EventType::TIP_CHANGED);
+                            }
+                        }
+                    }
+                }
+                
+                // Clear the last template ID to force immediate fetch
+                {
+                    std::lock_guard<std::mutex> lock(job_mutex);
+                    last_template_id.clear();
+                }
+                
+                // Immediately fetch new template
+                json template_response = client->getBlockTemplate(wallet_address);
+                
+                if (!template_response.empty() && template_response.contains("result")) {
+                    json result = template_response["result"];
+                    
+                    if (result.contains("template") && !result["template"].is_null()) {
+                        json template_obj = result["template"];
+                        
+                        if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+                            json metadata = template_obj["metadata"];
+                            std::string template_id = metadata.contains("digest") ? 
+                                metadata.value("digest", "") : "";
+                            
+                            {
+                                std::lock_guard<std::mutex> lock(job_mutex);
+                                last_template_id = template_id;
+                            }
+                            
+                            stats.total_jobs_fetched++;
+                            {
+                                std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                                stats.last_job_time = std::chrono::steady_clock::now();
+                            }
+                            
+                            std::cout << "[TipMonitor] " << Color::GREEN << "New template fetched" << Color::RESET << std::endl;
+                            broadcastJobToWorkers(template_response);
+                        }
+                    }
+                }
+            }
+        }
+        
+        LOG_DEBUG("[TipMonitor] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[TipMonitor] Exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[TipMonitor] Unknown exception" << std::endl;
+    }
 }
