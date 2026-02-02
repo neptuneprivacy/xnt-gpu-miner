@@ -501,13 +501,13 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         }
         
         // Check if template is stale - if so, pause mining and wait for new job
-        if (!template_obj.is_null() && !template_obj.empty()) {
+        if (!template_for_this_batch.is_null() && !template_for_this_batch.empty()) {
             auto& multiplexer = ConnectionMultiplexer::getInstance();
-            if (multiplexer.isTemplateStale(template_obj)) {
+            if (multiplexer.isTemplateStale(template_for_this_batch)) {
                 // Template is stale, pause mining to save GPU power
                 std::string prev_block = "unknown";
-                if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
-                    json metadata = template_obj["metadata"];
+                if (template_for_this_batch.contains("metadata") && !template_for_this_batch["metadata"].is_null()) {
+                    json metadata = template_for_this_batch["metadata"];
                     if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
                         prev_block = metadata.value("prevBlock", "");
                     } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {

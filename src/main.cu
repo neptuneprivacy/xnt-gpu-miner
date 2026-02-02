@@ -1,6 +1,11 @@
 #include "mining.cuh"
 #include "connection_multiplexer.cuh"
 #include "mining_client.h"
+#include "network.cuh"
+#include "rpc_client.cuh"
+#include <fstream>
+#include <iomanip>
+#include <chrono>
 
 void print_usage(const char* program_name) {
     std::cerr << "\n" << Color::BOLD << "Usage:" << Color::RESET << std::endl;
@@ -23,6 +28,7 @@ void print_usage(const char* program_name) {
     std::cerr << "  -d, --device ID       Use specific GPU device ID (default: all GPUs)" << std::endl;
     std::cerr << "  --rpc-url URL         RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
     std::cerr << "  --test-mode           Enable test mode (100,000x easier target)" << std::endl;
+    std::cerr << "  --benchmark           Run mining benchmark (saves/loads test template)" << std::endl;
     std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
@@ -35,6 +41,9 @@ void print_usage(const char* program_name) {
     std::cerr << std::endl;
     std::cerr << "  " << Color::DIM << "# Pool mining via stratum" << Color::RESET << std::endl;
     std::cerr << "  " << program_name << " -w nolgam... --stratum stratum://pool.example.com:3333" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  " << Color::DIM << "# Benchmark mining speed" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --benchmark" << std::endl;
     std::cerr << std::endl;
 }
 
@@ -60,6 +69,186 @@ void print_system_info() {
                   << " (" << vram_gb << " GB)" << std::endl;
     }
     std::cout << std::endl;
+}
+
+// ============================================================================
+// Benchmark Functions
+// ============================================================================
+
+const std::string BENCHMARK_FILE = "benchmark_template.json";
+
+bool saveBenchmarkTemplate(const json& template_response) {
+    std::ofstream file(BENCHMARK_FILE);
+    if (!file.is_open()) {
+        std::cerr << Color::RED << "Error: Cannot create benchmark file: " << BENCHMARK_FILE << Color::RESET << std::endl;
+        return false;
+    }
+    file << std::setw(2) << template_response << std::endl;
+    file.close();
+    std::cout << Color::GREEN << "Benchmark template saved to " << BENCHMARK_FILE << Color::RESET << std::endl;
+    return true;
+}
+
+bool loadBenchmarkTemplate(json& template_response) {
+    std::ifstream file(BENCHMARK_FILE);
+    if (!file.is_open()) {
+        return false;
+    }
+    try {
+        file >> template_response;
+        file.close();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << Color::RED << "Error: Invalid benchmark file: " << e.what() << Color::RESET << std::endl;
+        return false;
+    }
+}
+
+void runBenchmark(const std::string& endpoint, int gpu_id) {
+    std::cout << Color::BOLD << "\n=== Mining Benchmark ===" << Color::RESET << std::endl;
+    
+    json template_response;
+    bool template_exists = loadBenchmarkTemplate(template_response);
+    
+    if (!template_exists) {
+        std::cout << "Benchmark template not found. Fetching from node..." << std::endl;
+        
+        // Wallet is required only when fetching template from node
+        if (g_miner_wallet_address.empty()) {
+            std::cerr << Color::RED << "Error: Wallet address is required to fetch template from node" << std::endl;
+            std::cerr << "Please provide wallet address with -w/--wallet or ensure " << BENCHMARK_FILE << " exists" << Color::RESET << std::endl;
+            return;
+        }
+        
+        // Try to fetch a template from the node
+        try {
+            XntRpcClient rpc_client(endpoint);
+            if (!rpc_client.testConnection()) {
+                std::cerr << Color::RED << "Error: Cannot connect to node at " << endpoint << std::endl;
+                std::cerr << "Please ensure the node is running or provide a valid RPC URL." << Color::RESET << std::endl;
+                return;
+            }
+            
+            template_response = rpc_client.getBlockTemplate(g_miner_wallet_address);
+            if (template_response.empty() || !template_response.contains("result")) {
+                std::cerr << Color::RED << "Error: Failed to fetch block template from node" << Color::RESET << std::endl;
+                return;
+            }
+            
+            if (!saveBenchmarkTemplate(template_response)) {
+                return;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << Color::RED << "Error fetching template: " << e.what() << Color::RESET << std::endl;
+            return;
+        }
+    } else {
+        std::cout << "Using existing benchmark template from " << BENCHMARK_FILE << std::endl;
+        std::cout << Color::GREEN << "No RPC connection required - running offline benchmark" << Color::RESET << std::endl;
+    }
+    
+    // Parse the template
+    json template_obj;
+    if (template_response.contains("result") && template_response["result"].contains("template")) {
+        template_obj = template_response["result"]["template"];
+    } else if (template_response.contains("template")) {
+        template_obj = template_response["template"];
+    } else {
+        std::cerr << Color::RED << "Error: Invalid template format" << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Parse puzzle
+    std::string template_json_str = template_response.dump();
+    PowPuzzle puzzle = parsePowPuzzle(template_json_str);
+    if (!puzzle.is_valid()) {
+        std::cerr << Color::RED << "Error: Invalid puzzle in template" << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Initialize GPU
+    int device_id = (gpu_id >= 0) ? gpu_id : 0;
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+        std::cerr << Color::RED << "CUDA Error: " << cudaGetErrorString(err) << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Initialize GPU resources
+    auto gpu_res = std::make_unique<GpuResources>(device_id);
+    gpu_res->mining_mode = MiningMode::Solo;
+    
+    if (!preprocessPuzzle(puzzle, gpu_res.get())) {
+        std::cerr << Color::RED << "Failed to initialize GPU resources" << Color::RESET << std::endl;
+        return;
+    }
+    
+    std::cout << "\n" << Color::BOLD << "Starting benchmark..." << Color::RESET << std::endl;
+    std::cout << "Press Ctrl+C to stop\n" << std::endl;
+    
+    // Benchmark parameters
+    const int BENCHMARK_DURATION_SEC = 30;
+    const uint64_t NONCES_PER_BATCH = 1000000;
+    
+    uint64_t total_nonces = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    auto last_update = start_time;
+    int iteration = 0;
+    
+    install_signal_handlers();
+    
+    while (!stop_mining) {
+        auto batch_start = std::chrono::steady_clock::now();
+        
+        // Mine a batch
+        Digest target = gpu_res->current_target;
+        auto result = mine_pow_with_buffer(
+            *gpu_res->buffer,
+            target,
+            gpu_res->buffer->mast_paths,
+            total_nonces,
+            NONCES_PER_BATCH,
+            gpu_res->buffer->consensus_rule_set,
+            nullptr
+        );
+        
+        total_nonces += NONCES_PER_BATCH;
+        iteration++;
+        
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
+        
+        if (since_update >= 1000) {  // Update every second
+            double hash_rate = (total_nonces / 1000000.0) / std::max(1.0, static_cast<double>(elapsed));
+            std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
+                      << hash_rate << " MH/s" << Color::RESET 
+                      << " | Nonces: " << total_nonces 
+                      << " | Time: " << elapsed << "s" << std::flush;
+            last_update = now;
+        }
+        
+        if (elapsed >= BENCHMARK_DURATION_SEC) {
+            break;
+        }
+    }
+    
+    auto end_time = std::chrono::steady_clock::now();
+    auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    double total_hash_rate = (total_nonces / 1000000.0) / (total_elapsed / 1000.0);
+    
+    std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
+    std::cout << "  Total Nonces:  " << total_nonces << std::endl;
+    std::cout << "  Duration:      " << (total_elapsed / 1000.0) << " seconds" << std::endl;
+    std::cout << "  Average Rate:  " << Color::GREEN << std::fixed << std::setprecision(2) 
+              << total_hash_rate << " MH/s" << Color::RESET << std::endl;
+    std::cout << std::endl;
+    
+    // Cleanup
+    if (gpu_res->buffer) {
+        gpu_res->buffer->cleanup();
+        gpu_res->buffer.reset();
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -136,6 +325,8 @@ int main(int argc, char* argv[]) {
             stratum_worker_name = argv[++i];
         } else if (arg == "--test-mode") {
             g_test_mode = true;
+        } else if (arg == "--benchmark") {
+            g_benchmark_mode = true;
         } else if ((arg == "--fetch-interval") && i + 1 < argc) {
             try {
                 int interval = std::stoi(argv[++i]);
@@ -164,6 +355,29 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     
+    // Handle benchmark mode early - wallet only required if template doesn't exist
+    if (g_benchmark_mode) {
+        // Check if template exists - if so, wallet is not required
+        json test_template;
+        bool template_exists = loadBenchmarkTemplate(test_template);
+        
+        if (!template_exists && g_miner_wallet_address.empty()) {
+            std::cerr << "\n" << Color::RED << Color::BOLD << "Error: Wallet address is required to fetch template" << Color::RESET << std::endl;
+            std::cerr << "\nFirst-time benchmark requires wallet address to fetch template from node." << std::endl;
+            std::cerr << "After template is saved, wallet is not required.\n" << std::endl;
+            print_usage(argv[0]);
+            return 1;
+        }
+        
+        print_system_info();
+        cudaDeviceReset();
+        install_signal_handlers();
+        runBenchmark(endpoint, g_gpu_device_id);
+        cudaDeviceReset();
+        return 0;
+    }
+    
+    // Normal mining mode - wallet is required
     if (g_miner_wallet_address.empty()) {
         std::cerr << "\n" << Color::RED << Color::BOLD << "Error: Wallet address is required" << Color::RESET << std::endl;
         std::cerr << "\nMining requires your Neptune wallet address.\n" << std::endl;
