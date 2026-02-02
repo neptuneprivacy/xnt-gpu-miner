@@ -6,6 +6,7 @@
 #include "pow.cuh"
 #include "digest.cuh"
 #include "common.cuh"
+#include <algorithm>
 
 // ============================================================================
 // Singleton Instance
@@ -188,6 +189,12 @@ bool SoloMiningClient::submitSolution(
         }
         
         std::cout << "[SUBMIT] " << Color::RED << "REJECTED: " << error_reason << Color::RESET << std::endl;
+        
+        // Store error reason for InvalidBlock detection
+        {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            last_error_reason = error_reason;
+        }
     } else {
         std::cout << "[SUBMIT] " << Color::RED << "REJECTED: No response from server" << Color::RESET << std::endl;
     }
@@ -201,6 +208,11 @@ std::string SoloMiningClient::getTipDigest() {
         return "";
     }
     return rpc_client->getTipDigest();
+}
+
+std::string SoloMiningClient::getLastError() const {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    return last_error_reason;
 }
 
 uint64_t SoloMiningClient::getChainHeight() {
@@ -547,16 +559,20 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                                     int count = proposals_seen_for_tip.fetch_add(1) + 1;
                                     
                                     if (count == 1) {
-                                        // First proposal - record prev_block but don't resume yet
+                                        // Always wait for second proposal, even in recovery mode
+                                        // First proposal after InvalidBlock is still unstable
                                         first_proposal_prev_block = prev_block;
                                         should_resume = false;
+                                        bool in_recovery = recovery_mode.load();
                                         std::cout << "[JobBroadcaster] " << Color::YELLOW 
                                                   << "First proposal received (prev_block: " 
-                                                  << prev_block.substr(0, 16) << "...), waiting for second..." 
+                                                  << prev_block.substr(0, 16) << "...), waiting for second..."
+                                                  << (in_recovery ? " (recovery mode)" : "")
                                                   << Color::RESET << std::endl;
                                     } else if (count == 2 && prev_block == first_proposal_prev_block) {
                                         // Second proposal with same prev_block - safe to resume
                                         composing_new_block.store(false);
+                                        recovery_mode.store(false);
                                         std::cout << "[JobBroadcaster] " << Color::GREEN 
                                                   << "Stable proposal confirmed (2nd with same prev_block), resuming mining" 
                                                   << Color::RESET << std::endl;
@@ -697,6 +713,7 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
     
     stats.total_solutions_submitted++;
     bool accepted = false;
+    bool is_invalid_block = false;  // Declare outside try block for use after catch
     try {
         // For solo mode, refresh the template on submission to ensure
         // the appendix claims are current for this proposal.
@@ -798,6 +815,20 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
             submission.pow_solution,
             submission.solution_hash,
             submission.template_obj);
+            
+        // Check if the rejection was due to InvalidBlock
+        if (!accepted && mining_mode == MiningMode::Solo) {
+            SoloMiningClient* solo_client = dynamic_cast<SoloMiningClient*>(client.get());
+            if (solo_client) {
+                std::string error = solo_client->getLastError();
+                std::string error_lower = error;
+                std::transform(error_lower.begin(), error_lower.end(), error_lower.begin(), ::tolower);
+                if (error_lower.find("invalidblock") != std::string::npos || 
+                    error_lower.find("invalid block") != std::string::npos) {
+                    is_invalid_block = true;
+                }
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "[Submit] Exception: " << e.what() << std::endl;
         accepted = false;
@@ -808,8 +839,47 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
     
     if (accepted) {
         stats.total_solutions_accepted++;
+        // Reset rejection counter on success
+        consecutive_rejections.store(0);
+        recovery_mode.store(false);
     } else {
         stats.total_solutions_rejected++;
+        
+        // Only invalidate on actual InvalidBlock errors, not InsufficientWork
+        if (is_invalid_block && !composing_new_block.load()) {
+            std::cout << "[SUBMIT] " << Color::YELLOW
+                      << "InvalidBlock error detected, invalidating template and forcing refresh" 
+                      << Color::RESET << std::endl;
+            
+            // Clear template to force immediate refresh
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                last_template_id.clear();
+            }
+            
+            // Set recovery mode - wait for second proposal (same as normal mode)
+            // First proposal after InvalidBlock is still unstable
+            recovery_mode.store(true);
+            proposals_seen_for_tip.store(0);
+            first_proposal_prev_block.clear();
+            composing_new_block.store(true);
+            
+            // Pause workers temporarily until new template arrives
+            {
+                std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                for (const auto& worker : workers) {
+                    if (worker && worker->active && worker->resources) {
+                        worker->resources->set_paused(true);
+                    }
+                }
+            }
+            
+            // Reset counter
+            consecutive_rejections.store(0);
+        } else {
+            // Reset counter on success or non-InvalidBlock errors
+            consecutive_rejections.store(0);
+        }
     }
     
     {
@@ -948,10 +1018,37 @@ void ConnectionMultiplexer::tipMonitorLoop() {
             }
             
             if (tip_changed) {
-                // Set composing flag - we're waiting for a valid new proposal
-                composing_new_block.store(true);
-                proposals_seen_for_tip.store(0);
-                first_proposal_prev_block.clear();
+                // Check if we're already waiting for a second proposal
+                // If the new tip matches the prev_block we're waiting for, don't reset
+                bool should_reset = true;
+                {
+                    std::lock_guard<std::mutex> lock(job_mutex);
+                    int current_count = proposals_seen_for_tip.load();
+                    if (current_count == 1 && !first_proposal_prev_block.empty()) {
+                        // We're waiting for second proposal - check if new tip matches
+                        if (new_tip == first_proposal_prev_block) {
+                            // New tip matches the prev_block we're waiting for
+                            // This means the first proposal was correct, continue waiting for second
+                            should_reset = false;
+                            std::cout << "[TipMonitor] " << Color::YELLOW 
+                                      << "New block detected (matches waiting prev_block), continuing to wait for second proposal..." 
+                                      << Color::RESET << std::endl;
+                        } else {
+                            // New tip doesn't match - the prev_block we were waiting for is stale
+                            std::cout << "[TipMonitor] " << Color::YELLOW 
+                                      << "New block detected (prev_block changed), resetting proposal wait..." 
+                                      << Color::RESET << std::endl;
+                        }
+                    }
+                    // Note: Tip change already logged above at line 1014-1015
+                }
+                
+                if (should_reset) {
+                    // Set composing flag - we're waiting for a valid new proposal
+                    composing_new_block.store(true);
+                    proposals_seen_for_tip.store(0);
+                    first_proposal_prev_block.clear();
+                }
                 
                 // Immediately pause all workers - their templates are now stale
                 {
@@ -966,15 +1063,17 @@ void ConnectionMultiplexer::tipMonitorLoop() {
                     }
                 }
                 
-                // Clear the last template ID to force immediate fetch
-                {
+                // Clear the last template ID to force immediate fetch (only if resetting)
+                if (should_reset) {
                     std::lock_guard<std::mutex> lock(job_mutex);
                     last_template_id.clear();
                 }
                 
-                std::cout << "[TipMonitor] " << Color::YELLOW 
-                          << "Node composing new block, waiting for stable proposal..." 
-                          << Color::RESET << std::endl;
+                if (should_reset) {
+                    std::cout << "[TipMonitor] " << Color::YELLOW 
+                              << "Node composing new block, waiting for stable proposal..." 
+                              << Color::RESET << std::endl;
+                }
                 
                 // Don't fetch here - let jobBroadcasterLoop handle it with retries
                 // This ensures we wait until a valid proposal is ready
