@@ -148,9 +148,11 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     uint64_t stride = gridDim.x * blockDim.x;
     
     // Process nonces
+    // Check solution flag every 64 iterations to reduce global memory traffic
+    const uint64_t CHECK_INTERVAL = 64;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        // Early exit if solution found
-        if (*d_solution_found) return;
+        // Early exit if solution found (check every N iterations for performance)
+        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
         
         // Sequential nonce within GPU's range (using original working format)
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
@@ -173,39 +175,35 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t path_index_a = index_a;
         uint64_t path_index_b = index_b;
         
-        // Compute path for index_a
+        // Compute paths for both indices - optimized with prefetching and unrolling
         Digest path_a[MERKLE_TREE_HEIGHT_];
-        size_t running_index_a = path_index_a + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
-        size_t sibling_leaf_index_a = path_index_a ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_index_a];
-        
-        // Subsequent levels: internal nodes
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_a >>= 1;
-            size_t sibling_index_a = running_index_a ^ 1;
-            if (sibling_index_a < (MERKLE_NUM_LEAFS)) {
-                path_a[level] = d_internal_nodes[sibling_index_a];
-            } else {
-                path_a[level] = Digest::default_digest();
-            }
-        }
-        
-        // Compute path for index_b
         Digest path_b[MERKLE_TREE_HEIGHT_];
+        
+        size_t running_index_a = path_index_a + num_leafs;
         size_t running_index_b = path_index_b + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
+        
+        // First level: leaf siblings - fetch both at once for better memory coalescing
+        size_t sibling_leaf_index_a = path_index_a ^ 1;
         size_t sibling_leaf_index_b = path_index_b ^ 1;
+        path_a[0] = d_leafs[sibling_leaf_index_a];
         path_b[0] = d_leafs[sibling_leaf_index_b];
         
+        // Subsequent levels: internal nodes - interleaved for better memory access
+        // Unroll more aggressively for better performance
+        #pragma unroll
         for (size_t level = 1; level < merkle_height; ++level) {
+            running_index_a >>= 1;
             running_index_b >>= 1;
+            size_t sibling_index_a = running_index_a ^ 1;
             size_t sibling_index_b = running_index_b ^ 1;
-            if (sibling_index_b < (MERKLE_NUM_LEAFS)) {
-                path_b[level] = d_internal_nodes[sibling_index_b];
-            } else {
-                path_b[level] = Digest::default_digest();
-            }
+            
+            // Fetch both paths in interleaved fashion
+            path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
+                ? d_internal_nodes[sibling_index_a] 
+                : Digest::default_digest();
+            path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
+                ? d_internal_nodes[sibling_index_b] 
+                : Digest::default_digest();
         }
         
         // Get Merkle root (stored at last index in sequentially-built tree)
@@ -225,15 +223,19 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         
         Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
-        // Check against target
-        bool is_solution = true;
-        for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
-                is_solution = false;
-                break;
-            }
-            if (final_hash.values[i] < target.values[i]) {
-                break;
+        // Check against target - optimized comparison
+        // Most hashes will fail on the highest limb, so check it first
+        bool is_solution = (final_hash.values[4] <= target.values[4]);
+        if (is_solution && final_hash.values[4] == target.values[4]) {
+            // Need to check lower limbs
+            for (int i = 3; i >= 0; --i) {
+                if (final_hash.values[i] > target.values[i]) {
+                    is_solution = false;
+                    break;
+                }
+                if (final_hash.values[i] < target.values[i]) {
+                    break;
+                }
             }
         }
         
@@ -294,8 +296,11 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
+    // Check solution flag every 64 iterations to reduce global memory traffic
+    const uint64_t CHECK_INTERVAL = 64;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        if (*d_solution_found) return;
+        // Early exit if solution found (check every N iterations for performance)
+        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
         
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
         
@@ -376,14 +381,19 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         
         Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
-        bool is_solution = true;
-        for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
-                is_solution = false;
-                break;
-            }
-            if (final_hash.values[i] < target.values[i]) {
-                break;
+        // Check against target - optimized comparison (low VRAM version)
+        // Most hashes will fail on the highest limb, so check it first
+        bool is_solution = (final_hash.values[4] <= target.values[4]);
+        if (is_solution && final_hash.values[4] == target.values[4]) {
+            // Need to check lower limbs
+            for (int i = 3; i >= 0; --i) {
+                if (final_hash.values[i] > target.values[i]) {
+                    is_solution = false;
+                    break;
+                }
+                if (final_hash.values[i] < target.values[i]) {
+                    break;
+                }
             }
         }
         
@@ -450,12 +460,21 @@ void calculate_mining_launch_config(
     // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
     //                                     parallel_mining_kernel_high_vram, 0, 0);
     
-    // Calculate maximum blocks to launch for optimal GPU utilization
-    // Higher values allow more parallel blocks, improving performance for large nonce ranges
-    // Note: This is effectively a multiplier to allow sufficient blocks to be launched.
-    // The actual number of blocks is capped by needed_blocks and MAX_GRID_DIM_X.
+    // Use multiple of SM count for good occupancy
+    // Architecture-specific tuning based on compute capability
+    // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
     int num_sms = prop.multiProcessorCount;
-    int blocks_per_sm = 128; // High value to allow maximum parallel blocks (capped by grid limits)
+    int blocks_per_sm;
+    if (prop.major >= 10) {
+        // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
+        blocks_per_sm = 128;  // High value for maximum parallel blocks (capped by grid limits)
+    } else if (prop.major == 9) {
+        // Hopper architecture - use 6 blocks per SM
+        blocks_per_sm = 6;
+    } else {
+        // Ampere/Ada - use default
+        blocks_per_sm = 8;  // Increased from 4 to 8 for better performance
+    }
     int max_blocks = num_sms * blocks_per_sm;
     
     // Calculate blocks needed for nonces
@@ -470,11 +489,24 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
     
-    uint64_t optimal = 1000000ULL;
+    // Base batch size scaled by SM count and architecture
+    // RTX 5090 (SM 120) has 192 SMs, ~21K CUDA cores
+    uint64_t optimal;
+    
+    if (prop.major >= 10) {
+        // Blackwell (RTX 5090) - larger batches for high SM count
+        optimal = 80000000ULL; // 80M nonces for maximum GPU utilization
+    } else if (prop.major == 9) {
+        // Hopper - medium batch
+        optimal = 40000000ULL;
+    } else {
+        // Ampere/Ada - default
+        optimal = 30000000ULL;
+    }
     
     // Apply bounds
-    const uint64_t min_batch = 100000;
-    const uint64_t max_batch = 50000000;
+    const uint64_t min_batch = 500000;
+    const uint64_t max_batch = 100000000;  // Increased max for high-end GPUs
     
     optimal = std::max(optimal, min_batch);
     optimal = std::min(optimal, max_batch);

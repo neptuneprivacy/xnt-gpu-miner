@@ -14,7 +14,7 @@ CXX = g++
 ifdef ARCH
     CUDA_ARCH = -arch=$(ARCH)
 else
-    CUDA_ARCH = -arch=sm_100  # Default: Blackwell (RTX 5090)
+    CUDA_ARCH = -arch=sm_120  # Blackwell RTX 5090 (compute 12.0)
 endif
 
 # Compiler flags

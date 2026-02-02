@@ -81,19 +81,19 @@ bool GpuWorker::initializeCuda() {
     int num_sms = prop.multiProcessorCount;
     
     // Scale by SM count (RTX 5090 has ~256 SMs, older GPUs have fewer)
-    // For modern high-end GPUs, use 15-20M nonces per batch
+    // Increased batch sizes for better GPU utilization and reduced kernel launch overhead
     if (num_sms >= 200) {
         // High-end GPU (RTX 5090, A100, H100, etc.)
-        gpu_resources->optimal_max_nonces = 20000000ULL; // 20M nonces
+        gpu_resources->optimal_max_nonces = 50000000ULL; // 50M nonces (increased from 20M)
     } else if (num_sms >= 100) {
         // Mid-high end GPU (RTX 4090, A6000, etc.)
-        gpu_resources->optimal_max_nonces = 15000000ULL; // 15M nonces
+        gpu_resources->optimal_max_nonces = 30000000ULL; // 30M nonces (increased from 15M)
     } else if (num_sms >= 50) {
         // Mid-range GPU
-        gpu_resources->optimal_max_nonces = 10000000ULL; // 10M nonces
+        gpu_resources->optimal_max_nonces = 20000000ULL; // 20M nonces (increased from 10M)
     } else {
         // Lower-end GPU
-        gpu_resources->optimal_max_nonces = 5000000ULL; // 5M nonces
+        gpu_resources->optimal_max_nonces = 10000000ULL; // 10M nonces (increased from 5M)
     }
     
     return true;
@@ -340,16 +340,16 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     int num_sms = prop.multiProcessorCount;
     if (num_sms >= 200) {
         // High-end GPU (RTX 5090, A100, H100, etc.)
-        gpu_res->optimal_max_nonces = 20000000ULL; // 20M nonces
+        gpu_res->optimal_max_nonces = 50000000ULL; // 50M nonces (increased from 20M)
     } else if (num_sms >= 100) {
         // Mid-high end GPU (RTX 4090, A6000, etc.)
-        gpu_res->optimal_max_nonces = 15000000ULL; // 15M nonces
+        gpu_res->optimal_max_nonces = 30000000ULL; // 30M nonces (increased from 15M)
     } else if (num_sms >= 50) {
         // Mid-range GPU
-        gpu_res->optimal_max_nonces = 10000000ULL; // 10M nonces
+        gpu_res->optimal_max_nonces = 20000000ULL; // 20M nonces (increased from 10M)
     } else {
         // Lower-end GPU
-        gpu_res->optimal_max_nonces = 5000000ULL; // 5M nonces
+        gpu_res->optimal_max_nonces = 10000000ULL; // 10M nonces (increased from 5M)
     }
     gpu_res->mining_mode = mining_mode;
     
