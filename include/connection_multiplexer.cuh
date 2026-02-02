@@ -202,6 +202,7 @@ private:
     // Current job state
     std::string last_template_id;
     std::string current_tip_digest;  // Track current chain tip for stale detection
+    std::atomic<bool> composing_new_block{false};  // True when tip changed, waiting for valid new proposal
     mutable std::mutex job_mutex;
     
     // Statistics

@@ -482,10 +482,10 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                 should_poll = true;
             }
 
-            // Also poll if we have no template yet
+            // Also poll if we have no template yet or if we're composing (waiting for new proposal)
             {
                 std::lock_guard<std::mutex> lock(job_mutex);
-                if (last_template_id.empty()) {
+                if (last_template_id.empty() || composing_new_block.load()) {
                     should_poll = true;
                 }
             }
@@ -498,14 +498,24 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                     json result = template_response["result"];
 
                     if (!result.contains("template") || result["template"].is_null()) {
-                        // Template null, node may be syncing
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        // Template null - node is still composing, keep waiting
+                        if (composing_new_block.load()) {
+                            // Poll more frequently during composition
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
                         continue;
                     }
 
                     json template_obj = result["template"];
                     if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        // Invalid template - node still composing
+                        if (composing_new_block.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
                         continue;
                     }
 
@@ -532,6 +542,14 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                                 current_tip_digest = tip_digest;  // Track current tip for stale detection
                                 is_new_template = true;
 
+                                // Clear composing flag - we have a valid new proposal
+                                if (composing_new_block.load()) {
+                                    composing_new_block.store(false);
+                                    std::cout << "[JobBroadcaster] " << Color::GREEN 
+                                              << "Valid new proposal received, resuming mining" 
+                                              << Color::RESET << std::endl;
+                                }
+
                                 stats.total_jobs_fetched++;
                                 {
                                     std::lock_guard<std::mutex> time_lock(stats.time_mutex);
@@ -542,6 +560,15 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                     }
 
                     if (is_new_template) {
+                        // Resume workers when we have a valid new proposal
+                        {
+                            std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                            for (const auto& worker : workers) {
+                                if (worker && worker->active && worker->resources) {
+                                    worker->resources->set_paused(false);
+                                }
+                            }
+                        }
                         broadcastJobToWorkers(template_response);
                     }
                 }
@@ -626,6 +653,14 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
         return false;
     }
     
+    // Reject submissions during composition gap (no valid proposal exists yet)
+    if (composing_new_block.load()) {
+        std::cout << "[SUBMIT] " << Color::YELLOW
+                  << "STALE: Node composing new block, no valid proposal yet" 
+                  << Color::RESET << std::endl;
+        return false;
+    }
+    
     stats.total_solutions_submitted++;
     bool accepted = false;
     try {
@@ -679,6 +714,45 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
                           << "Template digest mismatch on refresh, dropping submission" 
                           << Color::RESET << std::endl;
                 return false;
+            }
+
+            // Additional validation: Ensure the block body (transaction kernel) hasn't changed
+            // by comparing a hash of the transaction kernel structure
+            json fresh_block = template_obj["block"];
+            json original_block = submission.template_obj["block"];
+            
+            if (fresh_block.contains("kernel") && original_block.contains("kernel")) {
+                json fresh_kernel = fresh_block["kernel"];
+                json original_kernel = original_block["kernel"];
+                
+                // Compare transaction kernel body fields that affect the MAST hash
+                // If these differ, the appendix claims will be invalid
+                auto kernel_body_hash = [](const json& kernel) -> std::string {
+                    if (!kernel.contains("body") || kernel["body"].is_null()) {
+                        return "";
+                    }
+                    json body = kernel["body"];
+                    // Create a simple hash from key transaction kernel fields
+                    std::ostringstream oss;
+                    if (body.contains("transactionKernel")) {
+                        json tk = body["transactionKernel"];
+                        if (tk.contains("fee")) oss << tk["fee"].dump();
+                        if (tk.contains("coinbase")) oss << tk["coinbase"].dump();
+                        if (tk.contains("timestamp")) oss << tk["timestamp"].dump();
+                        if (tk.contains("mutatorSetHash")) oss << tk["mutatorSetHash"].dump();
+                    }
+                    return oss.str();
+                };
+                
+                std::string fresh_hash = kernel_body_hash(fresh_kernel);
+                std::string original_hash = kernel_body_hash(original_kernel);
+                
+                if (fresh_hash != original_hash) {
+                    std::cout << "[SUBMIT] " << Color::YELLOW
+                              << "Transaction kernel body changed on refresh, dropping submission" 
+                              << Color::RESET << std::endl;
+                    return false;
+                }
             }
 
             // Always use the freshly fetched template for submission
@@ -840,6 +914,9 @@ void ConnectionMultiplexer::tipMonitorLoop() {
             }
             
             if (tip_changed) {
+                // Set composing flag - we're waiting for a valid new proposal
+                composing_new_block.store(true);
+                
                 // Immediately pause all workers - their templates are now stale
                 {
                     std::shared_lock<std::shared_mutex> lock(workers_mutex);
@@ -859,36 +936,12 @@ void ConnectionMultiplexer::tipMonitorLoop() {
                     last_template_id.clear();
                 }
                 
-                // Immediately fetch new template
-                json template_response = client->getBlockTemplate(wallet_address);
+                std::cout << "[TipMonitor] " << Color::YELLOW 
+                          << "Node composing new block, waiting for valid proposal..." 
+                          << Color::RESET << std::endl;
                 
-                if (!template_response.empty() && template_response.contains("result")) {
-                    json result = template_response["result"];
-                    
-                    if (result.contains("template") && !result["template"].is_null()) {
-                        json template_obj = result["template"];
-                        
-                        if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
-                            json metadata = template_obj["metadata"];
-                            std::string template_id = metadata.contains("digest") ? 
-                                metadata.value("digest", "") : "";
-                            
-                            {
-                                std::lock_guard<std::mutex> lock(job_mutex);
-                                last_template_id = template_id;
-                            }
-                            
-                            stats.total_jobs_fetched++;
-                            {
-                                std::lock_guard<std::mutex> time_lock(stats.time_mutex);
-                                stats.last_job_time = std::chrono::steady_clock::now();
-                            }
-                            
-                            std::cout << "[TipMonitor] " << Color::GREEN << "New template fetched" << Color::RESET << std::endl;
-                            broadcastJobToWorkers(template_response);
-                        }
-                    }
-                }
+                // Don't fetch here - let jobBroadcasterLoop handle it with retries
+                // This ensures we wait until a valid proposal is ready
             }
         }
         
