@@ -173,39 +173,34 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t path_index_a = index_a;
         uint64_t path_index_b = index_b;
         
-        // Compute path for index_a
+        // Compute paths for both indices - optimized with prefetching
         Digest path_a[MERKLE_TREE_HEIGHT_];
-        size_t running_index_a = path_index_a + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
-        size_t sibling_leaf_index_a = path_index_a ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_index_a];
-        
-        // Subsequent levels: internal nodes
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_a >>= 1;
-            size_t sibling_index_a = running_index_a ^ 1;
-            if (sibling_index_a < (MERKLE_NUM_LEAFS)) {
-                path_a[level] = d_internal_nodes[sibling_index_a];
-            } else {
-                path_a[level] = Digest::default_digest();
-            }
-        }
-        
-        // Compute path for index_b
         Digest path_b[MERKLE_TREE_HEIGHT_];
+        
+        size_t running_index_a = path_index_a + num_leafs;
         size_t running_index_b = path_index_b + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
+        
+        // First level: leaf siblings - fetch both at once for better memory coalescing
+        size_t sibling_leaf_index_a = path_index_a ^ 1;
         size_t sibling_leaf_index_b = path_index_b ^ 1;
+        path_a[0] = d_leafs[sibling_leaf_index_a];
         path_b[0] = d_leafs[sibling_leaf_index_b];
         
+        // Subsequent levels: internal nodes - interleaved for better memory access
+        #pragma unroll 4
         for (size_t level = 1; level < merkle_height; ++level) {
+            running_index_a >>= 1;
             running_index_b >>= 1;
+            size_t sibling_index_a = running_index_a ^ 1;
             size_t sibling_index_b = running_index_b ^ 1;
-            if (sibling_index_b < (MERKLE_NUM_LEAFS)) {
-                path_b[level] = d_internal_nodes[sibling_index_b];
-            } else {
-                path_b[level] = Digest::default_digest();
-            }
+            
+            // Fetch both paths in interleaved fashion
+            path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
+                ? d_internal_nodes[sibling_index_a] 
+                : Digest::default_digest();
+            path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
+                ? d_internal_nodes[sibling_index_b] 
+                : Digest::default_digest();
         }
         
         // Get Merkle root (stored at last index in sequentially-built tree)
@@ -225,15 +220,19 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         
         Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
-        // Check against target
-        bool is_solution = true;
-        for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
-                is_solution = false;
-                break;
-            }
-            if (final_hash.values[i] < target.values[i]) {
-                break;
+        // Check against target - optimized comparison
+        // Most hashes will fail on the highest limb, so check it first
+        bool is_solution = (final_hash.values[4] <= target.values[4]);
+        if (is_solution && final_hash.values[4] == target.values[4]) {
+            // Need to check lower limbs
+            for (int i = 3; i >= 0; --i) {
+                if (final_hash.values[i] > target.values[i]) {
+                    is_solution = false;
+                    break;
+                }
+                if (final_hash.values[i] < target.values[i]) {
+                    break;
+                }
             }
         }
         
@@ -376,14 +375,19 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         
         Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
-        bool is_solution = true;
-        for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
-                is_solution = false;
-                break;
-            }
-            if (final_hash.values[i] < target.values[i]) {
-                break;
+        // Check against target - optimized comparison
+        // Most hashes will fail on the highest limb, so check it first
+        bool is_solution = (final_hash.values[4] <= target.values[4]);
+        if (is_solution && final_hash.values[4] == target.values[4]) {
+            // Need to check lower limbs
+            for (int i = 3; i >= 0; --i) {
+                if (final_hash.values[i] > target.values[i]) {
+                    is_solution = false;
+                    break;
+                }
+                if (final_hash.values[i] < target.values[i]) {
+                    break;
+                }
             }
         }
         
@@ -444,15 +448,23 @@ void calculate_mining_launch_config(
     
     threads_per_block = MINING_THREADS_PER_BLOCK;
     
-    // Calculate optimal number of blocks
-    // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
-    // int min_grid_size, optimal_block_size;
-    // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
-    //                                     parallel_mining_kernel_high_vram, 0, 0);
-    
     // Use multiple of SM count for good occupancy
     int num_sms = prop.multiProcessorCount;
-    int blocks_per_sm = 4; // Target occupancy
+    
+    // Architecture-specific tuning based on compute capability
+    // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
+    int blocks_per_sm;
+    if (prop.major >= 10) {
+        // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
+        blocks_per_sm = BLOCKS_PER_SM_BLACKWELL;
+    } else if (prop.major == 9) {
+        // Hopper architecture - use 6 blocks per SM
+        blocks_per_sm = 6;
+    } else {
+        // Ampere/Ada - use default
+        blocks_per_sm = BLOCKS_PER_SM_DEFAULT;
+    }
+    
     int max_blocks = num_sms * blocks_per_sm;
     
     // Calculate blocks needed for nonces
@@ -467,11 +479,24 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
     
-    uint64_t optimal = 1000000ULL;
+    // Base batch size scaled by SM count and architecture
+    // RTX 5090 (SM 120) has 192 SMs, ~21K CUDA cores
+    uint64_t optimal;
+    
+    if (prop.major >= 10) {
+        // Blackwell (RTX 5090) - larger batches for high SM count
+        optimal = 2000000ULL * prop.multiProcessorCount / 84;  // Normalized to typical SM count
+    } else if (prop.major == 9) {
+        // Hopper - medium batch
+        optimal = 1500000ULL * prop.multiProcessorCount / 84;
+    } else {
+        // Ampere/Ada - default
+        optimal = 1000000ULL * prop.multiProcessorCount / 84;
+    }
     
     // Apply bounds
-    const uint64_t min_batch = 100000;
-    const uint64_t max_batch = 50000000;
+    const uint64_t min_batch = 500000;
+    const uint64_t max_batch = 100000000;  // Increased max for high-end GPUs
     
     optimal = std::max(optimal, min_batch);
     optimal = std::min(optimal, max_batch);
