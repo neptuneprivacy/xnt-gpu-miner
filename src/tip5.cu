@@ -350,7 +350,7 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
     
-    // Split each element into lo and hi 32-bit limbs - fully unrolled
+    // Split each element into lo and hi 32-bit limbs
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         uint64_t b = state_in[i];
@@ -364,23 +364,14 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     generated_function(hi, hi_out);
     
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
-    // Optimized reduction using fused operations
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        // Use __umul64hi for high part of multiplication
-        uint64_t lo_shifted = lo_out[i] >> 4;
-        uint64_t hi_shifted = hi_out[i] << 28;
-        uint64_t hi_carry = hi_out[i] >> 36;  // Overflow from hi << 28
+        __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
+        uint64_t s_hi = (uint64_t)(s >> 64);
+        uint64_t s_lo = (uint64_t)s;
         
-        // s = lo_shifted + hi_shifted (with carry to hi_carry)
-        uint64_t s_lo = lo_shifted + hi_shifted;
-        bool carry1 = (s_lo < lo_shifted);
-        uint64_t s_hi = hi_carry + (carry1 ? 1ULL : 0ULL);
-        
-        // Goldilocks reduction: res = s_lo + s_hi * (2^64 mod p) = s_lo + s_hi * 0xFFFFFFFF
-        // Since 2^64 ≡ 2^32 - 1 (mod p) for Goldilocks prime p = 2^64 - 2^32 + 1
-        uint64_t correction = s_hi * 0xFFFFFFFFULL;
-        uint64_t res = s_lo + correction;
+        // Goldilocks reduction with overflow check
+        uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
         bool overflow = (res < s_lo);
         state_out[i] = overflow ? (res + 0xFFFFFFFFULL) : res;
     }
@@ -485,69 +476,13 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
     }
 }
 
-// Optimized split_lookup using constant memory (for use in tip5.cu)
-__device__ __forceinline__ uint64_t split_lookup_const(uint64_t element_in) {
-    uint64_t lo1 = element_in * R2;
-    uint64_t hi1 = __umul64hi(element_in, R2);
-    uint64_t reduced_in = montyred_from_parts(hi1, lo1);
-    
-    uint8_t addr0 = (uint8_t)(reduced_in >> 0);
-    uint8_t addr1 = (uint8_t)(reduced_in >> 8);
-    uint8_t addr2 = (uint8_t)(reduced_in >> 16);
-    uint8_t addr3 = (uint8_t)(reduced_in >> 24);
-    uint8_t addr4 = (uint8_t)(reduced_in >> 32);
-    uint8_t addr5 = (uint8_t)(reduced_in >> 40);
-    uint8_t addr6 = (uint8_t)(reduced_in >> 48);
-    uint8_t addr7 = (uint8_t)(reduced_in >> 56);
-    
-    uint64_t b0 = LOOKUP_TABLE[addr0];
-    uint64_t b1 = LOOKUP_TABLE[addr1];
-    uint64_t b2 = LOOKUP_TABLE[addr2];
-    uint64_t b3 = LOOKUP_TABLE[addr3];
-    uint64_t b4 = LOOKUP_TABLE[addr4];
-    uint64_t b5 = LOOKUP_TABLE[addr5];
-    uint64_t b6 = LOOKUP_TABLE[addr6];
-    uint64_t b7 = LOOKUP_TABLE[addr7];
-    
-    uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
-                        (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
-    
-    return montyred_from_parts(0, sbox_out);
-}
-
 __device__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
     
-    // OPTIMIZATION: Fully unrolled rounds for better instruction scheduling
+    // Original implementation - sbox_layer uses shared memory loaded by kernel
     #pragma unroll
     for (int round = 0; round < NUM_ROUNDS; ++round) {
-        // Inline S-box layer for first 4 elements (lookup) and rest (x^7)
-        
-        // Load state into registers
-        uint64_t s0 = state[0], s1 = state[1], s2 = state[2], s3 = state[3];
-        uint64_t s4 = state[4], s5 = state[5], s6 = state[6], s7 = state[7];
-        uint64_t s8 = state[8], s9 = state[9], s10 = state[10], s11 = state[11];
-        uint64_t s12 = state[12], s13 = state[13], s14 = state[14], s15 = state[15];
-        
-        // S-box: first 4 use lookup (constant memory), rest use x^7
-        temp_state[0] = split_lookup_const(s0);
-        temp_state[1] = split_lookup_const(s1);
-        temp_state[2] = split_lookup_const(s2);
-        temp_state[3] = split_lookup_const(s3);
-        temp_state[4] = x7_computer(s4);
-        temp_state[5] = x7_computer(s5);
-        temp_state[6] = x7_computer(s6);
-        temp_state[7] = x7_computer(s7);
-        temp_state[8] = x7_computer(s8);
-        temp_state[9] = x7_computer(s9);
-        temp_state[10] = x7_computer(s10);
-        temp_state[11] = x7_computer(s11);
-        temp_state[12] = x7_computer(s12);
-        temp_state[13] = x7_computer(s13);
-        temp_state[14] = x7_computer(s14);
-        temp_state[15] = x7_computer(s15);
-        
-        // MDS layer
+        sbox_layer(state, temp_state);
         mds_layer(temp_state, state);
         
         // Fused round constants addition
