@@ -239,9 +239,6 @@ __host__ inline uint32_t get_mds_coeff_host(int i, int j) {
 }
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out);
-__device__ __forceinline__ void sbox_layer_fast(const uint64_t* __restrict__ state_in, 
-                                                  uint64_t* __restrict__ state_out,
-                                                  const uint8_t* __restrict__ shared_lut);
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out);
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out);
 __device__ void generated_function(const uint64_t* input, uint64_t* output);
@@ -251,8 +248,49 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void round_constants_layer_host(int round_index, const uint64_t* state_in, uint64_t* state_out);
 
 __device__ void tip5_permutation(uint64_t* state);
-__device__ __forceinline__ void tip5_permutation_fast(uint64_t* state, const uint8_t* __restrict__ shared_lut);
 __host__ void tip5_permutation_host(uint64_t* state);
+
+// Optimized sbox that takes pre-loaded shared LUT (no syncthreads)
+__device__ __forceinline__ void sbox_layer_fast(const uint64_t* __restrict__ state_in, 
+                                                  uint64_t* __restrict__ state_out,
+                                                  const uint8_t* __restrict__ shared_lut) {
+    // First 4 elements use S-box lookup
+    state_out[0] = split_lookup_shared(state_in[0], shared_lut);
+    state_out[1] = split_lookup_shared(state_in[1], shared_lut);
+    state_out[2] = split_lookup_shared(state_in[2], shared_lut);
+    state_out[3] = split_lookup_shared(state_in[3], shared_lut);
+    
+    // Remaining 12 elements use x^7
+    state_out[4] = x7_computer(state_in[4]);
+    state_out[5] = x7_computer(state_in[5]);
+    state_out[6] = x7_computer(state_in[6]);
+    state_out[7] = x7_computer(state_in[7]);
+    state_out[8] = x7_computer(state_in[8]);
+    state_out[9] = x7_computer(state_in[9]);
+    state_out[10] = x7_computer(state_in[10]);
+    state_out[11] = x7_computer(state_in[11]);
+    state_out[12] = x7_computer(state_in[12]);
+    state_out[13] = x7_computer(state_in[13]);
+    state_out[14] = x7_computer(state_in[14]);
+    state_out[15] = x7_computer(state_in[15]);
+}
+
+// Optimized permutation using pre-loaded shared LUT - NO syncthreads inside!
+__device__ __forceinline__ void tip5_permutation_fast(uint64_t* state, const uint8_t* __restrict__ shared_lut) {
+    uint64_t temp_state[STATE_SIZE];
+    
+    #pragma unroll
+    for (int round = 0; round < NUM_ROUNDS; ++round) {
+        sbox_layer_fast(state, temp_state, shared_lut);
+        mds_layer(temp_state, state);
+        
+        // Fused round constants addition
+        #pragma unroll
+        for (int i = 0; i < STATE_SIZE; ++i) {
+            state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
+        }
+    }
+}
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {
     // OPTIMIZATION #16: Combined initialization in single loop
