@@ -130,6 +130,20 @@ bool SoloMiningClient::submitSolution(
         std::cout << "[SUBMIT] ERROR: Block missing 'kernel' field" << std::endl;
         return false;
     }
+
+    json kernel_obj = block_obj["kernel"];
+    if (!kernel_obj.contains("appendix") || kernel_obj["appendix"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel missing 'appendix' field" << std::endl;
+        return false;
+    }
+    if (!kernel_obj["appendix"].is_array()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel 'appendix' is not an array" << std::endl;
+        return false;
+    }
+    if (kernel_obj["appendix"].empty()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel 'appendix' is empty" << std::endl;
+        return false;
+    }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
     
@@ -615,6 +629,26 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
     stats.total_solutions_submitted++;
     bool accepted = false;
     try {
+        // For solo mode, refresh the template on submission to ensure
+        // the appendix claims are current for this proposal.
+        if (mining_mode == MiningMode::Solo) {
+            json template_response = client->getBlockTemplate(wallet_address);
+            if (!template_response.empty() && template_response.contains("result")) {
+                json result = template_response["result"];
+                if (result.contains("template") && !result["template"].is_null()) {
+                    json template_obj = result["template"];
+                    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+                        json metadata = template_obj["metadata"];
+                        std::string template_id = metadata.contains("digest")
+                            ? metadata.value("digest", "") : "";
+                        if (!template_id.empty() && template_id == submission.proposal_id) {
+                            submission.template_obj = template_obj;
+                        }
+                    }
+                }
+            }
+        }
+
         accepted = client->submitSolution(
             submission.proposal_id,
             submission.pow_solution,
