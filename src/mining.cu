@@ -644,13 +644,14 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                       << " Submitting to " << submit_target << "..." << std::endl;
             
                 PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
-                Digest solution_hash = mast_paths.fast_mast_hash(result.value().pow);
+                MiningSolution solution = result.value();
+                Digest solution_hash = mast_paths.fast_mast_hash(solution.pow);
                 
             // Use the template captured at the start of this mining batch
             // This ensures we submit with the same template we were mining for
             auto future = worker->submitSolution(
                     proposal_id,
-                    result.value().pow,
+                    solution.pow,
                     solution_hash,
                     template_for_this_batch
                 );
