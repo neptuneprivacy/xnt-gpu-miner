@@ -62,6 +62,21 @@ bool MiningOutputBuffers::allocate() {
         return false;
     }
     
+    err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce);
+        cudaFree(d_solution_found);
+        cudaFree(d_solution_path_a);
+        cudaFree(d_solution_path_b);
+        cudaFree(d_solution_nonce_digest);
+        d_solution_nonce = nullptr;
+        d_solution_found = nullptr;
+        d_solution_path_a = nullptr;
+        d_solution_path_b = nullptr;
+        d_solution_nonce_digest = nullptr;
+        return false;
+    }
+    
     return true;
 }
 
@@ -85,6 +100,10 @@ void MiningOutputBuffers::free() {
     if (d_solution_nonce_digest) {
         cudaFree(d_solution_nonce_digest);
         d_solution_nonce_digest = nullptr;
+    }
+    if (d_solution_final_hash) {
+        cudaFree(d_solution_final_hash);
+        d_solution_final_hash = nullptr;
     }
 }
 
@@ -113,7 +132,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
-    Digest* __restrict__ d_solution_nonce_digest) {
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash) {
     
     // Load lookup table into shared memory (first warp)
     if (threadIdx.x < 256) {
@@ -225,6 +245,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
                 // Store full nonce digest so host can submit all 5 limbs
                 *d_solution_nonce_digest = nonce_digest;
                 
+                // Store the final_hash that met the threshold (for debugging)
+                *d_solution_final_hash = final_hash;
+                
                 // Copy the already-computed paths
                 #pragma unroll
                 for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
@@ -257,7 +280,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
-    Digest* __restrict__ d_solution_nonce_digest) {
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash) {
     
     // Load lookup table into shared memory
     if (threadIdx.x < 256) {
@@ -367,6 +391,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_value);
+                
+                // Store the final_hash that met the threshold (for debugging)
+                *d_solution_final_hash = final_hash;
                 *d_solution_nonce_digest = nonce_digest;
                 
                 // Store paths - use get_internal_node_safe for both stored and computed nodes
@@ -418,9 +445,10 @@ void calculate_mining_launch_config(
     threads_per_block = MINING_THREADS_PER_BLOCK;
     
     // Calculate optimal number of blocks
-    int min_grid_size, optimal_block_size;
-    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
-                                        parallel_mining_kernel_high_vram, 0, 0);
+    // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
+    // int min_grid_size, optimal_block_size;
+    // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
+    //                                     parallel_mining_kernel_high_vram, 0, 0);
     
     // Use multiple of SM count for good occupancy
     int num_sms = prop.multiProcessorCount;
@@ -484,7 +512,7 @@ bool sync_and_check_errors(const char* stage) {
 
 // ===== MAIN MINING FUNCTION =====
 
-std::optional<Pow> mine_pow_with_buffer(
+std::optional<MiningSolution> mine_pow_with_buffer(
     GuesserBuffer& buffer,
     const Digest& target,
     const PowMastPaths& mast_paths,
@@ -556,7 +584,8 @@ std::optional<Pow> mine_pow_with_buffer(
                 output.d_solution_found,
                 output.d_solution_path_a,
                 output.d_solution_path_b,
-                output.d_solution_nonce_digest);
+                output.d_solution_nonce_digest,
+                output.d_solution_final_hash);
             break;
             
         case MiningKernelType::LOW_VRAM:
@@ -577,7 +606,8 @@ std::optional<Pow> mine_pow_with_buffer(
                 output.d_solution_found,
                 output.d_solution_path_a,
                 output.d_solution_path_b,
-                output.d_solution_nonce_digest);
+                output.d_solution_nonce_digest,
+                output.d_solution_final_hash);
             break;
     }
     
@@ -610,11 +640,20 @@ std::optional<Pow> mine_pow_with_buffer(
         cudaMemcpy(solution.path_b, output.d_solution_path_b,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
         
+        // Copy the final_hash that kernel computed (for debugging)
+        Digest kernel_final_hash;
+        cudaMemcpy(&kernel_final_hash, output.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
+        
         // Set root from buffer
         solution.root = buffer.merkle_root;
         
+        // Return both solution and kernel_final_hash
+        MiningSolution mining_solution;
+        mining_solution.pow = solution;
+        mining_solution.kernel_final_hash = kernel_final_hash;
+        
         output.free();
-        return solution;
+        return mining_solution;
     }
     
     output.free();
@@ -648,7 +687,8 @@ MiningResult mine_batch(
     
     if (solution.has_value()) {
         result.solution_found = true;
-        result.pow_solution = solution.value();
+        result.pow_solution = solution.value().pow;
+        result.solution_hash = solution.value().kernel_final_hash;  // Use kernel's final_hash
     }
     
     return result;

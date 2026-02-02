@@ -73,7 +73,12 @@ __device__ void compute_merkle_paths(
     size_t num_leafs,
     size_t merkle_height);
 
-std::optional<Pow> mine_pow_with_buffer(
+struct MiningSolution {
+    Pow pow;
+    Digest kernel_final_hash;  // The final_hash that kernel computed and checked
+};
+
+std::optional<MiningSolution> mine_pow_with_buffer(
     GuesserBuffer& buffer,
     const Digest& target,
     const PowMastPaths& mast_paths,
@@ -115,13 +120,15 @@ struct MiningOutputBuffers {
     Digest* d_solution_path_a;
     Digest* d_solution_path_b;
     Digest* d_solution_nonce_digest;
+    Digest* d_solution_final_hash;  // Store the final_hash that kernel computed
     
     MiningOutputBuffers()
         : d_solution_nonce(nullptr)
         , d_solution_found(nullptr)
         , d_solution_path_a(nullptr)
         , d_solution_path_b(nullptr)
-        , d_solution_nonce_digest(nullptr) {}
+        , d_solution_nonce_digest(nullptr)
+        , d_solution_final_hash(nullptr) {}
     
     bool allocate();
     void free();
