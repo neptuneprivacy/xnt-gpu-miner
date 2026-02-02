@@ -234,6 +234,11 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     auto last_update = start_time;
     int iteration = 0;
     
+    // Track actual mining time (excluding validation/display overhead)
+    double total_mining_time_seconds = 0.0;
+    double average_batch_time_seconds = 0.0;  // Rolling average for estimating early exits
+    int batches_without_solution = 0;  // Count batches without solutions for averaging
+    
     install_signal_handlers();
     
     std::cout << "\n" << Color::BOLD << "Validation:" << Color::RESET << std::endl;
@@ -258,8 +263,25 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
             nullptr
         );
         
+        // Measure actual batch execution time
+        auto batch_end = std::chrono::steady_clock::now();
+        auto batch_duration = std::chrono::duration_cast<std::chrono::microseconds>(batch_end - batch_start).count();
+        double batch_time_seconds = batch_duration / 1000000.0;
+        
         // Validate any solution found by the kernel
         if (result.has_value()) {
+            // Solution found: kernel may have exited early
+            // Estimate nonces processed based on time ratio compared to average batch time
+            if (average_batch_time_seconds > 0.0 && batch_time_seconds < average_batch_time_seconds * 0.7) {
+                // Likely early exit - estimate nonces based on time ratio
+                uint64_t estimated_nonces = static_cast<uint64_t>(NONCES_PER_BATCH * (batch_time_seconds / average_batch_time_seconds));
+                total_nonces += estimated_nonces;
+                total_mining_time_seconds += batch_time_seconds;
+            } else {
+                // Processed most/all of batch (or no baseline yet)
+                total_nonces += NONCES_PER_BATCH;
+                total_mining_time_seconds += batch_time_seconds;
+            }
             solutions_found++;
             
             // Extract solution components
@@ -323,9 +345,21 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
                     }
                 }
             }
+        } else {
+            // No solution found: processed full batch
+            total_nonces += NONCES_PER_BATCH;
+            total_mining_time_seconds += batch_time_seconds;
+            
+            // Update rolling average of batch time (for estimating early exits)
+            batches_without_solution++;
+            if (batches_without_solution == 1) {
+                average_batch_time_seconds = batch_time_seconds;
+            } else {
+                // Exponential moving average (weighted towards recent batches)
+                average_batch_time_seconds = average_batch_time_seconds * 0.8 + batch_time_seconds * 0.2;
+            }
         }
         
-        total_nonces += NONCES_PER_BATCH;
         iteration++;
         
         // Update progress display and check if benchmark duration has elapsed
@@ -334,8 +368,9 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
         
         // Update hash rate display every second
+        // Use actual mining time for accurate hash rate calculation
         if (since_update >= 1000) {
-            double hash_rate = (total_nonces / 1000000.0) / std::max(1.0, static_cast<double>(elapsed));
+            double hash_rate = (total_nonces / 1000000.0) / std::max(0.001, total_mining_time_seconds);
             std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
                       << hash_rate << " MH/s" << Color::RESET 
                       << " | Nonces: " << total_nonces 
@@ -351,7 +386,8 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     
     auto end_time = std::chrono::steady_clock::now();
     auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    double total_hash_rate = (total_nonces / 1000000.0) / (total_elapsed / 1000.0);
+    // Use actual mining time for accurate hash rate (excludes validation/display overhead)
+    double total_hash_rate = (total_nonces / 1000000.0) / std::max(0.001, total_mining_time_seconds);
     
     std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
     std::cout << "  Total Nonces:  " << total_nonces << std::endl;

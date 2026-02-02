@@ -5,10 +5,17 @@ NVCC = nvcc
 CXX = g++
 
 # CUDA architecture flags
-# RTX 5090 has compute capability 12.0 (Blackwell)
-# CUDA 13.0 supports up to compute_100, so use native or all-major
-# Using -arch=native for automatic detection, or specify compute_100 for Blackwell
-CUDA_ARCH = -arch=native
+# RTX 5090 has compute capability 12.0 (Blackwell) = sm_100
+# Options: 
+#   -arch=sm_100 (Blackwell/RTX 5090 - optimal)
+#   -arch=sm_90  (Ada/Hopper - fallback compatibility)
+#   -arch=native (auto-detect)
+# Usage: make ARCH=sm_90 or make ARCH=sm_100
+ifdef ARCH
+    CUDA_ARCH = -arch=$(ARCH)
+else
+    CUDA_ARCH = -arch=sm_100  # Default: Blackwell (RTX 5090)
+endif
 
 # Compiler flags
 # Enable separable compilation for device functions across multiple files
