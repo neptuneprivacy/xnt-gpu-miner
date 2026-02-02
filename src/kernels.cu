@@ -175,7 +175,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t path_index_a = index_a;
         uint64_t path_index_b = index_b;
         
-        // Compute paths for both indices - optimized with prefetching
+        // Compute paths for both indices - optimized with prefetching and unrolling
         Digest path_a[MERKLE_TREE_HEIGHT_];
         Digest path_b[MERKLE_TREE_HEIGHT_];
         
@@ -189,7 +189,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         path_b[0] = d_leafs[sibling_leaf_index_b];
         
         // Subsequent levels: internal nodes - interleaved for better memory access
-        #pragma unroll 4
+        // Unroll more aggressively for better performance
+        #pragma unroll
         for (size_t level = 1; level < merkle_height; ++level) {
             running_index_a >>= 1;
             running_index_b >>= 1;
@@ -380,7 +381,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         
         Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
-        // Check against target - optimized comparison
+        // Check against target - optimized comparison (low VRAM version)
         // Most hashes will fail on the highest limb, so check it first
         bool is_solution = (final_hash.values[4] <= target.values[4]);
         if (is_solution && final_hash.values[4] == target.values[4]) {
@@ -453,25 +454,27 @@ void calculate_mining_launch_config(
     
     threads_per_block = MINING_THREADS_PER_BLOCK;
     
+    // Calculate optimal number of blocks
+    // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
+    // int min_grid_size, optimal_block_size;
+    // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
+    //                                     parallel_mining_kernel_high_vram, 0, 0);
+    
     // Use multiple of SM count for good occupancy
     // Architecture-specific tuning based on compute capability
     // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
     int num_sms = prop.multiProcessorCount;
-    
-    // Architecture-specific tuning based on compute capability
-    // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
     int blocks_per_sm;
     if (prop.major >= 10) {
         // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
-        blocks_per_sm = BLOCKS_PER_SM_BLACKWELL;
+        blocks_per_sm = 128;  // High value for maximum parallel blocks (capped by grid limits)
     } else if (prop.major == 9) {
         // Hopper architecture - use 6 blocks per SM
         blocks_per_sm = 6;
     } else {
         // Ampere/Ada - use default
-        blocks_per_sm = BLOCKS_PER_SM_DEFAULT;
+        blocks_per_sm = 8;  // Increased from 4 to 8 for better performance
     }
-    
     int max_blocks = num_sms * blocks_per_sm;
     
     // Calculate blocks needed for nonces
@@ -492,13 +495,13 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     
     if (prop.major >= 10) {
         // Blackwell (RTX 5090) - larger batches for high SM count
-        optimal = 2000000ULL * prop.multiProcessorCount / 84;  // Normalized to typical SM count
+        optimal = 80000000ULL; // 80M nonces for maximum GPU utilization
     } else if (prop.major == 9) {
         // Hopper - medium batch
-        optimal = 1500000ULL * prop.multiProcessorCount / 84;
+        optimal = 40000000ULL;
     } else {
         // Ampere/Ada - default
-        optimal = 1000000ULL * prop.multiProcessorCount / 84;
+        optimal = 30000000ULL;
     }
     
     // Apply bounds
