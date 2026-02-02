@@ -28,6 +28,8 @@ private:
     std::string rpc_url;
     mutable std::mutex client_mutex;  // Thread-safe access
     std::atomic<bool> connected{false};
+    std::string last_error_reason;  // Store last error for InvalidBlock detection
+    mutable std::mutex error_mutex;
     
 public:
     SoloMiningClient(const std::string& rpc_url);
@@ -65,6 +67,7 @@ public:
     
     std::string getTipDigest() override;
     uint64_t getChainHeight() override;
+    std::string getLastError() const;  // Get last error reason for InvalidBlock detection
     
     bool is_push_based() const override { return false; }
 };
@@ -199,12 +202,23 @@ private:
     std::thread job_broadcaster_thread;
     std::thread solution_submitter_thread;
     std::thread health_monitor_thread;
+    std::thread tip_monitor_thread;  // Fast tip change detection
     std::atomic<bool> running{false};
     std::atomic<bool> initialized{false};
     std::atomic<bool> connected{false};
     
     // Current job state
     std::string last_template_id;
+    std::string current_tip_digest;  // Track current chain tip for stale detection
+    std::atomic<bool> composing_new_block{false};  // True when tip changed, waiting for valid new proposal
+    std::string first_proposal_prev_block;  // Track first proposal's prev_block after tip change
+    std::atomic<int> proposals_seen_for_tip{0};  // Count proposals seen for current tip
+    
+    // InvalidBlock detection
+    std::atomic<int> consecutive_rejections{0};  // Track consecutive rejections
+    std::atomic<std::chrono::steady_clock::time_point> last_rejection_time{std::chrono::steady_clock::now()};
+    std::atomic<bool> recovery_mode{false};  // True when recovering from InvalidBlock, resume after first proposal
+    
     mutable std::mutex job_mutex;
     
     // Statistics
@@ -215,6 +229,7 @@ private:
     void jobBroadcasterLoop();
     void solutionSubmitterLoop();
     void healthMonitorLoop();
+    void tipMonitorLoop();  // Fast tip monitoring for stale detection
     
     // ========== Internal Helpers ==========
     

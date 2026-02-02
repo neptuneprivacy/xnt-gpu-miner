@@ -6,6 +6,7 @@
 #include "pow.cuh"
 #include "digest.cuh"
 #include "common.cuh"
+#include <algorithm>
 
 // ============================================================================
 // Singleton Instance
@@ -100,24 +101,22 @@ bool SoloMiningClient::submitSolution(
         return false;
     }
     
-    // Check if template is stale
+    // Check if template is stale by comparing prev_block with current tip
     std::string tip_digest = rpc_client->getTipDigest();
     
+    std::string prev_block;
     if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
         json metadata = template_obj["metadata"];
-        std::string prev_block;
         if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
             prev_block = metadata.value("prevBlock", "");
         } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
             prev_block = metadata.value("prev_block", "");
         }
+    }
 
-        if (!prev_block.empty() && tip_digest != prev_block) {
-            std::string short_prev = prev_block.length() > 20 ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) : prev_block;
-            std::string short_tip = tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest;
-            std::cout << "[SUBMIT] " << Color::RED << "STALE: Template stale (prev_block=" << short_prev << " != tip=" << short_tip << ")" << Color::RESET << std::endl;
-            return false;
-        }
+    if (!prev_block.empty() && tip_digest != prev_block) {
+        std::cout << "[SUBMIT] " << Color::RED << "STALE: Template stale (new block arrived)" << Color::RESET << std::endl;
+        return false;
     }
     
     // Extract the block from template
@@ -132,15 +131,19 @@ bool SoloMiningClient::submitSolution(
         std::cout << "[SUBMIT] ERROR: Block missing 'kernel' field" << std::endl;
         return false;
     }
-    
+
     json kernel_obj = block_obj["kernel"];
-    
     if (!kernel_obj.contains("appendix") || kernel_obj["appendix"].is_null()) {
-        kernel_obj["appendix"] = json::array();
-        block_obj["kernel"] = kernel_obj;
-    } else if (!kernel_obj["appendix"].is_array()) {
-        kernel_obj["appendix"] = json::array();
-        block_obj["kernel"] = kernel_obj;
+        std::cout << "[SUBMIT] ERROR: Block kernel missing 'appendix' field" << std::endl;
+        return false;
+    }
+    if (!kernel_obj["appendix"].is_array()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel 'appendix' is not an array" << std::endl;
+        return false;
+    }
+    if (kernel_obj["appendix"].empty()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel 'appendix' is empty" << std::endl;
+        return false;
     }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
@@ -186,6 +189,12 @@ bool SoloMiningClient::submitSolution(
         }
         
         std::cout << "[SUBMIT] " << Color::RED << "REJECTED: " << error_reason << Color::RESET << std::endl;
+        
+        // Store error reason for InvalidBlock detection
+        {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            last_error_reason = error_reason;
+        }
     } else {
         std::cout << "[SUBMIT] " << Color::RED << "REJECTED: No response from server" << Color::RESET << std::endl;
     }
@@ -199,6 +208,11 @@ std::string SoloMiningClient::getTipDigest() {
         return "";
     }
     return rpc_client->getTipDigest();
+}
+
+std::string SoloMiningClient::getLastError() const {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    return last_error_reason;
 }
 
 uint64_t SoloMiningClient::getChainHeight() {
@@ -294,6 +308,11 @@ bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string&
     solution_submitter_thread = std::thread(&ConnectionMultiplexer::solutionSubmitterLoop, this);
     health_monitor_thread = std::thread(&ConnectionMultiplexer::healthMonitorLoop, this);
     
+    // Start tip monitor for solo mode (fast stale detection)
+    if (mining_mode == MiningMode::Solo) {
+        tip_monitor_thread = std::thread(&ConnectionMultiplexer::tipMonitorLoop, this);
+    }
+    
     std::cout << Color::GREEN << "Connection multiplexer started" << Color::RESET << std::endl;
     
     return true;
@@ -319,6 +338,9 @@ void ConnectionMultiplexer::shutdown() {
     }
     if (health_monitor_thread.joinable()) {
         health_monitor_thread.join();
+    }
+    if (tip_monitor_thread.joinable()) {
+        tip_monitor_thread.join();
     }
     
     // Clear workers
@@ -505,10 +527,10 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                 should_poll = true;
             }
 
-            // Also poll if we have no template yet
+            // Also poll if we have no template yet or if we're composing (waiting for new proposal)
             {
                 std::lock_guard<std::mutex> lock(job_mutex);
-                if (last_template_id.empty()) {
+                if (last_template_id.empty() || composing_new_block.load()) {
                     should_poll = true;
                 }
             }
@@ -521,14 +543,24 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                     json result = template_response["result"];
 
                     if (!result.contains("template") || result["template"].is_null()) {
-                        // Template null, node may be syncing
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        // Template null - node is still composing, keep waiting
+                        if (composing_new_block.load()) {
+                            // Poll more frequently during composition
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
                         continue;
                     }
 
                     json template_obj = result["template"];
                     if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        // Invalid template - node still composing
+                        if (composing_new_block.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
                         continue;
                     }
 
@@ -551,19 +583,50 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                             std::string tip_digest = client->getTipDigest();
 
                             if (prev_block.empty() || prev_block == tip_digest) {
-                                last_template_id = template_id;
-                                is_new_template = true;
-
-                                stats.total_jobs_fetched++;
-                                {
-                                    std::lock_guard<std::mutex> time_lock(stats.time_mutex);
-                                    stats.last_job_time = std::chrono::steady_clock::now();
+                                // If prev_block matches tip, the proposal is valid - start mining immediately
+                                bool should_resume = true;
+                                bool is_composing = composing_new_block.load();
+                                
+                                if (is_composing) {
+                                    // First valid proposal after tip change - start mining immediately
+                                    composing_new_block.store(false);
+                                    recovery_mode.store(false);
+                                    proposals_seen_for_tip.store(0);
+                                    first_proposal_prev_block.clear();
+                                    std::cout << "[JobBroadcaster] " << Color::GREEN 
+                                              << "Valid proposal received (prev_block matches tip), resuming mining" 
+                                              << Color::RESET << std::endl;
+                                    should_resume = true;
                                 }
+
+                                // Always update template_id and tip tracking
+                                last_template_id = template_id;
+                                current_tip_digest = tip_digest;
+                                
+                                if (should_resume) {
+                                    is_new_template = true;
+                                    stats.total_jobs_fetched++;
+                                    {
+                                        std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                                        stats.last_job_time = std::chrono::steady_clock::now();
+                                    }
+                                }
+                                // If not resuming (first proposal after tip change), don't set is_new_template
+                                // This prevents broadcasting until we have a stable proposal
                             }
                         }
                     }
 
                     if (is_new_template) {
+                        // Resume workers when we have a stable new proposal
+                        {
+                            std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                            for (const auto& worker : workers) {
+                                if (worker && worker->active && worker->resources) {
+                                    worker->resources->set_paused(false);
+                                }
+                            }
+                        }
                         broadcastJobToWorkers(template_response);
                     }
                 }
@@ -648,14 +711,132 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
         return false;
     }
     
+    // Reject submissions during composition gap (no valid proposal exists yet)
+    if (composing_new_block.load()) {
+        std::cout << "[SUBMIT] " << Color::YELLOW
+                  << "STALE: Node composing new block, no valid proposal yet" 
+                  << Color::RESET << std::endl;
+        return false;
+    }
+    
     stats.total_solutions_submitted++;
     bool accepted = false;
+    bool is_invalid_block = false;  // Declare outside try block for use after catch
     try {
+        // For solo mode, refresh the template on submission to ensure
+        // the appendix claims are current for this proposal.
+        if (mining_mode == MiningMode::Solo) {
+            json template_response = client->getBlockTemplate(wallet_address);
+            if (template_response.empty() || !template_response.contains("result")) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "No template response on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json result = template_response["result"];
+            if (!result.contains("template") || result["template"].is_null()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json template_obj = result["template"];
+            if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template metadata missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json metadata = template_obj["metadata"];
+            std::string template_id = metadata.contains("digest")
+                ? metadata.value("digest", "") : "";
+
+            auto normalize_digest = [](std::string value) {
+                if (value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+                    value = value.substr(2);
+                }
+                for (auto& ch : value) {
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                }
+                return value;
+            };
+
+            if (template_id.empty()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template digest missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+
+            if (normalize_digest(template_id) != normalize_digest(submission.proposal_id)) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template digest mismatch on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+
+            // Additional validation: Ensure the block body (transaction kernel) hasn't changed
+            // by comparing a hash of the transaction kernel structure
+            json fresh_block = template_obj["block"];
+            json original_block = submission.template_obj["block"];
+            
+            if (fresh_block.contains("kernel") && original_block.contains("kernel")) {
+                json fresh_kernel = fresh_block["kernel"];
+                json original_kernel = original_block["kernel"];
+                
+                // Compare transaction kernel body fields that affect the MAST hash
+                // If these differ, the appendix claims will be invalid
+                auto kernel_body_hash = [](const json& kernel) -> std::string {
+                    if (!kernel.contains("body") || kernel["body"].is_null()) {
+                        return "";
+                    }
+                    json body = kernel["body"];
+                    // Create a simple hash from key transaction kernel fields
+                    std::ostringstream oss;
+                    if (body.contains("transactionKernel")) {
+                        json tk = body["transactionKernel"];
+                        if (tk.contains("fee")) oss << tk["fee"].dump();
+                        if (tk.contains("coinbase")) oss << tk["coinbase"].dump();
+                        if (tk.contains("timestamp")) oss << tk["timestamp"].dump();
+                        if (tk.contains("mutatorSetHash")) oss << tk["mutatorSetHash"].dump();
+                    }
+                    return oss.str();
+                };
+                
+                std::string fresh_hash = kernel_body_hash(fresh_kernel);
+                std::string original_hash = kernel_body_hash(original_kernel);
+                
+                if (fresh_hash != original_hash) {
+                    std::cout << "[SUBMIT] " << Color::YELLOW
+                              << "Transaction kernel body changed on refresh, dropping submission" 
+                              << Color::RESET << std::endl;
+                    return false;
+                }
+            }
+
+            // Always use the freshly fetched template for submission
+            submission.template_obj = template_obj;
+        }
+
         accepted = client->submitSolution(
             submission.proposal_id,
             submission.pow_solution,
             submission.solution_hash,
             submission.template_obj);
+            
+        // Check if the rejection was due to InvalidBlock
+        if (!accepted && mining_mode == MiningMode::Solo) {
+            SoloMiningClient* solo_client = dynamic_cast<SoloMiningClient*>(client.get());
+            if (solo_client) {
+                std::string error = solo_client->getLastError();
+                std::string error_lower = error;
+                std::transform(error_lower.begin(), error_lower.end(), error_lower.begin(), ::tolower);
+                if (error_lower.find("invalidblock") != std::string::npos || 
+                    error_lower.find("invalid block") != std::string::npos) {
+                    is_invalid_block = true;
+                }
+            }
+        }
     } catch (const std::exception& e) {
         std::cerr << "[Submit] Exception: " << e.what() << std::endl;
         accepted = false;
@@ -666,8 +847,47 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
     
     if (accepted) {
         stats.total_solutions_accepted++;
+        // Reset rejection counter on success
+        consecutive_rejections.store(0);
+        recovery_mode.store(false);
     } else {
         stats.total_solutions_rejected++;
+        
+        // Only invalidate on actual InvalidBlock errors, not InsufficientWork
+        if (is_invalid_block && !composing_new_block.load()) {
+            std::cout << "[SUBMIT] " << Color::YELLOW
+                      << "InvalidBlock error detected, invalidating template and forcing refresh" 
+                      << Color::RESET << std::endl;
+            
+            // Clear template to force immediate refresh
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                last_template_id.clear();
+            }
+            
+            // Set recovery mode - wait for second proposal (same as normal mode)
+            // First proposal after InvalidBlock is still unstable
+            recovery_mode.store(true);
+            proposals_seen_for_tip.store(0);
+            first_proposal_prev_block.clear();
+            composing_new_block.store(true);
+            
+            // Pause workers temporarily until new template arrives
+            {
+                std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                for (const auto& worker : workers) {
+                    if (worker && worker->active && worker->resources) {
+                        worker->resources->set_paused(true);
+                    }
+                }
+            }
+            
+            // Reset counter
+            consecutive_rejections.store(0);
+        } else {
+            // Reset counter on success or non-InvalidBlock errors
+            consecutive_rejections.store(0);
+        }
     }
     
     {
@@ -766,4 +986,83 @@ bool ConnectionMultiplexer::attemptReconnection() {
     std::cout << Color::RED << "[Multiplexer] Failed to reconnect after " 
               << attempt << " attempts" << Color::RESET << std::endl;
     return false;
+}
+
+void ConnectionMultiplexer::tipMonitorLoop() {
+    try {
+        LOG_DEBUG("[TipMonitor] Started");
+        
+        // Check tip every 500ms for fast stale detection
+        const auto TIP_CHECK_INTERVAL = std::chrono::milliseconds(500);
+        
+        while (running.load() && !stop_mining) {
+            std::this_thread::sleep_for(TIP_CHECK_INTERVAL);
+            
+            if (!client || !client->is_connected()) {
+                continue;
+            }
+            
+            // Get current tip from node
+            std::string new_tip = client->getTipDigest();
+            if (new_tip.empty()) {
+                continue;
+            }
+            
+            bool tip_changed = false;
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                if (!current_tip_digest.empty() && current_tip_digest != new_tip) {
+                    tip_changed = true;
+                    std::string short_old = current_tip_digest.length() > 16 ? 
+                        current_tip_digest.substr(0, 8) + "..." + current_tip_digest.substr(current_tip_digest.length() - 8) : 
+                        current_tip_digest;
+                    std::string short_new = new_tip.length() > 16 ? 
+                        new_tip.substr(0, 8) + "..." + new_tip.substr(new_tip.length() - 8) : 
+                        new_tip;
+                    std::cout << "[TipMonitor] " << Color::YELLOW << "New block detected!" << Color::RESET
+                              << " Tip: " << short_old << " -> " << short_new << std::endl;
+                }
+                current_tip_digest = new_tip;
+            }
+            
+            if (tip_changed) {
+                // Set composing flag - we're waiting for a valid new proposal
+                composing_new_block.store(true);
+                proposals_seen_for_tip.store(0);
+                first_proposal_prev_block.clear();
+                
+                // Immediately pause all workers - their templates are now stale
+                {
+                    std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                    for (const auto& worker : workers) {
+                        if (worker && worker->active && worker->resources) {
+                            worker->resources->set_paused(true);
+                            if (worker->resources->event_handler) {
+                                worker->resources->event_handler->postEvent(EventType::TIP_CHANGED);
+                            }
+                        }
+                    }
+                }
+                
+                // Clear the last template ID to force immediate fetch
+                {
+                    std::lock_guard<std::mutex> lock(job_mutex);
+                    last_template_id.clear();
+                }
+                
+                std::cout << "[TipMonitor] " << Color::YELLOW 
+                          << "Node composing new block, waiting for valid proposal..." 
+                          << Color::RESET << std::endl;
+                
+                // Don't fetch here - let jobBroadcasterLoop handle it with retries
+                // This ensures we wait until a valid proposal is ready
+            }
+        }
+        
+        LOG_DEBUG("[TipMonitor] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[TipMonitor] Exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[TipMonitor] Unknown exception" << std::endl;
+    }
 }

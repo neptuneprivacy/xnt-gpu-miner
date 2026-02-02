@@ -472,14 +472,14 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
     
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
+        // Check for new events (new puzzle) - even when paused
+        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
+            break; // Break to let handleNewPuzzle process the new job
+        }
+        
         if (gpu_res->gpu_pause_flag) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
-        }
-        
-        // Check for new events (new puzzle)
-        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
-            break;
         }
         
         if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
@@ -488,11 +488,11 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         }
         
         std::string proposal_id;
-        json template_obj;
+        json template_for_this_batch;
         {
             std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
             proposal_id = gpu_res->current_proposal_id;
-            template_obj = gpu_res->current_template;
+            template_for_this_batch = gpu_res->current_template;  // Capture template with proposal_id
         }
         
         if (proposal_id.empty()) {
@@ -623,6 +623,21 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         
         if (result.has_value()) {
             gpu_res->solutions_found++;
+            
+            // Check if proposal has changed - if so, this solution is for a stale template
+            std::string current_proposal_id;
+            {
+                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                current_proposal_id = gpu_res->current_proposal_id;
+            }
+            
+            if (current_proposal_id != proposal_id) {
+                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
+                          << "Solution discarded - template changed during mining" << Color::RESET << std::endl;
+                // Don't count as rejected since we caught it ourselves
+                continue;
+            }
+            
             const char* submit_target = gpu_res->is_stratum_mode() ? "pool" : "node";
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
                       << "*** SOLUTION FOUND! ***" << Color::RESET 
@@ -631,33 +646,13 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
                 Digest solution_hash = mast_paths.fast_mast_hash(result.value());
                 
-                // Get fresh template_obj (may have been updated)
-                json current_template_obj;
-                {
-                    std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                    current_template_obj = gpu_res->current_template;
-                }
-                
-                // Verify proposal_id still matches before submitting
-                std::string current_proposal_id;
-                {
-                    std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                    current_proposal_id = gpu_res->current_proposal_id;
-                }
-                
-                if (current_proposal_id != proposal_id) {
-                    // Proposal changed, skip submission
-                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW
-                              << "Proposal changed, skipping stale solution" << Color::RESET << std::endl;
-                    continue;
-                }
-                
-            // Submit through multiplexer (async, get future)
+            // Use the template captured at the start of this mining batch
+            // This ensures we submit with the same template we were mining for
             auto future = worker->submitSolution(
                     proposal_id,
                     result.value(),
                     solution_hash,
-                    current_template_obj
+                    template_for_this_batch
                 );
                 
             // Wait for result (with timeout)

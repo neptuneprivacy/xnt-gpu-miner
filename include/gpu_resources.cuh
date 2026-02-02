@@ -13,7 +13,8 @@ enum class EventType {
     SOLUTION_FOUND,
     STOP_MINING,
     RECONNECT,
-    ERROR_EVENT
+    ERROR_EVENT,
+    TIP_CHANGED  // New block arrived, current template is stale
 };
 
 struct MiningEvent {
@@ -44,6 +45,7 @@ struct MiningEvent {
             case EventType::STOP_MINING: return "STOP_MINING";
             case EventType::RECONNECT: return "RECONNECT";
             case EventType::ERROR_EVENT: return "ERROR";
+            case EventType::TIP_CHANGED: return "TIP_CHANGED";
             default: return "UNKNOWN";
         }
     }

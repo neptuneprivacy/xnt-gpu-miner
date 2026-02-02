@@ -96,16 +96,13 @@ bool NeptuneCudaMinerClient::submit_solution(
     
     json kernel_obj = block_obj["kernel"];
     
-    // Check if appendix exists, if not create empty array
-    // If it exists but is not an array, ensure it's properly structured
-    if (!kernel_obj.contains("appendix") || kernel_obj["appendix"].is_null()) {
-        std::cout << "[SUBMIT] WARNING: Block kernel missing 'appendix', adding empty array" << std::endl;
-        kernel_obj["appendix"] = json::array();
-        block_obj["kernel"] = kernel_obj;
-    } else if (!kernel_obj["appendix"].is_array()) {
-        std::cout << "[SUBMIT] WARNING: Block kernel 'appendix' is not an array, fixing structure" << std::endl;
-        kernel_obj["appendix"] = json::array();
-        block_obj["kernel"] = kernel_obj;
+    // Debug: Log the kernel structure
+    bool has_appendix = kernel_obj.contains("appendix") && !kernel_obj["appendix"].is_null();
+    if (has_appendix && kernel_obj["appendix"].is_array()) {
+        LOG_DEBUG("[SUBMIT] kernel.appendix has " << kernel_obj["appendix"].size() << " claims");
+    } else {
+        std::cout << "[SUBMIT] " << Color::YELLOW << "WARNING: Block kernel missing valid 'appendix' - template may be incomplete" << Color::RESET << std::endl;
+        // Don't override with empty array - the node requires the proper appendix claims
     }
     
     json pow_json = powToRpcFormat(pow_solution, solution_hash);
