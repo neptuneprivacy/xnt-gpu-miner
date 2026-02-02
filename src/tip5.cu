@@ -289,6 +289,32 @@ __device__ void generated_function(const uint64_t* input, uint64_t* output) {
     output[15] = node_159 - node_1657;
 }
 
+// Optimized sbox that takes pre-loaded shared LUT (no syncthreads)
+__device__ __forceinline__ void sbox_layer_fast(const uint64_t* __restrict__ state_in, 
+                                                  uint64_t* __restrict__ state_out,
+                                                  const uint8_t* __restrict__ shared_lut) {
+    // First 4 elements use S-box lookup
+    state_out[0] = split_lookup_shared(state_in[0], shared_lut);
+    state_out[1] = split_lookup_shared(state_in[1], shared_lut);
+    state_out[2] = split_lookup_shared(state_in[2], shared_lut);
+    state_out[3] = split_lookup_shared(state_in[3], shared_lut);
+    
+    // Remaining 12 elements use x^7
+    state_out[4] = x7_computer(state_in[4]);
+    state_out[5] = x7_computer(state_in[5]);
+    state_out[6] = x7_computer(state_in[6]);
+    state_out[7] = x7_computer(state_in[7]);
+    state_out[8] = x7_computer(state_in[8]);
+    state_out[9] = x7_computer(state_in[9]);
+    state_out[10] = x7_computer(state_in[10]);
+    state_out[11] = x7_computer(state_in[11]);
+    state_out[12] = x7_computer(state_in[12]);
+    state_out[13] = x7_computer(state_in[13]);
+    state_out[14] = x7_computer(state_in[14]);
+    state_out[15] = x7_computer(state_in[15]);
+}
+
+// Legacy sbox_layer that loads its own shared memory (for backward compatibility)
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
     __shared__ uint8_t shared_lut[256];
     int tid = threadIdx.x;
@@ -302,49 +328,7 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     }
     __syncthreads();
     
-    ulonglong2 v0 = *reinterpret_cast<const ulonglong2*>(&state_in[0]);
-    ulonglong2 v1 = *reinterpret_cast<const ulonglong2*>(&state_in[2]);
-    ulonglong2 v2 = *reinterpret_cast<const ulonglong2*>(&state_in[4]);
-    ulonglong2 v3 = *reinterpret_cast<const ulonglong2*>(&state_in[6]);
-    ulonglong2 v4 = *reinterpret_cast<const ulonglong2*>(&state_in[8]);
-    ulonglong2 v5 = *reinterpret_cast<const ulonglong2*>(&state_in[10]);
-    ulonglong2 v6 = *reinterpret_cast<const ulonglong2*>(&state_in[12]);
-    ulonglong2 v7 = *reinterpret_cast<const ulonglong2*>(&state_in[14]);
-    
-    uint64_t e0 = v0.x, e1 = v0.y;
-    uint64_t e2 = v1.x, e3 = v1.y;
-    uint64_t e4 = v2.x, e5 = v2.y;
-    uint64_t e6 = v3.x, e7 = v3.y;
-    uint64_t e8 = v4.x, e9 = v4.y;
-    uint64_t e10 = v5.x, e11 = v5.y;
-    uint64_t e12 = v6.x, e13 = v6.y;
-    uint64_t e14 = v7.x, e15 = v7.y;
-    
-    e0 = split_lookup_shared(e0, shared_lut);
-    e1 = split_lookup_shared(e1, shared_lut);
-    e2 = split_lookup_shared(e2, shared_lut);
-    e3 = split_lookup_shared(e3, shared_lut);
-    e4 = x7_computer(e4);
-    e5 = x7_computer(e5);
-    e6 = x7_computer(e6);
-    e7 = x7_computer(e7);
-    e8 = x7_computer(e8);
-    e9 = x7_computer(e9);
-    e10 = x7_computer(e10);
-    e11 = x7_computer(e11);
-    e12 = x7_computer(e12);
-    e13 = x7_computer(e13);
-    e14 = x7_computer(e14);
-    e15 = x7_computer(e15);
-    
-    *reinterpret_cast<ulonglong2*>(&state_out[0]) = make_ulonglong2(e0, e1);
-    *reinterpret_cast<ulonglong2*>(&state_out[2]) = make_ulonglong2(e2, e3);
-    *reinterpret_cast<ulonglong2*>(&state_out[4]) = make_ulonglong2(e4, e5);
-    *reinterpret_cast<ulonglong2*>(&state_out[6]) = make_ulonglong2(e6, e7);
-    *reinterpret_cast<ulonglong2*>(&state_out[8]) = make_ulonglong2(e8, e9);
-    *reinterpret_cast<ulonglong2*>(&state_out[10]) = make_ulonglong2(e10, e11);
-    *reinterpret_cast<ulonglong2*>(&state_out[12]) = make_ulonglong2(e12, e13);
-    *reinterpret_cast<ulonglong2*>(&state_out[14]) = make_ulonglong2(e14, e15);
+    sbox_layer_fast(state_in, state_out, shared_lut);
 }
 
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
@@ -476,13 +460,13 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
     }
 }
 
-__device__ void tip5_permutation(uint64_t* state) {
+// Optimized permutation using pre-loaded shared LUT - NO syncthreads inside!
+__device__ __forceinline__ void tip5_permutation_fast(uint64_t* state, const uint8_t* __restrict__ shared_lut) {
     uint64_t temp_state[STATE_SIZE];
     
-    // Original implementation - sbox_layer uses shared memory loaded by kernel
     #pragma unroll
     for (int round = 0; round < NUM_ROUNDS; ++round) {
-        sbox_layer(state, temp_state);
+        sbox_layer_fast(state, temp_state, shared_lut);
         mds_layer(temp_state, state);
         
         // Fused round constants addition
@@ -491,6 +475,24 @@ __device__ void tip5_permutation(uint64_t* state) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
         }
     }
+}
+
+// Legacy permutation - loads shared memory each time (slower but self-contained)
+__device__ void tip5_permutation(uint64_t* state) {
+    // Load shared LUT once for all rounds
+    __shared__ uint8_t shared_lut[256];
+    int tid = threadIdx.x;
+    
+    if (tid < 32) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int idx = tid * 8 + i;
+            shared_lut[idx] = LOOKUP_TABLE[idx];
+        }
+    }
+    __syncthreads();
+    
+    tip5_permutation_fast(state, shared_lut);
 }
 
 __host__ void tip5_permutation_host(uint64_t* state) {

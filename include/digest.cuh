@@ -125,6 +125,115 @@ __device__ __forceinline__ Digest tip5_hash_fixed_right_zero_device(const Digest
     return result;
 }
 
+// ========== FAST VERSIONS (use pre-loaded shared LUT) ==========
+
+__device__ __forceinline__ Digest tip5_hash_fixed_fast(const Digest& left, const Digest& right, 
+                                                        const uint8_t* __restrict__ shared_lut) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::FixedLength);
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        state[i] = left.values[i];
+        state[i + DIGEST_LEN] = right.values[i];
+    }
+    
+    tip5_permutation_fast(state, shared_lut);
+    
+    Digest result;
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
+
+__device__ __forceinline__ Digest tip5_hash_fixed_right_zero_fast(const Digest& left, 
+                                                                   const uint8_t* __restrict__ shared_lut) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::FixedLength);
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        state[i] = left.values[i];
+    }
+    #pragma unroll
+    for (int i = DIGEST_LEN; i < RATE; ++i) {
+        state[i] = 0;
+    }
+    
+    tip5_permutation_fast(state, shared_lut);
+    
+    Digest result;
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
+
+__device__ __forceinline__ Digest tip5_hash_varlen_fast(const uint64_t* input, size_t input_len,
+                                                         const uint8_t* __restrict__ shared_lut) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::VariableLength);
+    
+    size_t pos = 0;
+    while (pos + RATE <= input_len) {
+        #pragma unroll
+        for (size_t i = 0; i < RATE; i++) {
+            state[i] = input[pos + i];
+        }
+        tip5_permutation_fast(state, shared_lut);
+        pos += RATE;
+    }
+    
+    size_t remaining = input_len - pos;
+    
+    #pragma unroll
+    for (size_t i = 0; i < RATE; i++) {
+        state[i] = 0;
+    }
+    
+    for (size_t i = 0; i < remaining; i++) {
+        state[i] = input[pos + i];
+    }
+    
+    state[remaining] = BFE_ONE;
+    tip5_permutation_fast(state, shared_lut);
+    
+    Digest result;
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
+
+__device__ __forceinline__ Digest tip5_hash_varlen_len5_fast(const Digest& in,
+                                                              const uint8_t* __restrict__ shared_lut) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::VariableLength);
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        state[i] = in.values[i];
+    }
+    state[DIGEST_LEN] = BFE_ONE;
+    #pragma unroll
+    for (int i = DIGEST_LEN + 1; i < RATE; ++i) {
+        state[i] = 0;
+    }
+    
+    tip5_permutation_fast(state, shared_lut);
+    
+    Digest result;
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
+
 __device__ __forceinline__ Digest tip5_hash_varlen_len5_device(const Digest& in) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);

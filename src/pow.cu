@@ -157,6 +157,52 @@ __device__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const 
     return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), kernel[0]);
 }
 
+// FAST version using pre-loaded shared LUT - no syncthreads!
+__device__ __forceinline__ Digest fast_mast_hash_with_lut(const Pow& pow_obj, 
+                                                           const PowMastPaths& mast_paths,
+                                                           const uint8_t* __restrict__ shared_lut) {
+    constexpr size_t POW_ENCODING_WORDS = 5 + 2 * MERKLE_TREE_HEIGHT_ * 5 + 5;
+    uint64_t encoding[POW_ENCODING_WORDS];
+    int idx = 0;
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        encoding[idx++] = pow_obj.nonce.values[i];
+    }
+    
+    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        #pragma unroll
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            encoding[idx++] = pow_obj.path_b[i].values[j];
+        }
+    }
+
+    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        #pragma unroll
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            encoding[idx++] = pow_obj.path_a[i].values[j];
+        }
+    }
+    
+    #pragma unroll
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        encoding[idx++] = pow_obj.root.values[i];
+    }
+    
+    // Use fast hash functions with pre-loaded LUT
+    Digest pow_encoding_digest = tip5_hash_varlen_fast(encoding, idx, shared_lut);
+    Digest header_mast_hash = tip5_hash_fixed_fast(pow_encoding_digest, mast_paths.pow[0], shared_lut);
+    header_mast_hash = tip5_hash_fixed_fast(header_mast_hash, mast_paths.pow[1], shared_lut);
+    header_mast_hash = tip5_hash_fixed_fast(mast_paths.pow[2], header_mast_hash, shared_lut);
+    
+    Digest kernel_mast_hash = tip5_hash_fixed_fast(tip5_hash_varlen_len5_fast(header_mast_hash, shared_lut), 
+                                                    mast_paths.header[0], shared_lut);
+    kernel_mast_hash = tip5_hash_fixed_fast(kernel_mast_hash, mast_paths.header[1], shared_lut);
+    
+    return tip5_hash_fixed_fast(tip5_hash_varlen_len5_fast(kernel_mast_hash, shared_lut), 
+                                 mast_paths.kernel[0], shared_lut);
+}
+
 VramMode detect_vram_mode(int gpu_id) {
     cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, gpu_id);
@@ -795,6 +841,22 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     #pragma unroll 4
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         indexer = tip5_hash_fixed_right_zero_device(indexer);
+    }
+
+    index_a = indexer.values[0] & MERKLE_INDEX_MASK;
+    index_b = indexer.values[1] & MERKLE_INDEX_MASK;
+}
+
+// FAST version using pre-loaded shared LUT - no syncthreads!
+__device__ __forceinline__ void Pow_indices_fast(const Digest& hash, const Digest& nonce, 
+                                                   uint64_t& index_a, uint64_t& index_b,
+                                                   const uint8_t* __restrict__ shared_lut) {
+    Digest indexer = tip5_hash_fixed_fast(hash, nonce, shared_lut);
+    
+    // Unrolled loop for 62 iterations of right-zero hash
+    #pragma unroll 4
+    for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
+        indexer = tip5_hash_fixed_right_zero_fast(indexer, shared_lut);
     }
 
     index_a = indexer.values[0] & MERKLE_INDEX_MASK;

@@ -239,6 +239,9 @@ __host__ inline uint32_t get_mds_coeff_host(int i, int j) {
 }
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out);
+__device__ __forceinline__ void sbox_layer_fast(const uint64_t* __restrict__ state_in, 
+                                                  uint64_t* __restrict__ state_out,
+                                                  const uint8_t* __restrict__ shared_lut);
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out);
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out);
 __device__ void generated_function(const uint64_t* input, uint64_t* output);
@@ -248,6 +251,7 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void round_constants_layer_host(int round_index, const uint64_t* state_in, uint64_t* state_out);
 
 __device__ void tip5_permutation(uint64_t* state);
+__device__ __forceinline__ void tip5_permutation_fast(uint64_t* state, const uint8_t* __restrict__ shared_lut);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {

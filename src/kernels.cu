@@ -166,8 +166,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         nonce_digest.values[4] = 0;
         
         // Compute indices from index picker preimage and nonce
+        // Use FAST version with pre-loaded shared LUT (no syncthreads!)
         uint64_t index_a, index_b;
-        Pow_indices_device(hash, nonce_digest, index_a, index_b);
+        Pow_indices_fast(hash, nonce_digest, index_a, index_b, s_lookup_table);
         
         // Paths are ALWAYS computed using original indices (matching Rust guess())
         // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
@@ -221,7 +222,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
             pow.path_b[i] = path_b[i];
         }
         
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
+        // Use FAST version with pre-loaded shared LUT (no syncthreads!)
+        Digest final_hash = fast_mast_hash_with_lut(pow, mast_paths, s_lookup_table);
         
         // Check against target - optimized comparison
         // Most hashes will fail on the highest limb, so check it first
@@ -313,8 +315,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = nonce_value;
         
+        // Use FAST version with pre-loaded shared LUT (no syncthreads!)
         uint64_t index_a, index_b;
-        Pow_indices_device(hash, nonce_digest, index_a, index_b);
+        Pow_indices_fast(hash, nonce_digest, index_a, index_b, s_lookup_table);
         
         // Paths are ALWAYS computed using original indices (matching Rust guess())
         // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
@@ -379,7 +382,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
             pow.path_b[i] = path_b[i];
         }
         
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
+        // Use FAST version with pre-loaded shared LUT (no syncthreads!)
+        Digest final_hash = fast_mast_hash_with_lut(pow, mast_paths, s_lookup_table);
         
         // Check against target - optimized comparison (low VRAM version)
         // Most hashes will fail on the highest limb, so check it first

@@ -188,6 +188,17 @@ __device__ void Pow_indices_device(
     const Digest& hash, const Digest& nonce, 
     uint64_t& index_a, uint64_t& index_b);
 
+// FAST versions using pre-loaded shared LUT (no __syncthreads inside)
+__device__ __forceinline__ void Pow_indices_fast(
+    const Digest& hash, const Digest& nonce, 
+    uint64_t& index_a, uint64_t& index_b,
+    const uint8_t* __restrict__ shared_lut);
+
+__device__ __forceinline__ Digest fast_mast_hash_with_lut(
+    const Pow& pow_obj, 
+    const PowMastPaths& mast_paths,
+    const uint8_t* __restrict__ shared_lut);
+
 uint64_t generate_secure_random_start(
     const std::string& puzzle_id, int gpu_id, 
     const std::string& worker_id = "", const std::string& gpu_uuid = "");
