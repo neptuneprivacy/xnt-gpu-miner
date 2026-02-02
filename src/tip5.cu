@@ -485,6 +485,36 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
     }
 }
 
+// Optimized split_lookup using constant memory (for use in tip5.cu)
+__device__ __forceinline__ uint64_t split_lookup_const(uint64_t element_in) {
+    uint64_t lo1 = element_in * R2;
+    uint64_t hi1 = __umul64hi(element_in, R2);
+    uint64_t reduced_in = montyred_from_parts(hi1, lo1);
+    
+    uint8_t addr0 = (uint8_t)(reduced_in >> 0);
+    uint8_t addr1 = (uint8_t)(reduced_in >> 8);
+    uint8_t addr2 = (uint8_t)(reduced_in >> 16);
+    uint8_t addr3 = (uint8_t)(reduced_in >> 24);
+    uint8_t addr4 = (uint8_t)(reduced_in >> 32);
+    uint8_t addr5 = (uint8_t)(reduced_in >> 40);
+    uint8_t addr6 = (uint8_t)(reduced_in >> 48);
+    uint8_t addr7 = (uint8_t)(reduced_in >> 56);
+    
+    uint64_t b0 = LOOKUP_TABLE[addr0];
+    uint64_t b1 = LOOKUP_TABLE[addr1];
+    uint64_t b2 = LOOKUP_TABLE[addr2];
+    uint64_t b3 = LOOKUP_TABLE[addr3];
+    uint64_t b4 = LOOKUP_TABLE[addr4];
+    uint64_t b5 = LOOKUP_TABLE[addr5];
+    uint64_t b6 = LOOKUP_TABLE[addr6];
+    uint64_t b7 = LOOKUP_TABLE[addr7];
+    
+    uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
+                        (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+    
+    return montyred_from_parts(0, sbox_out);
+}
+
 __device__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
     
@@ -492,7 +522,6 @@ __device__ void tip5_permutation(uint64_t* state) {
     #pragma unroll
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         // Inline S-box layer for first 4 elements (lookup) and rest (x^7)
-        // This avoids shared memory sync overhead per round
         
         // Load state into registers
         uint64_t s0 = state[0], s1 = state[1], s2 = state[2], s3 = state[3];
@@ -500,11 +529,11 @@ __device__ void tip5_permutation(uint64_t* state) {
         uint64_t s8 = state[8], s9 = state[9], s10 = state[10], s11 = state[11];
         uint64_t s12 = state[12], s13 = state[13], s14 = state[14], s15 = state[15];
         
-        // S-box: first 4 use lookup, rest use x^7
-        temp_state[0] = split_lookup_shared(s0, s_lookup_table);
-        temp_state[1] = split_lookup_shared(s1, s_lookup_table);
-        temp_state[2] = split_lookup_shared(s2, s_lookup_table);
-        temp_state[3] = split_lookup_shared(s3, s_lookup_table);
+        // S-box: first 4 use lookup (constant memory), rest use x^7
+        temp_state[0] = split_lookup_const(s0);
+        temp_state[1] = split_lookup_const(s1);
+        temp_state[2] = split_lookup_const(s2);
+        temp_state[3] = split_lookup_const(s3);
         temp_state[4] = x7_computer(s4);
         temp_state[5] = x7_computer(s5);
         temp_state[6] = x7_computer(s6);
