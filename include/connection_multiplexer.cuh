@@ -203,6 +203,8 @@ private:
     std::string last_template_id;
     std::string current_tip_digest;  // Track current chain tip for stale detection
     std::atomic<bool> composing_new_block{false};  // True when tip changed, waiting for valid new proposal
+    std::string first_proposal_prev_block;  // Track first proposal's prev_block after tip change
+    std::atomic<int> proposals_seen_for_tip{0};  // Count proposals seen for current tip
     mutable std::mutex job_mutex;
     
     // Statistics

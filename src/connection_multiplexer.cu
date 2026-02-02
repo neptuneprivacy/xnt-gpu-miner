@@ -538,29 +538,63 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                             std::string tip_digest = client->getTipDigest();
 
                             if (prev_block.empty() || prev_block == tip_digest) {
+                                // After tip change, wait for second proposal with same prev_block
+                                // First proposal often causes InvalidBlock errors
+                                bool should_resume = true;
+                                bool is_composing = composing_new_block.load();
+                                
+                                if (is_composing) {
+                                    int count = proposals_seen_for_tip.fetch_add(1) + 1;
+                                    
+                                    if (count == 1) {
+                                        // First proposal - record prev_block but don't resume yet
+                                        first_proposal_prev_block = prev_block;
+                                        should_resume = false;
+                                        std::cout << "[JobBroadcaster] " << Color::YELLOW 
+                                                  << "First proposal received (prev_block: " 
+                                                  << prev_block.substr(0, 16) << "...), waiting for second..." 
+                                                  << Color::RESET << std::endl;
+                                    } else if (count == 2 && prev_block == first_proposal_prev_block) {
+                                        // Second proposal with same prev_block - safe to resume
+                                        composing_new_block.store(false);
+                                        std::cout << "[JobBroadcaster] " << Color::GREEN 
+                                                  << "Stable proposal confirmed (2nd with same prev_block), resuming mining" 
+                                                  << Color::RESET << std::endl;
+                                        should_resume = true;
+                                    } else if (count >= 2 && prev_block != first_proposal_prev_block) {
+                                        // Prev_block changed, reset counter
+                                        proposals_seen_for_tip.store(1);
+                                        first_proposal_prev_block = prev_block;
+                                        should_resume = false;
+                                        std::cout << "[JobBroadcaster] " << Color::YELLOW 
+                                                  << "Prev_block changed, resetting proposal count" 
+                                                  << Color::RESET << std::endl;
+                                    } else {
+                                        // Still waiting
+                                        should_resume = false;
+                                    }
+                                }
+
+                                // Always update template_id and tip tracking
                                 last_template_id = template_id;
-                                current_tip_digest = tip_digest;  // Track current tip for stale detection
-                                is_new_template = true;
-
-                                // Clear composing flag - we have a valid new proposal
-                                if (composing_new_block.load()) {
-                                    composing_new_block.store(false);
-                                    std::cout << "[JobBroadcaster] " << Color::GREEN 
-                                              << "Valid new proposal received, resuming mining" 
-                                              << Color::RESET << std::endl;
+                                current_tip_digest = tip_digest;
+                                
+                                if (should_resume) {
+                                    is_new_template = true;
+                                    stats.total_jobs_fetched++;
+                                    {
+                                        std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                                        stats.last_job_time = std::chrono::steady_clock::now();
+                                    }
                                 }
-
-                                stats.total_jobs_fetched++;
-                                {
-                                    std::lock_guard<std::mutex> time_lock(stats.time_mutex);
-                                    stats.last_job_time = std::chrono::steady_clock::now();
-                                }
+                                // If not resuming (first proposal after tip change), don't set is_new_template
+                                // This prevents broadcasting until we have a stable proposal
                             }
                         }
                     }
 
                     if (is_new_template) {
-                        // Resume workers when we have a valid new proposal
+                        // Resume workers when we have a stable new proposal
                         {
                             std::shared_lock<std::shared_mutex> lock(workers_mutex);
                             for (const auto& worker : workers) {
@@ -916,6 +950,8 @@ void ConnectionMultiplexer::tipMonitorLoop() {
             if (tip_changed) {
                 // Set composing flag - we're waiting for a valid new proposal
                 composing_new_block.store(true);
+                proposals_seen_for_tip.store(0);
+                first_proposal_prev_block.clear();
                 
                 // Immediately pause all workers - their templates are now stale
                 {
@@ -937,7 +973,7 @@ void ConnectionMultiplexer::tipMonitorLoop() {
                 }
                 
                 std::cout << "[TipMonitor] " << Color::YELLOW 
-                          << "Node composing new block, waiting for valid proposal..." 
+                          << "Node composing new block, waiting for stable proposal..." 
                           << Color::RESET << std::endl;
                 
                 // Don't fetch here - let jobBroadcasterLoop handle it with retries
