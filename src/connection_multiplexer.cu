@@ -633,20 +633,56 @@ bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
         // the appendix claims are current for this proposal.
         if (mining_mode == MiningMode::Solo) {
             json template_response = client->getBlockTemplate(wallet_address);
-            if (!template_response.empty() && template_response.contains("result")) {
-                json result = template_response["result"];
-                if (result.contains("template") && !result["template"].is_null()) {
-                    json template_obj = result["template"];
-                    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
-                        json metadata = template_obj["metadata"];
-                        std::string template_id = metadata.contains("digest")
-                            ? metadata.value("digest", "") : "";
-                        if (!template_id.empty() && template_id == submission.proposal_id) {
-                            submission.template_obj = template_obj;
-                        }
-                    }
-                }
+            if (template_response.empty() || !template_response.contains("result")) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "No template response on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
             }
+            json result = template_response["result"];
+            if (!result.contains("template") || result["template"].is_null()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json template_obj = result["template"];
+            if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template metadata missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json metadata = template_obj["metadata"];
+            std::string template_id = metadata.contains("digest")
+                ? metadata.value("digest", "") : "";
+
+            auto normalize_digest = [](std::string value) {
+                if (value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+                    value = value.substr(2);
+                }
+                for (auto& ch : value) {
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                }
+                return value;
+            };
+
+            if (template_id.empty()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template digest missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+
+            if (normalize_digest(template_id) != normalize_digest(submission.proposal_id)) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template digest mismatch on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+
+            // Always use the freshly fetched template for submission
+            submission.template_obj = template_obj;
         }
 
         accepted = client->submitSolution(
