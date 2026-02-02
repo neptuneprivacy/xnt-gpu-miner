@@ -450,9 +450,12 @@ void calculate_mining_launch_config(
     // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
     //                                     parallel_mining_kernel_high_vram, 0, 0);
     
-    // Use multiple of SM count for good occupancy
+    // Calculate maximum blocks to launch for optimal GPU utilization
+    // Higher values allow more parallel blocks, improving performance for large nonce ranges
+    // Note: This is effectively a multiplier to allow sufficient blocks to be launched.
+    // The actual number of blocks is capped by needed_blocks and MAX_GRID_DIM_X.
     int num_sms = prop.multiProcessorCount;
-    int blocks_per_sm = 4; // Target occupancy
+    int blocks_per_sm = 128; // High value to allow maximum parallel blocks (capped by grid limits)
     int max_blocks = num_sms * blocks_per_sm;
     
     // Calculate blocks needed for nonces

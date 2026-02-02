@@ -210,7 +210,9 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     
     // Benchmark configuration
     const int BENCHMARK_DURATION_SEC = 10;        // Total benchmark duration
-    const uint64_t NONCES_PER_BATCH = 1000000;    // Nonces to test per mining batch
+    // Use GPU's optimal batch size for maximum performance
+    // For RTX 5090 (256 SMs), this will be ~20M nonces, reducing kernel launch overhead
+    uint64_t NONCES_PER_BATCH = gpu_res->optimal_max_nonces;
     
     // Extract the original difficulty threshold from the puzzle
     Digest original_threshold = hex_to_digest(puzzle.threshold);
