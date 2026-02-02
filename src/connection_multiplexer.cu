@@ -447,6 +447,39 @@ bool ConnectionMultiplexer::isConnected() const {
     return connected.load() && client && client->is_connected();
 }
 
+bool ConnectionMultiplexer::isTemplateStale(const json& template_obj) const {
+    if (!client || !client->is_connected()) {
+        return false; // Can't check if not connected
+    }
+    
+    if (template_obj.is_null() || template_obj.empty()) {
+        return false; // Empty template, can't determine staleness
+    }
+    
+    if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+        return false; // No metadata, can't check
+    }
+    
+    json metadata = template_obj["metadata"];
+    std::string prev_block;
+    if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+        prev_block = metadata.value("prevBlock", "");
+    } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+        prev_block = metadata.value("prev_block", "");
+    }
+    
+    if (prev_block.empty()) {
+        return false; // No prev_block, can't determine staleness
+    }
+    
+    std::string tip_digest = client->getTipDigest();
+    if (tip_digest.empty()) {
+        return false; // Can't get tip, assume not stale
+    }
+    
+    return prev_block != tip_digest;
+}
+
 void ConnectionMultiplexer::updateAllWorkersConnectionState(bool is_connected) {
     std::shared_lock<std::shared_mutex> lock(workers_mutex);
     for (const auto& worker : workers) {

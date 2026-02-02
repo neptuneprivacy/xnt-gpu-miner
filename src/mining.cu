@@ -500,6 +500,77 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             continue;
         }
         
+        // Check if template is stale - if so, pause mining and wait for new job
+        if (!template_obj.is_null() && !template_obj.empty()) {
+            auto& multiplexer = ConnectionMultiplexer::getInstance();
+            if (multiplexer.isTemplateStale(template_obj)) {
+                // Template is stale, pause mining to save GPU power
+                std::string prev_block = "unknown";
+                if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+                    json metadata = template_obj["metadata"];
+                    if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+                        prev_block = metadata.value("prevBlock", "");
+                    } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+                        prev_block = metadata.value("prev_block", "");
+                    }
+                }
+                std::string short_prev = prev_block.length() > 20 
+                    ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) 
+                    : prev_block;
+                
+                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW
+                          << "Template stale (prev_block=" << short_prev 
+                          << " != current tip), pausing mining to save power..." << Color::RESET << std::endl;
+                
+                gpu_res->set_paused(true);
+                
+                // Wait for new job or template update
+                while (!stop_mining && !gpu_res->gpu_stop_flag) {
+                    // Check if pause flag was cleared (new job received)
+                    if (!gpu_res->gpu_pause_flag) {
+                        break;
+                    }
+                    
+                    // Check for new events (new puzzle/job)
+                    if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
+                        break;
+                    }
+                    
+                    // Check if proposal ID changed (new template)
+                    std::string current_proposal_id;
+                    {
+                        std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                        current_proposal_id = gpu_res->current_proposal_id;
+                    }
+                    if (current_proposal_id != proposal_id) {
+                        break;
+                    }
+                    
+                    // Check if template is no longer stale
+                    json current_template;
+                    {
+                        std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                        current_template = gpu_res->current_template;
+                    }
+                    if (!current_template.is_null() && !current_template.empty()) {
+                        if (!multiplexer.isTemplateStale(current_template)) {
+                            break;
+                        }
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                
+                // Resume mining if we broke out of the wait loop
+                if (!stop_mining && !gpu_res->gpu_stop_flag) {
+                    gpu_res->set_paused(false);
+                    continue; // Start over to get fresh proposal_id and template_obj
+                }
+                
+                continue;
+            }
+        }
+        
         auto start_time = std::chrono::high_resolution_clock::now();
         uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
         Digest target;

@@ -151,6 +151,11 @@ public:
     bool isConnected() const;
     bool isRunning() const { return running.load(); }
     
+    // ========== Template Staleness Check ==========
+    
+    // Check if a template is stale (prev_block doesn't match current chain tip)
+    bool isTemplateStale(const json& template_obj) const;
+    
     // ========== Statistics ==========
     
     struct Stats {
