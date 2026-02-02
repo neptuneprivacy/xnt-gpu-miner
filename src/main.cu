@@ -262,29 +262,10 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
             
             // Extract solution components
             const MiningSolution& mining_solution = result.value();
-            const Pow& pow_solution = mining_solution.pow;
             const Digest& kernel_final_hash = mining_solution.kernel_final_hash;
             
-            // Convert to hex for display and comparison
+            // Convert to hex for display
             std::string kernel_final_hash_hex = digest_to_hex(kernel_final_hash);
-            
-            // Compute pow_digest on host using fast_mast_hash (same algorithm as Rust node)
-            // This allows us to compare kernel vs host computation for debugging
-            Digest pow_digest = gpu_res->buffer->mast_paths.fast_mast_hash(pow_solution);
-            std::string pow_digest_hex = digest_to_hex(pow_digest);
-            
-            // Debug output: Compare kernel's computation with host's computation
-            // This helps identify any discrepancies between device and host implementations
-            std::cout << "\n" << Color::BOLD << "[DEBUG] Solution found by kernel:" << Color::RESET << std::endl;
-            std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
-            std::cout << "  Host pow_digest:    " << pow_digest_hex << std::endl;
-            bool hashes_match = (kernel_final_hash.values[0] == pow_digest.values[0] &&
-                                kernel_final_hash.values[1] == pow_digest.values[1] &&
-                                kernel_final_hash.values[2] == pow_digest.values[2] &&
-                                kernel_final_hash.values[3] == pow_digest.values[3] &&
-                                kernel_final_hash.values[4] == pow_digest.values[4]);
-            std::cout << "  Hashes match: " << (hashes_match ? Color::GREEN : Color::RED) 
-                      << (hashes_match ? "YES" : "NO") << Color::RESET << std::endl;
             
             // Validate using the kernel's final_hash (the value the kernel actually checked)
             // This matches the Rust node's validation: final_hash <= threshold
@@ -320,10 +301,9 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
             } else {
                 invalid_threshold++;
                 // Log first few invalid solutions for debugging
-                // This indicates a potential mismatch between kernel and host validation logic
                 if (solutions_found <= 3) {
                     std::cout << "\n" << Color::YELLOW << "[VALIDATION] ✗ Solution does not meet threshold" << Color::RESET << std::endl;
-                    std::cout << "  " << Color::DIM << "Note: kernel_final_hash > threshold (kernel found this but validation fails)" << Color::RESET << std::endl;
+                    std::cout << "  " << Color::DIM << "Note: kernel_final_hash > threshold" << Color::RESET << std::endl;
                     std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
                     std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
                     std::cout << "  Meets threshold:   " << Color::RED << "NO" << Color::RESET << std::endl;
