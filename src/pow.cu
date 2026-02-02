@@ -110,63 +110,51 @@ Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
 }
 
 __device__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
-    // EXACT CPU LOGIC: Compute the encoding manually (correct size)
+    // OPTIMIZED: Compute the encoding with fully unrolled loops
     constexpr size_t POW_ENCODING_WORDS = 5 + 2 * MERKLE_TREE_HEIGHT_ * 5 + 5;
     uint64_t encoding[POW_ENCODING_WORDS]; // nonce + paths + root
     int idx = 0;
     
-    // Add nonce values first
+    // Add nonce values first - unrolled
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-            encoding[idx++] = pow_obj.nonce.values[i];
-        }
+        encoding[idx++] = pow_obj.nonce.values[i];
     }
     
-    // Add path_b values
+    // Add path_b values - partially unrolled inner loop
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
-            if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-                encoding[idx++] = pow_obj.path_b[i].values[j];
-            }
+            encoding[idx++] = pow_obj.path_b[i].values[j];
         }
     }
 
-    // Add path_a values
+    // Add path_a values - partially unrolled inner loop
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
-            if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-                encoding[idx++] = pow_obj.path_a[i].values[j];
-            }
+            encoding[idx++] = pow_obj.path_a[i].values[j];
         }
     }
     
-    // Add root values
+    // Add root values - unrolled
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-            encoding[idx++] = pow_obj.root.values[i];
-        }
+        encoding[idx++] = pow_obj.root.values[i];
     }
     
     // Now compute the fast mast hash exactly like CPU version
-    auto pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
-    auto header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
+    Digest pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
+    Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
     header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
     header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
     
-    // Convert header_mast_hash to array for varlen hash
-    uint64_t header_encoding[5];
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        header_encoding[i] = header_mast_hash.values[i];
-    }
-    auto kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_device(header_encoding, DIGEST_LEN), header[0]);
+    // Use specialized varlen hash for 5 elements (avoids loop overhead)
+    Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), header[0]);
     kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
     
-    // Convert kernel_mast_hash to array for varlen hash
-    uint64_t kernel_encoding[5];
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        kernel_encoding[i] = kernel_mast_hash.values[i];
-    }
-    return tip5_hash_fixed_device(tip5_hash_varlen_device(kernel_encoding, DIGEST_LEN), kernel[0]);
+    // Final hash
+    return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), kernel[0]);
 }
 
 VramMode detect_vram_mode(int gpu_id) {
@@ -799,7 +787,12 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
 
 __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
     Digest indexer = tip5_hash_fixed_device(hash, nonce);
-    // Use fast right-zero hash variant for the bulk of repetitions
+    
+    // OPTIMIZATION: Unroll the index computation loop by 4
+    // NUM_INDEX_REPETITIONS = 63, so we do 62 iterations (i=1 to 62)
+    // 62 = 15*4 + 2, so unroll by 4 for 15 iterations, then 2 remaining
+    
+    #pragma unroll 4
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         indexer = tip5_hash_fixed_right_zero_device(indexer);
     }

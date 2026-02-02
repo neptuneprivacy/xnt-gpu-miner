@@ -350,7 +350,7 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
     
-    // Split each element into lo and hi 32-bit limbs
+    // Split each element into lo and hi 32-bit limbs - fully unrolled
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         uint64_t b = state_in[i];
@@ -364,14 +364,23 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     generated_function(hi, hi_out);
     
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
+    // Optimized reduction using fused operations
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
-        uint64_t s_hi = (uint64_t)(s >> 64);
-        uint64_t s_lo = (uint64_t)s;
+        // Use __umul64hi for high part of multiplication
+        uint64_t lo_shifted = lo_out[i] >> 4;
+        uint64_t hi_shifted = hi_out[i] << 28;
+        uint64_t hi_carry = hi_out[i] >> 36;  // Overflow from hi << 28
         
-        // Goldilocks reduction with overflow check
-        uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
+        // s = lo_shifted + hi_shifted (with carry to hi_carry)
+        uint64_t s_lo = lo_shifted + hi_shifted;
+        bool carry1 = (s_lo < lo_shifted);
+        uint64_t s_hi = hi_carry + (carry1 ? 1ULL : 0ULL);
+        
+        // Goldilocks reduction: res = s_lo + s_hi * (2^64 mod p) = s_lo + s_hi * 0xFFFFFFFF
+        // Since 2^64 ≡ 2^32 - 1 (mod p) for Goldilocks prime p = 2^64 - 2^32 + 1
+        uint64_t correction = s_hi * 0xFFFFFFFFULL;
+        uint64_t res = s_lo + correction;
         bool overflow = (res < s_lo);
         state_out[i] = overflow ? (res + 0xFFFFFFFFULL) : res;
     }
@@ -479,9 +488,37 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
 __device__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
     
-    // OPTIMIZATION: Fused round constants - no separate function call
+    // OPTIMIZATION: Fully unrolled rounds for better instruction scheduling
+    #pragma unroll
     for (int round = 0; round < NUM_ROUNDS; ++round) {
-        sbox_layer(state, temp_state);
+        // Inline S-box layer for first 4 elements (lookup) and rest (x^7)
+        // This avoids shared memory sync overhead per round
+        
+        // Load state into registers
+        uint64_t s0 = state[0], s1 = state[1], s2 = state[2], s3 = state[3];
+        uint64_t s4 = state[4], s5 = state[5], s6 = state[6], s7 = state[7];
+        uint64_t s8 = state[8], s9 = state[9], s10 = state[10], s11 = state[11];
+        uint64_t s12 = state[12], s13 = state[13], s14 = state[14], s15 = state[15];
+        
+        // S-box: first 4 use lookup, rest use x^7
+        temp_state[0] = split_lookup_shared(s0, s_lookup_table);
+        temp_state[1] = split_lookup_shared(s1, s_lookup_table);
+        temp_state[2] = split_lookup_shared(s2, s_lookup_table);
+        temp_state[3] = split_lookup_shared(s3, s_lookup_table);
+        temp_state[4] = x7_computer(s4);
+        temp_state[5] = x7_computer(s5);
+        temp_state[6] = x7_computer(s6);
+        temp_state[7] = x7_computer(s7);
+        temp_state[8] = x7_computer(s8);
+        temp_state[9] = x7_computer(s9);
+        temp_state[10] = x7_computer(s10);
+        temp_state[11] = x7_computer(s11);
+        temp_state[12] = x7_computer(s12);
+        temp_state[13] = x7_computer(s13);
+        temp_state[14] = x7_computer(s14);
+        temp_state[15] = x7_computer(s15);
+        
+        // MDS layer
         mds_layer(temp_state, state);
         
         // Fused round constants addition

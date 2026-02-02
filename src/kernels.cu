@@ -454,12 +454,6 @@ void calculate_mining_launch_config(
     
     threads_per_block = MINING_THREADS_PER_BLOCK;
     
-    // Calculate optimal number of blocks
-    // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
-    // int min_grid_size, optimal_block_size;
-    // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
-    //                                     parallel_mining_kernel_high_vram, 0, 0);
-    
     // Use multiple of SM count for good occupancy
     // Architecture-specific tuning based on compute capability
     // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
