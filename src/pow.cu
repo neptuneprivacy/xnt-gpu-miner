@@ -44,12 +44,13 @@ void maybe_prefetch_managed(void* ptr, size_t bytes, int device_id) {
     size_t offset = 0;
     while (offset < bytes) {
         size_t chunk = std::min(kPrefetchChunkBytes, bytes - offset);
-        // Use cudaMemLocation struct for newer CUDA versions
+        // CUDA 12.0+ uses cudaMemLocation struct, older versions use int
+        // Use the struct version for CUDA 12.0+ compatibility
         cudaMemLocation location;
         location.type = cudaMemLocationTypeDevice;
         location.id = device_id;
         cudaError_t err = cudaMemPrefetchAsync(
-            static_cast<char*>(ptr) + offset, chunk, location, 0, 0);
+            static_cast<char*>(ptr) + offset, chunk, location, 0);
         if (err != cudaSuccess) {
             LOG_ERROR("cudaMemPrefetchAsync (managed)", err);
             break;
