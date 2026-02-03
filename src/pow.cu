@@ -148,21 +148,24 @@ __device__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const 
     }
     
     // Now compute the fast mast hash exactly like CPU version
+    // Optimized: unroll loops and use direct member access
     auto pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
     auto header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
     header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
     header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
     
-    // Convert header_mast_hash to array for varlen hash
+    // Convert header_mast_hash to array for varlen hash - unroll for performance
     uint64_t header_encoding[5];
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         header_encoding[i] = header_mast_hash.values[i];
     }
     auto kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_device(header_encoding, DIGEST_LEN), header[0]);
     kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
     
-    // Convert kernel_mast_hash to array for varlen hash
+    // Convert kernel_mast_hash to array for varlen hash - unroll for performance
     uint64_t kernel_encoding[5];
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         kernel_encoding[i] = kernel_mast_hash.values[i];
     }
@@ -800,6 +803,8 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
 __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
     Digest indexer = tip5_hash_fixed_device(hash, nonce);
     // Use fast right-zero hash variant for the bulk of repetitions
+    // Unroll loop for better performance - compiler will optimize this
+    #pragma unroll
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         indexer = tip5_hash_fixed_right_zero_device(indexer);
     }

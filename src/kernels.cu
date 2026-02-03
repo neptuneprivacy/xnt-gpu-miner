@@ -183,13 +183,16 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         size_t running_index_b = path_index_b + num_leafs;
         
         // First level: leaf siblings - fetch both at once for better memory coalescing
+        // Use const pointer to hint compiler about read-only access (enables caching)
         size_t sibling_leaf_index_a = path_index_a ^ 1;
         size_t sibling_leaf_index_b = path_index_b ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_index_a];
-        path_b[0] = d_leafs[sibling_leaf_index_b];
+        const Digest* __restrict__ leaf_ptr_a = &d_leafs[sibling_leaf_index_a];
+        const Digest* __restrict__ leaf_ptr_b = &d_leafs[sibling_leaf_index_b];
+        path_a[0] = *leaf_ptr_a;
+        path_b[0] = *leaf_ptr_b;
         
         // Subsequent levels: internal nodes - interleaved for better memory access
-        // Unroll more aggressively for better performance
+        // Use const pointers and unroll for better performance
         #pragma unroll
         for (size_t level = 1; level < merkle_height; ++level) {
             running_index_a >>= 1;
@@ -197,19 +200,27 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
             size_t sibling_index_a = running_index_a ^ 1;
             size_t sibling_index_b = running_index_b ^ 1;
             
-            // Fetch both paths in interleaved fashion
-            path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
-                ? d_internal_nodes[sibling_index_a] 
-                : Digest::default_digest();
-            path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
-                ? d_internal_nodes[sibling_index_b] 
-                : Digest::default_digest();
+            // Fetch both paths in interleaved fashion with const pointers for caching
+            if (sibling_index_a < MERKLE_NUM_LEAFS) {
+                const Digest* __restrict__ node_ptr_a = &d_internal_nodes[sibling_index_a];
+                path_a[level] = *node_ptr_a;
+            } else {
+                path_a[level] = Digest::default_digest();
+            }
+            if (sibling_index_b < MERKLE_NUM_LEAFS) {
+                const Digest* __restrict__ node_ptr_b = &d_internal_nodes[sibling_index_b];
+                path_b[level] = *node_ptr_b;
+            } else {
+                path_b[level] = Digest::default_digest();
+            }
         }
         
         // Get Merkle root (stored at last index in sequentially-built tree)
         // Tree is built sequentially: layer 0 at offset 0, root at last index
         // Total internal nodes = num_leafs - 1, so root is at index num_leafs - 2
-        Digest merkle_root = d_internal_nodes[num_leafs - 2];
+        // Use const pointer to hint compiler about read-only access
+        const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
+        Digest merkle_root = *root_ptr;
         
         // Compute POW hash using correct fast_mast_hash implementation
         Pow pow;
@@ -369,7 +380,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         
         // Compute final hash using correct fast_mast_hash implementation
         // Root is at last index in sequentially-built tree
-        Digest merkle_root = d_internal_nodes[stored_nodes_count - 1];
+        // Use const pointer to hint compiler about read-only access
+        const Digest* __restrict__ root_ptr = &d_internal_nodes[stored_nodes_count - 1];
+        Digest merkle_root = *root_ptr;
         Pow pow;
         pow.root = merkle_root;
         pow.nonce = nonce_digest;
