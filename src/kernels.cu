@@ -195,7 +195,7 @@ bool GuesserBuffer::reset_output_buffers() {
 
 // ===== HIGH-VRAM MINING KERNEL =====
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
+__global__ void parallel_mining_kernel_high_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
@@ -328,7 +328,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
 
 // ===== LOW-VRAM MINING KERNEL =====
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
+__global__ void parallel_mining_kernel_low_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
@@ -645,20 +645,23 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     calculate_mining_launch_config(max_nonces, threads_per_block, blocks_per_grid, gpu_id);
     
     // Calculate GPU's dedicated nonce range to avoid overlap with other GPUs
-    // CRITICAL: Pass actual GPU count to ensure proper nonce space partitioning
-    int actual_gpu_count = g_total_gpu_count.load();
-    GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
-    
-    // Copy range to constant memory (avoids register pressure from extra parameters)
-    cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
-    if (range_err != cudaSuccess) {
-        LOG_ERROR("copy range_start", range_err);
-        return std::nullopt;
-    }
-    range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
-    if (range_err != cudaSuccess) {
-        LOG_ERROR("copy range_size", range_err);
-        return std::nullopt;
+    // Only set once per buffer - the range doesn't change during mining
+    if (!buffer.gpu_range_initialized) {
+        int actual_gpu_count = g_total_gpu_count.load();
+        GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+        
+        // Copy range to constant memory (avoids register pressure from extra parameters)
+        cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+        if (range_err != cudaSuccess) {
+            LOG_ERROR("copy range_start", range_err);
+            return std::nullopt;
+        }
+        range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+        if (range_err != cudaSuccess) {
+            LOG_ERROR("copy range_size", range_err);
+            return std::nullopt;
+        }
+        buffer.gpu_range_initialized = true;
     }
     
     // Select and launch appropriate kernel on the buffer's stream

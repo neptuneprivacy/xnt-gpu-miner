@@ -51,6 +51,9 @@ public:
     Digest* d_solution_final_hash;
     bool output_buffers_allocated;
     
+    // GPU range initialization (only need to set once per GPU)
+    bool gpu_range_initialized;
+    
     GuesserBuffer() 
         : merkle_root()
         , hash()
@@ -70,7 +73,8 @@ public:
         , d_solution_path_b(nullptr)
         , d_solution_nonce_digest(nullptr)
         , d_solution_final_hash(nullptr)
-        , output_buffers_allocated(false) {}
+        , output_buffers_allocated(false)
+        , gpu_range_initialized(false) {}
     
     ~GuesserBuffer() { cleanup(); }
     
