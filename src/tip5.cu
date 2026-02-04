@@ -289,17 +289,13 @@ __device__ void generated_function(const uint64_t* input, uint64_t* output) {
     output[15] = node_159 - node_1657;
 }
 
+// Extern declaration for the shared lookup table loaded by mining kernels
+// This is defined in kernels.cu and loaded ONCE at kernel start with __syncthreads
+extern __shared__ uint8_t s_lookup_table[256];
+
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
-    __shared__ uint8_t shared_lut[256];
-    int tid = threadIdx.x;
-    
-    if (tid < 32) {
-        for (int i = 0; i < 8; i++) {
-            int idx = tid * 8 + i;
-            shared_lut[idx] = LOOKUP_TABLE[idx];
-        }
-    }
-    __syncthreads();
+    // NO __syncthreads here - the lookup table is already loaded by the kernel
+    // and synced before any thread enters the mining loop
     
     ulonglong2 v0 = *reinterpret_cast<const ulonglong2*>(&state_in[0]);
     ulonglong2 v1 = *reinterpret_cast<const ulonglong2*>(&state_in[2]);
@@ -319,10 +315,11 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     uint64_t e12 = v6.x, e13 = v6.y;
     uint64_t e14 = v7.x, e15 = v7.y;
     
-    e0 = split_lookup_shared(e0, shared_lut);
-    e1 = split_lookup_shared(e1, shared_lut);
-    e2 = split_lookup_shared(e2, shared_lut);
-    e3 = split_lookup_shared(e3, shared_lut);
+    // Use the kernel's pre-loaded s_lookup_table (no sync needed)
+    e0 = split_lookup_shared(e0, s_lookup_table);
+    e1 = split_lookup_shared(e1, s_lookup_table);
+    e2 = split_lookup_shared(e2, s_lookup_table);
+    e3 = split_lookup_shared(e3, s_lookup_table);
     e4 = x7_computer(e4);
     e5 = x7_computer(e5);
     e6 = x7_computer(e6);

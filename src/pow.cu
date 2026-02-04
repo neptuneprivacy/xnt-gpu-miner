@@ -113,59 +113,43 @@ __device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& po
     uint64_t encoding[POW_ENCODING_WORDS]; // nonce + paths + root
     int idx = 0;
     
-    // Add nonce values first
+    // Add nonce values first - removed unnecessary bounds check
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-            encoding[idx++] = pow_obj.nonce.values[i];
-        }
+        encoding[idx++] = pow_obj.nonce.values[i];
     }
     
-    // Add path_b values
+    // Add path_b values - removed unnecessary bounds check
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
-            if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-                encoding[idx++] = pow_obj.path_b[i].values[j];
-            }
+            encoding[idx++] = pow_obj.path_b[i].values[j];
         }
     }
 
-    // Add path_a values
+    // Add path_a values - removed unnecessary bounds check
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
-            if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-                encoding[idx++] = pow_obj.path_a[i].values[j];
-            }
+            encoding[idx++] = pow_obj.path_a[i].values[j];
         }
     }
     
-    // Add root values
+    // Add root values - removed unnecessary bounds check
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        if (idx < sizeof(encoding)/sizeof(encoding[0])) {
-            encoding[idx++] = pow_obj.root.values[i];
-        }
+        encoding[idx++] = pow_obj.root.values[i];
     }
     
     // Now compute the fast mast hash exactly like CPU version
-    // Optimized: unroll loops and use direct member access
-    auto pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
-    auto header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
+    // Optimized: use reduced variable scope and specialized hash function
+    Digest pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
+    Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
     header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
     header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
     
-    // Convert header_mast_hash to array for varlen hash - unroll for performance
-    uint64_t header_encoding[5];
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        header_encoding[i] = header_mast_hash.values[i];
-    }
-    auto kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_device(header_encoding, DIGEST_LEN), header[0]);
+    // Use specialized 5-word hash function instead of building array - saves 40 bytes
+    Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), header[0]);
     kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
     
-    // Convert kernel_mast_hash to array for varlen hash - unroll for performance
-    uint64_t kernel_encoding[5];
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        kernel_encoding[i] = kernel_mast_hash.values[i];
-    }
-    return tip5_hash_fixed_device(tip5_hash_varlen_device(kernel_encoding, DIGEST_LEN), kernel[0]);
+    // Use specialized 5-word hash function instead of building array - saves 40 bytes
+    return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), kernel[0]);
 }
 
 VramMode detect_vram_mode(int gpu_id) {
@@ -797,11 +781,14 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
 }
 
 __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
+    // Reduced variable scope to minimize register pressure
     Digest indexer = tip5_hash_fixed_device(hash, nonce);
     // Use fast right-zero hash variant for the bulk of repetitions
-    // Unroll loop for better performance - compiler will optimize this
-    for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
-        indexer = tip5_hash_fixed_right_zero_device(indexer);
+    // Process in reduced scope to help compiler optimize register allocation
+    {
+        for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
+            indexer = tip5_hash_fixed_right_zero_device(indexer);
+        }
     }
 
     index_a = indexer.values[0] & MERKLE_INDEX_MASK;

@@ -114,6 +114,85 @@ bool MiningOutputBuffers::reset() {
     return err == cudaSuccess;
 }
 
+// ===== GUESSER BUFFER MINING RESOURCES =====
+
+bool GuesserBuffer::ensure_mining_resources() {
+    // Create stream if not initialized
+    if (!stream_initialized) {
+        cudaError_t err = cudaStreamCreate(&mining_stream);
+        if (err != cudaSuccess) {
+            LOG_ERROR("cudaStreamCreate", err);
+            return false;
+        }
+        stream_initialized = true;
+    }
+    
+    // Allocate output buffers if not allocated
+    if (!output_buffers_allocated) {
+        cudaError_t err;
+        
+        err = cudaMalloc(&d_solution_nonce, sizeof(uint64_t));
+        if (err != cudaSuccess) { LOG_ERROR("alloc d_solution_nonce", err); return false; }
+        
+        err = cudaMalloc(&d_solution_found, sizeof(int));
+        if (err != cudaSuccess) { 
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            LOG_ERROR("alloc d_solution_found", err); 
+            return false; 
+        }
+        
+        err = cudaMalloc(&d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            LOG_ERROR("alloc d_solution_path_a", err);
+            return false;
+        }
+        
+        err = cudaMalloc(&d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+            LOG_ERROR("alloc d_solution_path_b", err);
+            return false;
+        }
+        
+        err = cudaMalloc(&d_solution_nonce_digest, sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+            cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+            LOG_ERROR("alloc d_solution_nonce_digest", err);
+            return false;
+        }
+        
+        err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+            cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+            cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr;
+            LOG_ERROR("alloc d_solution_final_hash", err);
+            return false;
+        }
+        
+        output_buffers_allocated = true;
+    }
+    
+    return true;
+}
+
+bool GuesserBuffer::reset_output_buffers() {
+    if (!d_solution_found) return false;
+    
+    // Use async memset on the mining stream for better overlap
+    cudaError_t err = cudaMemsetAsync(d_solution_found, 0, sizeof(int), mining_stream);
+    return err == cudaSuccess;
+}
+
 // ===== HIGH-VRAM MINING KERNEL =====
 
 __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
@@ -558,15 +637,14 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         return std::nullopt;
     }
     
-    // Allocate output buffers
-    MiningOutputBuffers output;
-    if (!output.allocate()) {
-        LOG_DEBUG("mine_pow_with_buffer: failed to allocate output buffers");
+    // Ensure persistent mining resources are allocated (stream + output buffers)
+    if (!buffer.ensure_mining_resources()) {
+        LOG_DEBUG("mine_pow_with_buffer: failed to ensure mining resources");
         return std::nullopt;
     }
     
-    if (!output.reset()) {
-        output.free();
+    // Reset the solution_found flag (async on stream)
+    if (!buffer.reset_output_buffers()) {
         return std::nullopt;
     }
     
@@ -585,22 +663,20 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
     if (range_err != cudaSuccess) {
         LOG_ERROR("copy range_start", range_err);
-        output.free();
         return std::nullopt;
     }
     range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
     if (range_err != cudaSuccess) {
         LOG_ERROR("copy range_size", range_err);
-        output.free();
         return std::nullopt;
     }
     
-    // Select and launch appropriate kernel
+    // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
     
     switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:
-            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block>>>(
+            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 buffer.d_leafs,
                 buffer.d_merkle_tree,
                 buffer.index_picker_preimage,
@@ -612,16 +688,16 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 mast_paths,
                 buffer.hash, // leaf_prefix = commitment
                 consensus_rule_set,
-                output.d_solution_nonce,
-                output.d_solution_found,
-                output.d_solution_path_a,
-                output.d_solution_path_b,
-                output.d_solution_nonce_digest,
-                output.d_solution_final_hash);
+                buffer.d_solution_nonce,
+                buffer.d_solution_found,
+                buffer.d_solution_path_a,
+                buffer.d_solution_path_b,
+                buffer.d_solution_nonce_digest,
+                buffer.d_solution_final_hash);
             break;
             
         case MiningKernelType::LOW_VRAM:
-            parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block>>>(
+            parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 nullptr,
                 buffer.d_merkle_tree,
                 buffer.index_picker_preimage,
@@ -634,47 +710,47 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 mast_paths,
                 buffer.hash,
                 consensus_rule_set,
-                output.d_solution_nonce,
-                output.d_solution_found,
-                output.d_solution_path_a,
-                output.d_solution_path_b,
-                output.d_solution_nonce_digest,
-                output.d_solution_final_hash);
+                buffer.d_solution_nonce,
+                buffer.d_solution_found,
+                buffer.d_solution_path_a,
+                buffer.d_solution_path_b,
+                buffer.d_solution_nonce_digest,
+                buffer.d_solution_final_hash);
             break;
     }
     
     // Check for launch errors
     if (!check_kernel_launch_errors("mining_kernel")) {
-        output.free();
         return std::nullopt;
     }
     
-    // Synchronize and check for errors
-    if (!sync_and_check_errors("mining_kernel_sync")) {
-        output.free();
+    // Synchronize on the stream (more efficient than cudaDeviceSynchronize)
+    cudaError_t sync_err = cudaStreamSynchronize(buffer.mining_stream);
+    if (sync_err != cudaSuccess) {
+        LOG_ERROR("mining_kernel stream sync", sync_err);
         return std::nullopt;
     }
     
     // Check if solution was found
     int solution_found = 0;
-    cudaMemcpy(&solution_found, output.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&solution_found, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
     
     if (solution_found) {
         // Copy solution data back to host
         Pow solution;
         
         uint64_t nonce_value;
-        cudaMemcpy(&nonce_value, output.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&nonce_value, buffer.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
         
-        cudaMemcpy(&solution.nonce, output.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
-        cudaMemcpy(solution.path_a, output.d_solution_path_a, 
+        cudaMemcpy(&solution.nonce, buffer.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
+        cudaMemcpy(solution.path_a, buffer.d_solution_path_a, 
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
-        cudaMemcpy(solution.path_b, output.d_solution_path_b,
+        cudaMemcpy(solution.path_b, buffer.d_solution_path_b,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
         
         // Copy the final_hash that kernel computed (for debugging)
         Digest kernel_final_hash;
-        cudaMemcpy(&kernel_final_hash, output.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&kernel_final_hash, buffer.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
         
         // Set root from buffer
         solution.root = buffer.merkle_root;
@@ -684,11 +760,9 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         mining_solution.pow = solution;
         mining_solution.kernel_final_hash = kernel_final_hash;
         
-        output.free();
         return mining_solution;
     }
     
-    output.free();
     return std::nullopt;
 }
 

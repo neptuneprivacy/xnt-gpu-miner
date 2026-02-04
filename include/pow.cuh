@@ -6,6 +6,7 @@
 class Pow;
 struct GuesserBuffer;
 struct PowMastPaths;
+struct MiningOutputBuffers;
 
 struct PowMastPaths {
     Digest pow[3];
@@ -37,6 +38,19 @@ public:
     int consensus_rule_set;
     PowMastPaths mast_paths;
     
+    // Persistent mining resources to avoid per-batch alloc/free overhead
+    cudaStream_t mining_stream;
+    bool stream_initialized;
+    
+    // Persistent output buffers (allocated on first use)
+    uint64_t* d_solution_nonce;
+    int* d_solution_found;
+    Digest* d_solution_path_a;
+    Digest* d_solution_path_b;
+    Digest* d_solution_nonce_digest;
+    Digest* d_solution_final_hash;
+    bool output_buffers_allocated;
+    
     GuesserBuffer() 
         : merkle_root()
         , hash()
@@ -47,7 +61,16 @@ public:
         , d_leafs(nullptr)
         , num_leafs(0)
         , consensus_rule_set(CONSENSUS_XNT)
-        , mast_paths() {}
+        , mast_paths()
+        , mining_stream(nullptr)
+        , stream_initialized(false)
+        , d_solution_nonce(nullptr)
+        , d_solution_found(nullptr)
+        , d_solution_path_a(nullptr)
+        , d_solution_path_b(nullptr)
+        , d_solution_nonce_digest(nullptr)
+        , d_solution_final_hash(nullptr)
+        , output_buffers_allocated(false) {}
     
     ~GuesserBuffer() { cleanup(); }
     
@@ -62,7 +85,27 @@ public:
             d_leafs = nullptr;
             num_leafs = 0;
         }
+        cleanup_mining_resources();
     }
+    
+    void cleanup_mining_resources() {
+        if (d_solution_nonce) { cudaFree(d_solution_nonce); d_solution_nonce = nullptr; }
+        if (d_solution_found) { cudaFree(d_solution_found); d_solution_found = nullptr; }
+        if (d_solution_path_a) { cudaFree(d_solution_path_a); d_solution_path_a = nullptr; }
+        if (d_solution_path_b) { cudaFree(d_solution_path_b); d_solution_path_b = nullptr; }
+        if (d_solution_nonce_digest) { cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr; }
+        if (d_solution_final_hash) { cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr; }
+        output_buffers_allocated = false;
+        
+        if (stream_initialized && mining_stream) {
+            cudaStreamDestroy(mining_stream);
+            mining_stream = nullptr;
+            stream_initialized = false;
+        }
+    }
+    
+    bool ensure_mining_resources();  // Allocates stream and output buffers if needed
+    bool reset_output_buffers();     // Resets solution_found flag
     
     GuesserBuffer(const GuesserBuffer&) = delete;
     GuesserBuffer& operator=(const GuesserBuffer&) = delete;
@@ -77,11 +120,29 @@ public:
         , d_leafs(other.d_leafs)
         , num_leafs(other.num_leafs)
         , consensus_rule_set(other.consensus_rule_set)
-        , mast_paths(other.mast_paths) {
+        , mast_paths(other.mast_paths)
+        , mining_stream(other.mining_stream)
+        , stream_initialized(other.stream_initialized)
+        , d_solution_nonce(other.d_solution_nonce)
+        , d_solution_found(other.d_solution_found)
+        , d_solution_path_a(other.d_solution_path_a)
+        , d_solution_path_b(other.d_solution_path_b)
+        , d_solution_nonce_digest(other.d_solution_nonce_digest)
+        , d_solution_final_hash(other.d_solution_final_hash)
+        , output_buffers_allocated(other.output_buffers_allocated) {
         other.d_merkle_tree = nullptr;
         other.tree_size = 0;
         other.d_leafs = nullptr;
         other.num_leafs = 0;
+        other.mining_stream = nullptr;
+        other.stream_initialized = false;
+        other.d_solution_nonce = nullptr;
+        other.d_solution_found = nullptr;
+        other.d_solution_path_a = nullptr;
+        other.d_solution_path_b = nullptr;
+        other.d_solution_nonce_digest = nullptr;
+        other.d_solution_final_hash = nullptr;
+        other.output_buffers_allocated = false;
     }
     
     GuesserBuffer& operator=(GuesserBuffer&& other) noexcept {
@@ -97,10 +158,28 @@ public:
             num_leafs = other.num_leafs;
             consensus_rule_set = other.consensus_rule_set;
             mast_paths = other.mast_paths;
+            mining_stream = other.mining_stream;
+            stream_initialized = other.stream_initialized;
+            d_solution_nonce = other.d_solution_nonce;
+            d_solution_found = other.d_solution_found;
+            d_solution_path_a = other.d_solution_path_a;
+            d_solution_path_b = other.d_solution_path_b;
+            d_solution_nonce_digest = other.d_solution_nonce_digest;
+            d_solution_final_hash = other.d_solution_final_hash;
+            output_buffers_allocated = other.output_buffers_allocated;
             other.d_merkle_tree = nullptr;
             other.tree_size = 0;
             other.d_leafs = nullptr;
             other.num_leafs = 0;
+            other.mining_stream = nullptr;
+            other.stream_initialized = false;
+            other.d_solution_nonce = nullptr;
+            other.d_solution_found = nullptr;
+            other.d_solution_path_a = nullptr;
+            other.d_solution_path_b = nullptr;
+            other.d_solution_nonce_digest = nullptr;
+            other.d_solution_final_hash = nullptr;
+            other.output_buffers_allocated = false;
         }
         return *this;
     }
