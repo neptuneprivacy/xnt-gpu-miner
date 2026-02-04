@@ -7,7 +7,6 @@ struct alignas(8) Digest {
     uint64_t values[DIGEST_LEN];
     
     __device__ __host__ __forceinline__ Digest() {
-        #pragma unroll
         for (int i = 0; i < DIGEST_LEN; ++i) {
             values[i] = 0;
         }
@@ -24,7 +23,6 @@ struct alignas(8) Digest {
     }
     
     __device__ __host__ __forceinline__ bool operator==(const Digest& other) const {
-        #pragma unroll
         for (int i = 0; i < DIGEST_LEN; ++i) {
             if (values[i] != other.values[i]) return false;
         }
@@ -36,7 +34,6 @@ struct alignas(8) Digest {
     }
     
     __device__ __host__ __forceinline__ bool is_zero() const {
-        #pragma unroll
         for (int i = 0; i < DIGEST_LEN; ++i) {
             if (values[i] != 0) return false;
         }
@@ -44,14 +41,12 @@ struct alignas(8) Digest {
     }
     
     __device__ __host__ __forceinline__ void from_array(const uint64_t* arr) {
-        #pragma unroll
         for (int i = 0; i < DIGEST_LEN; ++i) {
             values[i] = arr[i];
         }
     }
     
     __device__ __host__ __forceinline__ void to_array(uint64_t* arr) const {
-        #pragma unroll
         for (int i = 0; i < DIGEST_LEN; ++i) {
             arr[i] = values[i];
         }
@@ -106,11 +101,9 @@ __device__ __forceinline__ Digest tip5_hash_fixed_right_zero_device(const Digest
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::FixedLength);
     
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         state[i] = left.values[i];
     }
-    #pragma unroll
     for (int i = DIGEST_LEN; i < RATE; ++i) {
         state[i] = 0;
     }
@@ -118,7 +111,6 @@ __device__ __forceinline__ Digest tip5_hash_fixed_right_zero_device(const Digest
     tip5_permutation(state);
     
     Digest result;
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         result.values[i] = state[i];
     }

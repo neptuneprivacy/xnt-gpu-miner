@@ -254,7 +254,6 @@ __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, D
     // OPTIMIZATION #16: Combined initialization in single loop
     uint64_t capacity_val = (domain == Domain::FixedLength) ? static_cast<uint64_t>(domain) : BFE_ZERO;
     
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; ++i) {
         state[i] = (i < RATE) ? BFE_ZERO : capacity_val;
     }
@@ -271,7 +270,6 @@ __device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ 
 
 __device__ __forceinline__ void tip5_sponge_squeeze(uint64_t* __restrict__ state, 
                                                      uint64_t* __restrict__ digest) {
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         digest[i] = state[i];
     }

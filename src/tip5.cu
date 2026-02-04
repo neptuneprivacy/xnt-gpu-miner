@@ -294,7 +294,6 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     int tid = threadIdx.x;
     
     if (tid < 32) {
-        #pragma unroll
         for (int i = 0; i < 8; i++) {
             int idx = tid * 8 + i;
             shared_lut[idx] = LOOKUP_TABLE[idx];
@@ -351,7 +350,6 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
     
     // Split each element into lo and hi 32-bit limbs
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         uint64_t b = state_in[i];
         lo[i] = b & 0xFFFFFFFFUL;
@@ -364,7 +362,6 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     generated_function(hi, hi_out);
     
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
         uint64_t s_hi = (uint64_t)(s >> 64);
@@ -378,7 +375,6 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
 }
 
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out) {
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; ++i) {
         state_out[i] = fast_field_add(state_in[i], ROUND_CONSTANTS[round_index][i]);
     }
@@ -485,7 +481,6 @@ __device__ void tip5_permutation(uint64_t* state) {
         mds_layer(temp_state, state);
         
         // Fused round constants addition
-        #pragma unroll
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
         }

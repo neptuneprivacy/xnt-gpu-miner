@@ -192,7 +192,6 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
             
             // Subsequent levels: internal nodes - interleaved for better memory access
             // Unroll more aggressively for better performance
-            #pragma unroll
             for (size_t level = 1; level < merkle_height; ++level) {
                 running_index_a >>= 1;
                 running_index_b >>= 1;
@@ -220,7 +219,6 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         Pow pow;
         pow.root = merkle_root;
         pow.nonce = nonce_digest;
-        #pragma unroll
         for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
             pow.path_a[i] = path_a[i];
             pow.path_b[i] = path_b[i];
@@ -256,7 +254,6 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
                 *d_solution_final_hash = final_hash;
                 
                 // Copy the already-computed paths
-                #pragma unroll
                 for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
                     d_solution_path_a[i] = path_a[i];
                     d_solution_path_b[i] = path_b[i];
@@ -381,7 +378,6 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         Pow pow;
         pow.root = merkle_root;
         pow.nonce = nonce_digest;
-        #pragma unroll
         for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
             pow.path_a[i] = path_a[i];
             pow.path_b[i] = path_b[i];

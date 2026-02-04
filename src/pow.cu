@@ -10,18 +10,15 @@ __device__ Digest PowMastPaths::commit_device() const {
     size_t pos = 0;
     
     for (int i = 0; i < 3; ++i) {
-        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
             values[pos++] = pow[i].values[j];
         }
     }
     for (int i = 0; i < 2; ++i) {
-        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
             values[pos++] = header[i].values[j];
         }
     }
-    #pragma unroll
     for (int j = 0; j < DIGEST_LEN; ++j) {
         values[pos++] = kernel[0].values[j];
     }
@@ -157,7 +154,6 @@ __device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& po
     
     // Convert header_mast_hash to array for varlen hash - unroll for performance
     uint64_t header_encoding[5];
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         header_encoding[i] = header_mast_hash.values[i];
     }
@@ -166,7 +162,6 @@ __device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& po
     
     // Convert kernel_mast_hash to array for varlen hash - unroll for performance
     uint64_t kernel_encoding[5];
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         kernel_encoding[i] = kernel_mast_hash.values[i];
     }
@@ -805,7 +800,6 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     Digest indexer = tip5_hash_fixed_device(hash, nonce);
     // Use fast right-zero hash variant for the bulk of repetitions
     // Unroll loop for better performance - compiler will optimize this
-    #pragma unroll
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         indexer = tip5_hash_fixed_right_zero_device(indexer);
     }

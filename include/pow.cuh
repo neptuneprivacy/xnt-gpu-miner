@@ -13,9 +13,7 @@ struct PowMastPaths {
     Digest kernel[1];
     
     __device__ __host__ PowMastPaths() {
-        #pragma unroll
         for (int i = 0; i < 3; ++i) pow[i] = Digest::default_digest();
-        #pragma unroll
         for (int i = 0; i < 2; ++i) header[i] = Digest::default_digest();
         kernel[0] = Digest::default_digest();
     }
@@ -135,7 +133,6 @@ public:
     Digest nonce;
     
     __device__ __host__ Pow() : root(), nonce() {
-        #pragma unroll
         for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
             path_a[i] = Digest::default_digest();
             path_b[i] = Digest::default_digest();
