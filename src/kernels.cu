@@ -254,48 +254,18 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t index_a, index_b;
         Pow_indices_device(hash, nonce_digest, index_a, index_b);
         
-        // Paths are ALWAYS computed using original indices (matching Rust guess())
-        // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
-        // but the tree structure matches the swapped leaves
-        uint64_t path_index_a = index_a;
-        uint64_t path_index_b = index_b;
-        
-        // Compute POW hash - compute paths directly into Pow struct to eliminate duplicate arrays
-        // This reduces register pressure by having only one set of path arrays instead of two
-        Pow pow;
-        pow.root = merkle_root;
-        pow.nonce = nonce_digest;
-        
-        // Compute paths directly into Pow struct - eliminates separate path_a/path_b arrays
-        {
-            size_t running_index_a = path_index_a + num_leafs;
-            size_t running_index_b = path_index_b + num_leafs;
-            
-            // First level: leaf siblings - fetch both at once for better memory coalescing
-            size_t sibling_leaf_index_a = path_index_a ^ 1;
-            size_t sibling_leaf_index_b = path_index_b ^ 1;
-            pow.path_a[0] = d_leafs[sibling_leaf_index_a];
-            pow.path_b[0] = d_leafs[sibling_leaf_index_b];
-            
-            // Subsequent levels: internal nodes - interleaved for better memory access
-            for (size_t level = 1; level < merkle_height; ++level) {
-                running_index_a >>= 1;
-                running_index_b >>= 1;
-                size_t sibling_index_a = running_index_a ^ 1;
-                size_t sibling_index_b = running_index_b ^ 1;
-                
-                // Fetch both paths in interleaved fashion
-                pow.path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
-                    ? d_internal_nodes[sibling_index_a] 
-                    : Digest::default_digest();
-                pow.path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
-                    ? d_internal_nodes[sibling_index_b] 
-                    : Digest::default_digest();
-            }
-        }
-        
-        // Compute POW hash using correct fast_mast_hash implementation
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
+        // Compute POW hash directly from global memory - no Pow struct needed
+        // This eliminates 2240 bytes of register pressure per thread
+        Digest final_hash = fast_mast_hash_direct(
+            mast_paths,
+            nonce_digest,
+            merkle_root,
+            d_leafs,
+            d_internal_nodes,
+            index_a,  // path_index_a
+            index_b,  // path_index_b
+            num_leafs,
+            merkle_height);
         
         // Check against target - optimized comparison
         // Most hashes will fail on the highest limb, so check it first
@@ -324,10 +294,30 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
                 // Store the final_hash that met the threshold (for debugging)
                 *d_solution_final_hash = final_hash;
                 
-                // Copy paths from Pow struct to output buffers (paths already computed above)
-                for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-                    d_solution_path_a[i] = pow.path_a[i];
-                    d_solution_path_b[i] = pow.path_b[i];
+                // Recompute paths for solution storage (solutions are rare, so this is fine)
+                // Path A
+                {
+                    size_t running_index = index_a + num_leafs;
+                    d_solution_path_a[0] = d_leafs[index_a ^ 1];
+                    for (size_t level = 1; level < merkle_height; ++level) {
+                        running_index >>= 1;
+                        size_t sibling_index = running_index ^ 1;
+                        d_solution_path_a[level] = (sibling_index < num_leafs) 
+                            ? d_internal_nodes[sibling_index] 
+                            : Digest::default_digest();
+                    }
+                }
+                // Path B
+                {
+                    size_t running_index = index_b + num_leafs;
+                    d_solution_path_b[0] = d_leafs[index_b ^ 1];
+                    for (size_t level = 1; level < merkle_height; ++level) {
+                        running_index >>= 1;
+                        size_t sibling_index = running_index ^ 1;
+                        d_solution_path_b[level] = (sibling_index < num_leafs) 
+                            ? d_internal_nodes[sibling_index] 
+                            : Digest::default_digest();
+                    }
                 }
                 
                 return;

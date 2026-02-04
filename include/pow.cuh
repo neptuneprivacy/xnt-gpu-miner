@@ -264,6 +264,18 @@ __device__ void Pow_indices_device(
     const Digest& hash, const Digest& nonce, 
     uint64_t& index_a, uint64_t& index_b);
 
+// Direct MAST hash - reads paths from global memory without building Pow struct
+__device__ __noinline__ Digest fast_mast_hash_direct(
+    const PowMastPaths& mast_paths,
+    const Digest& nonce,
+    const Digest& root,
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    uint64_t path_index_a,
+    uint64_t path_index_b,
+    size_t num_leafs,
+    size_t merkle_height);
+
 uint64_t generate_secure_random_start(
     const std::string& puzzle_id, int gpu_id, 
     const std::string& worker_id = "", const std::string& gpu_uuid = "");

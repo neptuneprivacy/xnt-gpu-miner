@@ -106,50 +106,197 @@ Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
     return tip5_hash_fixed_host(tip5_hash_varlen_host(kernel_encoding), this->kernel[0]);
 }
 
-__device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
-    // EXACT CPU LOGIC: Compute the encoding manually (correct size)
-    // Large local array - marked __noinline__ to reduce register pressure
-    constexpr size_t POW_ENCODING_WORDS = 5 + 2 * MERKLE_TREE_HEIGHT_ * 5 + 5;
-    uint64_t encoding[POW_ENCODING_WORDS]; // nonce + paths + root
-    int idx = 0;
+// Streaming hash that reads paths directly from global memory
+// Avoids building large Pow struct in registers - reads on demand
+__device__ __noinline__ Digest hash_pow_encoding_direct(
+    const Digest& nonce,
+    const Digest& root,
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    uint64_t path_index_a,
+    uint64_t path_index_b,
+    size_t num_leafs,
+    size_t merkle_height
+) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::VariableLength);
     
-    // Add nonce values first - removed unnecessary bounds check
+    // Total encoding: nonce(5) + path_b(135) + path_a(135) + root(5) = 280 words
+    // RATE = 10, so 28 full chunks
+    
+    int chunk_pos = 0;
+    
+    // Inline absorb - directly write to state, permute when full
+    #define ABSORB_VALUE(val) do { \
+        state[chunk_pos++] = (val); \
+        if (chunk_pos == RATE) { \
+            tip5_permutation(state); \
+            chunk_pos = 0; \
+        } \
+    } while(0)
+    
+    // 1. Add nonce (5 words)
     for (int i = 0; i < DIGEST_LEN; ++i) {
-        encoding[idx++] = pow_obj.nonce.values[i];
+        ABSORB_VALUE(nonce.values[i]);
     }
     
-    // Add path_b values - removed unnecessary bounds check
-    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-        for (int j = 0; j < DIGEST_LEN; ++j) {
-            encoding[idx++] = pow_obj.path_b[i].values[j];
+    // 2. Add path_b (27 * 5 = 135 words) - read directly from global memory
+    {
+        size_t running_index = path_index_b + num_leafs;
+        // Level 0: leaf sibling
+        size_t sibling_leaf = path_index_b ^ 1;
+        Digest d = d_leafs[sibling_leaf];
+        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
+        
+        // Levels 1-26: internal nodes
+        for (size_t level = 1; level < merkle_height; ++level) {
+            running_index >>= 1;
+            size_t sibling_index = running_index ^ 1;
+            Digest node = (sibling_index < num_leafs) 
+                ? d_internal_nodes[sibling_index] 
+                : Digest::default_digest();
+            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
         }
     }
+    
+    // 3. Add path_a (27 * 5 = 135 words) - read directly from global memory
+    {
+        size_t running_index = path_index_a + num_leafs;
+        // Level 0: leaf sibling
+        size_t sibling_leaf = path_index_a ^ 1;
+        Digest d = d_leafs[sibling_leaf];
+        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
+        
+        // Levels 1-26: internal nodes
+        for (size_t level = 1; level < merkle_height; ++level) {
+            running_index >>= 1;
+            size_t sibling_index = running_index ^ 1;
+            Digest node = (sibling_index < num_leafs) 
+                ? d_internal_nodes[sibling_index] 
+                : Digest::default_digest();
+            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
+        }
+    }
+    
+    // 4. Add root (5 words)
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        ABSORB_VALUE(root.values[i]);
+    }
+    
+    #undef ABSORB_VALUE
+    
+    // Final padding (280 % 10 = 0, so chunk_pos should be 0)
+    // Zero remaining slots and add padding marker
+    for (int i = chunk_pos; i < RATE; ++i) {
+        state[i] = BFE_ZERO;
+    }
+    state[chunk_pos] = BFE_ONE;
+    tip5_permutation(state);
+    
+    Digest result;
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
 
-    // Add path_a values - removed unnecessary bounds check
+// Version that takes Pow struct (for compatibility with existing code)
+__device__ __noinline__ Digest hash_pow_encoding_streaming(const Pow& pow_obj) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::VariableLength);
+    
+    int chunk_pos = 0;
+    
+    #define ABSORB_VALUE(val) do { \
+        state[chunk_pos++] = (val); \
+        if (chunk_pos == RATE) { \
+            tip5_permutation(state); \
+            chunk_pos = 0; \
+        } \
+    } while(0)
+    
+    // 1. Add nonce (5 words)
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        ABSORB_VALUE(pow_obj.nonce.values[i]);
+    }
+    
+    // 2. Add path_b (27 * 5 = 135 words)
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
-            encoding[idx++] = pow_obj.path_a[i].values[j];
+            ABSORB_VALUE(pow_obj.path_b[i].values[j]);
         }
     }
     
-    // Add root values - removed unnecessary bounds check
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        encoding[idx++] = pow_obj.root.values[i];
+    // 3. Add path_a (27 * 5 = 135 words)
+    for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            ABSORB_VALUE(pow_obj.path_a[i].values[j]);
+        }
     }
     
-    // Now compute the fast mast hash exactly like CPU version
-    // Optimized: use reduced variable scope and specialized hash function
-    Digest pow_encoding_digest = tip5_hash_varlen_device(encoding, idx);
+    // 4. Add root (5 words)
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        ABSORB_VALUE(pow_obj.root.values[i]);
+    }
+    
+    #undef ABSORB_VALUE
+    
+    // Final padding
+    for (int i = chunk_pos; i < RATE; ++i) {
+        state[i] = BFE_ZERO;
+    }
+    state[chunk_pos] = BFE_ONE;
+    tip5_permutation(state);
+    
+    Digest result;
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
+
+__device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
+    // Streaming hash - no large local array needed
+    Digest pow_encoding_digest = hash_pow_encoding_streaming(pow_obj);
+    
+    // MAST hash chain
     Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
     header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
     header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
     
-    // Use specialized 5-word hash function instead of building array - saves 40 bytes
+    // Use specialized 5-word hash function instead of building array
     Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), header[0]);
     kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
     
-    // Use specialized 5-word hash function instead of building array - saves 40 bytes
     return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), kernel[0]);
+}
+
+// Direct version - reads paths from global memory without building Pow struct
+__device__ __noinline__ Digest fast_mast_hash_direct(
+    const PowMastPaths& mast_paths,
+    const Digest& nonce,
+    const Digest& root,
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    uint64_t path_index_a,
+    uint64_t path_index_b,
+    size_t num_leafs,
+    size_t merkle_height
+) {
+    // Streaming hash directly from global memory
+    Digest pow_encoding_digest = hash_pow_encoding_direct(
+        nonce, root, d_leafs, d_internal_nodes,
+        path_index_a, path_index_b, num_leafs, merkle_height);
+    
+    // MAST hash chain
+    Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, mast_paths.pow[0]);
+    header_mast_hash = tip5_hash_fixed_device(header_mast_hash, mast_paths.pow[1]);
+    header_mast_hash = tip5_hash_fixed_device(mast_paths.pow[2], header_mast_hash);
+    
+    Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), mast_paths.header[0]);
+    kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, mast_paths.header[1]);
+    
+    return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), mast_paths.kernel[0]);
 }
 
 VramMode detect_vram_mode(int gpu_id) {
