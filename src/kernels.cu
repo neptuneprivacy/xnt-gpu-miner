@@ -176,34 +176,37 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t path_index_b = index_b;
         
         // Compute paths for both indices - optimized with prefetching and unrolling
+        // Large local arrays - scope reduced to help register allocation
         Digest path_a[MERKLE_TREE_HEIGHT_];
         Digest path_b[MERKLE_TREE_HEIGHT_];
         
-        size_t running_index_a = path_index_a + num_leafs;
-        size_t running_index_b = path_index_b + num_leafs;
-        
-        // First level: leaf siblings - fetch both at once for better memory coalescing
-        size_t sibling_leaf_index_a = path_index_a ^ 1;
-        size_t sibling_leaf_index_b = path_index_b ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_index_a];
-        path_b[0] = d_leafs[sibling_leaf_index_b];
-        
-        // Subsequent levels: internal nodes - interleaved for better memory access
-        // Unroll more aggressively for better performance
-        #pragma unroll
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_a >>= 1;
-            running_index_b >>= 1;
-            size_t sibling_index_a = running_index_a ^ 1;
-            size_t sibling_index_b = running_index_b ^ 1;
+        {
+            size_t running_index_a = path_index_a + num_leafs;
+            size_t running_index_b = path_index_b + num_leafs;
             
-            // Fetch both paths in interleaved fashion
-            path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
-                ? d_internal_nodes[sibling_index_a] 
-                : Digest::default_digest();
-            path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
-                ? d_internal_nodes[sibling_index_b] 
-                : Digest::default_digest();
+            // First level: leaf siblings - fetch both at once for better memory coalescing
+            size_t sibling_leaf_index_a = path_index_a ^ 1;
+            size_t sibling_leaf_index_b = path_index_b ^ 1;
+            path_a[0] = d_leafs[sibling_leaf_index_a];
+            path_b[0] = d_leafs[sibling_leaf_index_b];
+            
+            // Subsequent levels: internal nodes - interleaved for better memory access
+            // Unroll more aggressively for better performance
+            #pragma unroll
+            for (size_t level = 1; level < merkle_height; ++level) {
+                running_index_a >>= 1;
+                running_index_b >>= 1;
+                size_t sibling_index_a = running_index_a ^ 1;
+                size_t sibling_index_b = running_index_b ^ 1;
+                
+                // Fetch both paths in interleaved fashion
+                path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
+                    ? d_internal_nodes[sibling_index_a] 
+                    : Digest::default_digest();
+                path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
+                    ? d_internal_nodes[sibling_index_b] 
+                    : Digest::default_digest();
+            }
         }
         
         // Get Merkle root (stored at last index in sequentially-built tree)
@@ -328,6 +331,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         
         // Build paths using stored internal nodes where available
         // For missing nodes, compute on-demand
+        // Large local arrays - scope reduced to help register allocation
         Digest path_a[MERKLE_TREE_HEIGHT_];
         Digest path_b[MERKLE_TREE_HEIGHT_];
         

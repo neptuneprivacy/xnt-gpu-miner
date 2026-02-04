@@ -19,8 +19,21 @@ endif
 
 # Compiler flags
 # Enable separable compilation for device functions across multiple files
-NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) -Xnvlink=-suppress-stack-size-warning
-NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) -dc
+# Register optimization flags:
+#   -maxrregcount=64: Limit registers to improve occupancy (can be adjusted)
+#   --ptxas-options=-v: Show register usage during compilation
+#   --ptxas-options=-O3: Aggressive PTX optimization
+# Note: Lower maxrregcount = better occupancy but may cause register spilling
+#       Start with 64, increase if you see performance degradation
+# MAX_REG_COUNT removed - forcing limits causes register spilling
+NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
+             --ptxas-options=-v \
+             --ptxas-options=-O3 \
+             -Xnvlink=-suppress-stack-size-warning
+NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
+                --ptxas-options=-v \
+                --ptxas-options=-O3 \
+                -dc
 CXX_FLAGS = -O3 -march=native -std=c++17
 
 # Include paths
@@ -97,3 +110,5 @@ help:
 	@echo "  make                  # Release build"
 	@echo "  make DEBUG=1          # Debug build"
 	@echo "  make clean && make    # Clean rebuild"
+	@echo "  make MAX_REG_COUNT=48 # Build with max 48 registers (higher occupancy)"
+	@echo "  make MAX_REG_COUNT=80 # Build with max 80 registers (if 64 causes spilling)"

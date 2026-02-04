@@ -23,7 +23,7 @@ struct PowMastPaths {
     __device__ Digest commit_device() const;
     __host__ Digest commit() const;
     Digest fast_mast_hash(const Pow& pow_obj) const;
-    __device__ Digest fast_mast_hash_device(const Pow& pow_obj) const;
+    __device__ __noinline__ Digest fast_mast_hash_device(const Pow& pow_obj) const;
 };
 
 class GuesserBuffer {

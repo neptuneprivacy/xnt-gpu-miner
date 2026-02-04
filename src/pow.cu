@@ -109,8 +109,9 @@ Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
     return tip5_hash_fixed_host(tip5_hash_varlen_host(kernel_encoding), this->kernel[0]);
 }
 
-__device__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
+__device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
     // EXACT CPU LOGIC: Compute the encoding manually (correct size)
+    // Large local array - marked __noinline__ to reduce register pressure
     constexpr size_t POW_ENCODING_WORDS = 5 + 2 * MERKLE_TREE_HEIGHT_ * 5 + 5;
     uint64_t encoding[POW_ENCODING_WORDS]; // nonce + paths + root
     int idx = 0;
