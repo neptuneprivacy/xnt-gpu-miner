@@ -1,6 +1,6 @@
 #include "digest.cuh"
 
-__device__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right) {
+__device__ __noinline__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::FixedLength);
     

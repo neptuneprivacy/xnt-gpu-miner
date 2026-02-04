@@ -203,14 +203,14 @@ __global__ void __launch_bounds__(256) compute_buds_kernel(
         // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
         // hash = Tip5::hash_pair(hash, Digest::new([index, 0, 0, 0, round]))
         Digest hash = commitment;
-        // Reduce variable scope to help register allocation
-        Digest round_digest;
-        round_digest.values[0] = global_idx;
-        round_digest.values[1] = 0;
-        round_digest.values[2] = 0;
-        round_digest.values[3] = 0;
         for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
             // Create Digest with values [global_idx, 0, 0, 0, round]
+            // Minimize scope of round_digest to reduce register pressure
+            Digest round_digest;
+            round_digest.values[0] = global_idx;
+            round_digest.values[1] = 0;
+            round_digest.values[2] = 0;
+            round_digest.values[3] = 0;
             round_digest.values[4] = round;
             hash = tip5_hash_fixed_device(hash, round_digest);
         }

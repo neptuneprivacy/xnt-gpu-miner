@@ -55,7 +55,7 @@ struct alignas(8) Digest {
 
 static_assert(sizeof(Digest) == DIGEST_LEN * sizeof(uint64_t), "Digest must be 5x u64");
 
-__device__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right);
+__device__ __noinline__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right);
 __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_len);
 
 __host__ Digest tip5_hash_fixed_host(const Digest& left, const Digest& right);
