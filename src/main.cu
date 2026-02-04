@@ -232,6 +232,7 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     
     auto start_time = std::chrono::steady_clock::now();
     auto last_update = start_time;
+    uint64_t last_nonces = 0;  // Track nonces at last update for instantaneous rate calculation
     int iteration = 0;
     
     install_signal_handlers();
@@ -338,13 +339,18 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
         
         // Update hash rate display every second
+        // Calculate instantaneous rate (nonces processed in last second) instead of cumulative average
         if (since_update >= 1000) {
-            double hash_rate = (total_nonces / 1000000.0) / std::max(1.0, static_cast<double>(elapsed));
+            uint64_t nonces_since_update = total_nonces - last_nonces;
+            double time_since_update_sec = since_update / 1000.0;
+            // Calculate instantaneous hash rate: nonces in last second / time elapsed
+            double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
             std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
                       << hash_rate << " MH/s" << Color::RESET 
                       << " | Nonces: " << total_nonces 
                       << " | Time: " << elapsed << "s" << std::flush;
             last_update = now;
+            last_nonces = total_nonces;  // Update tracked nonces for next calculation
         }
         
         // Stop benchmark after the configured duration

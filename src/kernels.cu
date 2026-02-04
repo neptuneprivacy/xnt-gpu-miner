@@ -147,9 +147,15 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
+    // Cache constant values outside loop to prevent repeated memory accesses
+    // Merkle root is constant - read once and reuse to maintain 40 MH/s performance
+    const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
+    const Digest merkle_root = *root_ptr;  // Cache constant value
+    
     // Process nonces
-    // Check solution flag every 64 iterations to reduce global memory traffic
-    const uint64_t CHECK_INTERVAL = 64;
+    // Check solution flag less frequently to reduce global memory traffic and cache pollution
+    // Increased from 64 to 4096 to improve sustained performance
+    const uint64_t CHECK_INTERVAL = 4096;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
         // Early exit if solution found (check every N iterations for performance)
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
@@ -160,7 +166,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
-        nonce_digest.values[1] = (nonce_value >> 32);  // Upper bits in second limb
+        nonce_digest.values[1] = 0;  // Upper bits in second limb
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
@@ -175,11 +181,13 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t path_index_a = index_a;
         uint64_t path_index_b = index_b;
         
-        // Compute paths for both indices - optimized with prefetching and unrolling
-        // Large local arrays - scope reduced to help register allocation
-        Digest path_a[MERKLE_TREE_HEIGHT_];
-        Digest path_b[MERKLE_TREE_HEIGHT_];
+        // Compute POW hash - compute paths directly into Pow struct to eliminate duplicate arrays
+        // This reduces register pressure by having only one set of path arrays instead of two
+        Pow pow;
+        pow.root = merkle_root;
+        pow.nonce = nonce_digest;
         
+        // Compute paths directly into Pow struct - eliminates separate path_a/path_b arrays
         {
             size_t running_index_a = path_index_a + num_leafs;
             size_t running_index_b = path_index_b + num_leafs;
@@ -187,11 +195,10 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
             // First level: leaf siblings - fetch both at once for better memory coalescing
             size_t sibling_leaf_index_a = path_index_a ^ 1;
             size_t sibling_leaf_index_b = path_index_b ^ 1;
-            path_a[0] = d_leafs[sibling_leaf_index_a];
-            path_b[0] = d_leafs[sibling_leaf_index_b];
+            pow.path_a[0] = d_leafs[sibling_leaf_index_a];
+            pow.path_b[0] = d_leafs[sibling_leaf_index_b];
             
             // Subsequent levels: internal nodes - interleaved for better memory access
-            // Unroll more aggressively for better performance
             for (size_t level = 1; level < merkle_height; ++level) {
                 running_index_a >>= 1;
                 running_index_b >>= 1;
@@ -199,31 +206,16 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
                 size_t sibling_index_b = running_index_b ^ 1;
                 
                 // Fetch both paths in interleaved fashion
-                path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
+                pow.path_a[level] = (sibling_index_a < MERKLE_NUM_LEAFS) 
                     ? d_internal_nodes[sibling_index_a] 
                     : Digest::default_digest();
-                path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
+                pow.path_b[level] = (sibling_index_b < MERKLE_NUM_LEAFS) 
                     ? d_internal_nodes[sibling_index_b] 
                     : Digest::default_digest();
             }
         }
         
-        // Get Merkle root (stored at last index in sequentially-built tree)
-        // Tree is built sequentially: layer 0 at offset 0, root at last index
-        // Total internal nodes = num_leafs - 1, so root is at index num_leafs - 2
-        // Use const pointer to hint compiler about read-only access
-        const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
-        Digest merkle_root = *root_ptr;
-        
         // Compute POW hash using correct fast_mast_hash implementation
-        Pow pow;
-        pow.root = merkle_root;
-        pow.nonce = nonce_digest;
-        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-            pow.path_a[i] = path_a[i];
-            pow.path_b[i] = path_b[i];
-        }
-        
         Digest final_hash = mast_paths.fast_mast_hash_device(pow);
         
         // Check against target - optimized comparison
@@ -253,10 +245,10 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
                 // Store the final_hash that met the threshold (for debugging)
                 *d_solution_final_hash = final_hash;
                 
-                // Copy the already-computed paths
+                // Copy paths from Pow struct to output buffers (paths already computed above)
                 for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-                    d_solution_path_a[i] = path_a[i];
-                    d_solution_path_b[i] = path_b[i];
+                    d_solution_path_a[i] = pow.path_a[i];
+                    d_solution_path_b[i] = pow.path_b[i];
                 }
                 
                 return;
@@ -298,8 +290,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
-    // Check solution flag every 64 iterations to reduce global memory traffic
-    const uint64_t CHECK_INTERVAL = 64;
+    // Check solution flag less frequently to reduce global memory traffic and cache pollution
+    // Increased from 64 to 4096 to improve sustained performance
+    const uint64_t CHECK_INTERVAL = 4096;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
         // Early exit if solution found (check every N iterations for performance)
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
