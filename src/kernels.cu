@@ -212,7 +212,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         // Get Merkle root (stored at last index in sequentially-built tree)
         // Tree is built sequentially: layer 0 at offset 0, root at last index
         // Total internal nodes = num_leafs - 1, so root is at index num_leafs - 2
-        Digest merkle_root = d_internal_nodes[num_leafs - 2];
+        // Use const pointer to hint compiler about read-only access
+        const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
+        Digest merkle_root = *root_ptr;
         
         // Compute POW hash using correct fast_mast_hash implementation
         Pow pow;
@@ -373,7 +375,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         
         // Compute final hash using correct fast_mast_hash implementation
         // Root is at last index in sequentially-built tree
-        Digest merkle_root = d_internal_nodes[stored_nodes_count - 1];
+        // Use const pointer to hint compiler about read-only access
+        const Digest* __restrict__ root_ptr = &d_internal_nodes[stored_nodes_count - 1];
+        Digest merkle_root = *root_ptr;
         Pow pow;
         pow.root = merkle_root;
         pow.nonce = nonce_digest;
