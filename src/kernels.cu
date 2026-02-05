@@ -232,12 +232,7 @@ __global__ void parallel_mining_kernel_high_vram(
     const Digest merkle_root = *root_ptr;  // Cache constant value
     
     // Process nonces
-    // Check solution flag less frequently to reduce global memory traffic and cache pollution
-    // Increased from 64 to 4096 to improve sustained performance
-    const uint64_t CHECK_INTERVAL = 4096;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        // Early exit if solution found (check every N iterations for performance)
-        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
         
         // Sequential nonce within GPU's range (using original working format)
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
@@ -481,7 +476,7 @@ void calculate_mining_launch_config(
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
     
-    threads_per_block = MINING_THREADS_PER_BLOCK;
+    threads_per_block = (g_block_size > 0) ? g_block_size : MINING_THREADS_PER_BLOCK;
     
     // Calculate optimal number of blocks
     // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
@@ -680,16 +675,14 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         return std::nullopt;
     }
     
-    // Synchronize on the stream (more efficient than cudaDeviceSynchronize)
-    cudaError_t sync_err = cudaStreamSynchronize(buffer.mining_stream);
+    // Check if solution was found
+    // Note: cudaMemcpy implicitly synchronizes with the device, so no need for explicit sync
+    int solution_found = 0;
+    cudaError_t sync_err = cudaMemcpy(&solution_found, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
     if (sync_err != cudaSuccess) {
-        LOG_ERROR("mining_kernel stream sync", sync_err);
+        LOG_ERROR("mining_kernel memcpy sync", sync_err);
         return std::nullopt;
     }
-    
-    // Check if solution was found
-    int solution_found = 0;
-    cudaMemcpy(&solution_found, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
     
     if (solution_found) {
         // Copy solution data back to host

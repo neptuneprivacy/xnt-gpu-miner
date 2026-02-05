@@ -73,28 +73,9 @@ bool GpuWorker::initializeCuda() {
     gpu_resources->gpu_name = prop.name;
     gpu_resources->gpu_vram_total = prop.totalGlobalMem;
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
-    gpu_resources->optimal_max_nonces = 1000000ULL;
     
-    // Calculate optimal batch size based on GPU capabilities
-    // For high-end GPUs (RTX 5090, etc.), use larger batches for better performance
-    // Target: ~900ms batch duration at ~16-20 MH/s = ~15-20M nonces per batch
-    int num_sms = prop.multiProcessorCount;
-    
-    // Scale by SM count (RTX 5090 has ~256 SMs, older GPUs have fewer)
-    // Increased batch sizes for better GPU utilization and reduced kernel launch overhead
-    if (num_sms >= 200) {
-        // High-end GPU (RTX 5090, A100, H100, etc.)
-        gpu_resources->optimal_max_nonces = 50000000ULL; // 50M nonces (increased from 20M)
-    } else if (num_sms >= 100) {
-        // Mid-high end GPU (RTX 4090, A6000, etc.)
-        gpu_resources->optimal_max_nonces = 30000000ULL; // 30M nonces (increased from 15M)
-    } else if (num_sms >= 50) {
-        // Mid-range GPU
-        gpu_resources->optimal_max_nonces = 20000000ULL; // 20M nonces (increased from 10M)
-    } else {
-        // Lower-end GPU
-        gpu_resources->optimal_max_nonces = 10000000ULL; // 10M nonces (increased from 5M)
-    }
+    // Use fixed batch size: 2^26 = 64M nonces per kernel
+    gpu_resources->optimal_max_nonces = g_batch_size;
     
     return true;
 }
@@ -336,21 +317,8 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_vram_total = prop.totalGlobalMem;
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
     
-    // Calculate optimal batch size based on GPU capabilities
-    int num_sms = prop.multiProcessorCount;
-    if (num_sms >= 200) {
-        // High-end GPU (RTX 5090, A100, H100, etc.)
-        gpu_res->optimal_max_nonces = 50000000ULL; // 50M nonces (increased from 20M)
-    } else if (num_sms >= 100) {
-        // Mid-high end GPU (RTX 4090, A6000, etc.)
-        gpu_res->optimal_max_nonces = 30000000ULL; // 30M nonces (increased from 15M)
-    } else if (num_sms >= 50) {
-        // Mid-range GPU
-        gpu_res->optimal_max_nonces = 20000000ULL; // 20M nonces (increased from 10M)
-    } else {
-        // Lower-end GPU
-        gpu_res->optimal_max_nonces = 10000000ULL; // 10M nonces (increased from 5M)
-    }
+    // Use fixed batch size: 2^26 = 64M nonces per kernel
+    gpu_res->optimal_max_nonces = g_batch_size;
     gpu_res->mining_mode = mining_mode;
     
     // Create GpuWorker (uses shared connection through multiplexer)
