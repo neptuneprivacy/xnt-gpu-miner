@@ -289,19 +289,15 @@ __device__ void generated_function(const uint64_t* input, uint64_t* output) {
     output[15] = node_159 - node_1657;
 }
 
+// Extern declaration for the shared lookup table loaded by mining kernels
+// This is defined in kernels.cu and loaded ONCE at kernel start with __syncthreads
+extern __shared__ uint8_t s_lookup_table[256];
+
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
-    __shared__ uint8_t shared_lut[256];
-    int tid = threadIdx.x;
-    
-    if (tid < 32) {
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            int idx = tid * 8 + i;
-            shared_lut[idx] = LOOKUP_TABLE[idx];
-        }
-    }
-    __syncthreads();
-    
+    // NO __syncthreads here - the lookup table is already loaded by the kernel
+    // and synced before any thread enters the mining loop
+
+    // Vectorized load of all 16 elements
     ulonglong2 v0 = *reinterpret_cast<const ulonglong2*>(&state_in[0]);
     ulonglong2 v1 = *reinterpret_cast<const ulonglong2*>(&state_in[2]);
     ulonglong2 v2 = *reinterpret_cast<const ulonglong2*>(&state_in[4]);
@@ -310,7 +306,7 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     ulonglong2 v5 = *reinterpret_cast<const ulonglong2*>(&state_in[10]);
     ulonglong2 v6 = *reinterpret_cast<const ulonglong2*>(&state_in[12]);
     ulonglong2 v7 = *reinterpret_cast<const ulonglong2*>(&state_in[14]);
-    
+
     uint64_t e0 = v0.x, e1 = v0.y;
     uint64_t e2 = v1.x, e3 = v1.y;
     uint64_t e4 = v2.x, e5 = v2.y;
@@ -319,24 +315,130 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     uint64_t e10 = v5.x, e11 = v5.y;
     uint64_t e12 = v6.x, e13 = v6.y;
     uint64_t e14 = v7.x, e15 = v7.y;
-    
-    e0 = split_lookup_shared(e0, shared_lut);
-    e1 = split_lookup_shared(e1, shared_lut);
-    e2 = split_lookup_shared(e2, shared_lut);
-    e3 = split_lookup_shared(e3, shared_lut);
-    e4 = x7_computer(e4);
-    e5 = x7_computer(e5);
-    e6 = x7_computer(e6);
-    e7 = x7_computer(e7);
-    e8 = x7_computer(e8);
-    e9 = x7_computer(e9);
-    e10 = x7_computer(e10);
-    e11 = x7_computer(e11);
-    e12 = x7_computer(e12);
-    e13 = x7_computer(e13);
-    e14 = x7_computer(e14);
-    e15 = x7_computer(e15);
-    
+
+    // Use the kernel's pre-loaded s_lookup_table (no sync needed)
+    e0 = split_lookup_shared(e0, s_lookup_table);
+    e1 = split_lookup_shared(e1, s_lookup_table);
+    e2 = split_lookup_shared(e2, s_lookup_table);
+    e3 = split_lookup_shared(e3, s_lookup_table);
+
+    // ILP-OPTIMIZED x^7 computation for elements 4-15 (12 elements)
+    // Interleave multiplications across all elements to hide latency
+    // x^7 = x * x^2 * x^4 where x^2 = x*x, x^4 = x^2*x^2, x^6 = x^4*x^2
+
+    // Stage 1: Compute x^2 for all 12 elements (issue all multiplications together)
+    uint64_t lo4_2  = e4 * e4,   hi4_2  = __umul64hi(e4, e4);
+    uint64_t lo5_2  = e5 * e5,   hi5_2  = __umul64hi(e5, e5);
+    uint64_t lo6_2  = e6 * e6,   hi6_2  = __umul64hi(e6, e6);
+    uint64_t lo7_2  = e7 * e7,   hi7_2  = __umul64hi(e7, e7);
+    uint64_t lo8_2  = e8 * e8,   hi8_2  = __umul64hi(e8, e8);
+    uint64_t lo9_2  = e9 * e9,   hi9_2  = __umul64hi(e9, e9);
+    uint64_t lo10_2 = e10 * e10, hi10_2 = __umul64hi(e10, e10);
+    uint64_t lo11_2 = e11 * e11, hi11_2 = __umul64hi(e11, e11);
+    uint64_t lo12_2 = e12 * e12, hi12_2 = __umul64hi(e12, e12);
+    uint64_t lo13_2 = e13 * e13, hi13_2 = __umul64hi(e13, e13);
+    uint64_t lo14_2 = e14 * e14, hi14_2 = __umul64hi(e14, e14);
+    uint64_t lo15_2 = e15 * e15, hi15_2 = __umul64hi(e15, e15);
+
+    // Reduce all x^2 results
+    uint64_t x4_2  = montyred_from_parts(hi4_2, lo4_2);
+    uint64_t x5_2  = montyred_from_parts(hi5_2, lo5_2);
+    uint64_t x6_2  = montyred_from_parts(hi6_2, lo6_2);
+    uint64_t x7_2  = montyred_from_parts(hi7_2, lo7_2);
+    uint64_t x8_2  = montyred_from_parts(hi8_2, lo8_2);
+    uint64_t x9_2  = montyred_from_parts(hi9_2, lo9_2);
+    uint64_t x10_2 = montyred_from_parts(hi10_2, lo10_2);
+    uint64_t x11_2 = montyred_from_parts(hi11_2, lo11_2);
+    uint64_t x12_2 = montyred_from_parts(hi12_2, lo12_2);
+    uint64_t x13_2 = montyred_from_parts(hi13_2, lo13_2);
+    uint64_t x14_2 = montyred_from_parts(hi14_2, lo14_2);
+    uint64_t x15_2 = montyred_from_parts(hi15_2, lo15_2);
+
+    // Stage 2: Compute x^4 for all 12 elements
+    uint64_t lo4_4  = x4_2 * x4_2,   hi4_4  = __umul64hi(x4_2, x4_2);
+    uint64_t lo5_4  = x5_2 * x5_2,   hi5_4  = __umul64hi(x5_2, x5_2);
+    uint64_t lo6_4  = x6_2 * x6_2,   hi6_4  = __umul64hi(x6_2, x6_2);
+    uint64_t lo7_4  = x7_2 * x7_2,   hi7_4  = __umul64hi(x7_2, x7_2);
+    uint64_t lo8_4  = x8_2 * x8_2,   hi8_4  = __umul64hi(x8_2, x8_2);
+    uint64_t lo9_4  = x9_2 * x9_2,   hi9_4  = __umul64hi(x9_2, x9_2);
+    uint64_t lo10_4 = x10_2 * x10_2, hi10_4 = __umul64hi(x10_2, x10_2);
+    uint64_t lo11_4 = x11_2 * x11_2, hi11_4 = __umul64hi(x11_2, x11_2);
+    uint64_t lo12_4 = x12_2 * x12_2, hi12_4 = __umul64hi(x12_2, x12_2);
+    uint64_t lo13_4 = x13_2 * x13_2, hi13_4 = __umul64hi(x13_2, x13_2);
+    uint64_t lo14_4 = x14_2 * x14_2, hi14_4 = __umul64hi(x14_2, x14_2);
+    uint64_t lo15_4 = x15_2 * x15_2, hi15_4 = __umul64hi(x15_2, x15_2);
+
+    // Reduce all x^4 results
+    uint64_t x4_4  = montyred_from_parts(hi4_4, lo4_4);
+    uint64_t x5_4  = montyred_from_parts(hi5_4, lo5_4);
+    uint64_t x6_4  = montyred_from_parts(hi6_4, lo6_4);
+    uint64_t x7_4  = montyred_from_parts(hi7_4, lo7_4);
+    uint64_t x8_4  = montyred_from_parts(hi8_4, lo8_4);
+    uint64_t x9_4  = montyred_from_parts(hi9_4, lo9_4);
+    uint64_t x10_4 = montyred_from_parts(hi10_4, lo10_4);
+    uint64_t x11_4 = montyred_from_parts(hi11_4, lo11_4);
+    uint64_t x12_4 = montyred_from_parts(hi12_4, lo12_4);
+    uint64_t x13_4 = montyred_from_parts(hi13_4, lo13_4);
+    uint64_t x14_4 = montyred_from_parts(hi14_4, lo14_4);
+    uint64_t x15_4 = montyred_from_parts(hi15_4, lo15_4);
+
+    // Stage 3: Compute x^6 = x^4 * x^2 for all 12 elements
+    uint64_t lo4_6  = x4_4 * x4_2,   hi4_6  = __umul64hi(x4_4, x4_2);
+    uint64_t lo5_6  = x5_4 * x5_2,   hi5_6  = __umul64hi(x5_4, x5_2);
+    uint64_t lo6_6  = x6_4 * x6_2,   hi6_6  = __umul64hi(x6_4, x6_2);
+    uint64_t lo7_6  = x7_4 * x7_2,   hi7_6  = __umul64hi(x7_4, x7_2);
+    uint64_t lo8_6  = x8_4 * x8_2,   hi8_6  = __umul64hi(x8_4, x8_2);
+    uint64_t lo9_6  = x9_4 * x9_2,   hi9_6  = __umul64hi(x9_4, x9_2);
+    uint64_t lo10_6 = x10_4 * x10_2, hi10_6 = __umul64hi(x10_4, x10_2);
+    uint64_t lo11_6 = x11_4 * x11_2, hi11_6 = __umul64hi(x11_4, x11_2);
+    uint64_t lo12_6 = x12_4 * x12_2, hi12_6 = __umul64hi(x12_4, x12_2);
+    uint64_t lo13_6 = x13_4 * x13_2, hi13_6 = __umul64hi(x13_4, x13_2);
+    uint64_t lo14_6 = x14_4 * x14_2, hi14_6 = __umul64hi(x14_4, x14_2);
+    uint64_t lo15_6 = x15_4 * x15_2, hi15_6 = __umul64hi(x15_4, x15_2);
+
+    // Reduce all x^6 results
+    uint64_t x4_6  = montyred_from_parts(hi4_6, lo4_6);
+    uint64_t x5_6  = montyred_from_parts(hi5_6, lo5_6);
+    uint64_t x6_6  = montyred_from_parts(hi6_6, lo6_6);
+    uint64_t x7_6  = montyred_from_parts(hi7_6, lo7_6);
+    uint64_t x8_6  = montyred_from_parts(hi8_6, lo8_6);
+    uint64_t x9_6  = montyred_from_parts(hi9_6, lo9_6);
+    uint64_t x10_6 = montyred_from_parts(hi10_6, lo10_6);
+    uint64_t x11_6 = montyred_from_parts(hi11_6, lo11_6);
+    uint64_t x12_6 = montyred_from_parts(hi12_6, lo12_6);
+    uint64_t x13_6 = montyred_from_parts(hi13_6, lo13_6);
+    uint64_t x14_6 = montyred_from_parts(hi14_6, lo14_6);
+    uint64_t x15_6 = montyred_from_parts(hi15_6, lo15_6);
+
+    // Stage 4: Compute x^7 = x^6 * x for all 12 elements
+    uint64_t lo4_7  = x4_6 * e4,   hi4_7  = __umul64hi(x4_6, e4);
+    uint64_t lo5_7  = x5_6 * e5,   hi5_7  = __umul64hi(x5_6, e5);
+    uint64_t lo6_7  = x6_6 * e6,   hi6_7  = __umul64hi(x6_6, e6);
+    uint64_t lo7_7  = x7_6 * e7,   hi7_7  = __umul64hi(x7_6, e7);
+    uint64_t lo8_7  = x8_6 * e8,   hi8_7  = __umul64hi(x8_6, e8);
+    uint64_t lo9_7  = x9_6 * e9,   hi9_7  = __umul64hi(x9_6, e9);
+    uint64_t lo10_7 = x10_6 * e10, hi10_7 = __umul64hi(x10_6, e10);
+    uint64_t lo11_7 = x11_6 * e11, hi11_7 = __umul64hi(x11_6, e11);
+    uint64_t lo12_7 = x12_6 * e12, hi12_7 = __umul64hi(x12_6, e12);
+    uint64_t lo13_7 = x13_6 * e13, hi13_7 = __umul64hi(x13_6, e13);
+    uint64_t lo14_7 = x14_6 * e14, hi14_7 = __umul64hi(x14_6, e14);
+    uint64_t lo15_7 = x15_6 * e15, hi15_7 = __umul64hi(x15_6, e15);
+
+    // Final reduction for x^7 results
+    e4  = montyred_from_parts(hi4_7, lo4_7);
+    e5  = montyred_from_parts(hi5_7, lo5_7);
+    e6  = montyred_from_parts(hi6_7, lo6_7);
+    e7  = montyred_from_parts(hi7_7, lo7_7);
+    e8  = montyred_from_parts(hi8_7, lo8_7);
+    e9  = montyred_from_parts(hi9_7, lo9_7);
+    e10 = montyred_from_parts(hi10_7, lo10_7);
+    e11 = montyred_from_parts(hi11_7, lo11_7);
+    e12 = montyred_from_parts(hi12_7, lo12_7);
+    e13 = montyred_from_parts(hi13_7, lo13_7);
+    e14 = montyred_from_parts(hi14_7, lo14_7);
+    e15 = montyred_from_parts(hi15_7, lo15_7);
+
+    // Vectorized store
     *reinterpret_cast<ulonglong2*>(&state_out[0]) = make_ulonglong2(e0, e1);
     *reinterpret_cast<ulonglong2*>(&state_out[2]) = make_ulonglong2(e2, e3);
     *reinterpret_cast<ulonglong2*>(&state_out[4]) = make_ulonglong2(e4, e5);
@@ -349,27 +451,25 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
 
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
-    
+
     // Split each element into lo and hi 32-bit limbs
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         uint64_t b = state_in[i];
         lo[i] = b & 0xFFFFFFFFUL;
         hi[i] = b >> 32;
     }
-    
+
     // Process each limb with FFT-based generated_function
     uint64_t lo_out[STATE_SIZE], hi_out[STATE_SIZE];
     generated_function(lo, lo_out);
     generated_function(hi, hi_out);
-    
+
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
         uint64_t s_hi = (uint64_t)(s >> 64);
         uint64_t s_lo = (uint64_t)s;
-        
+
         // Goldilocks reduction with overflow check
         uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
         bool overflow = (res < s_lo);
@@ -378,7 +478,6 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
 }
 
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out) {
-    #pragma unroll
     for (int i = 0; i < STATE_SIZE; ++i) {
         state_out[i] = fast_field_add(state_in[i], ROUND_CONSTANTS[round_index][i]);
     }
@@ -388,7 +487,7 @@ __host__ void sbox_layer_host(const uint64_t* state_in, uint64_t* state_out) {
     for (int i = 0; i < 4; ++i) {
         state_out[i] = split_lookup_host(state_in[i]);
     }
-    
+
     for (int i = 4; i < STATE_SIZE; ++i) {
         state_out[i] = x7_computer_host(state_in[i]);
     }
@@ -429,7 +528,7 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out) {
         uint64_t lower = (uint64_t)acc;
         uint64_t upper = (uint64_t)(acc >> 64);
 #endif
-        
+
 #ifdef _WIN32
         #ifdef _MSC_VER
             unsigned __int64 mul_high;
@@ -445,7 +544,7 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out) {
         __uint128_t temp128 = (__uint128_t)lower + (__uint128_t)upper * 0xFFFFFFFFULL;
         uint64_t temp = (uint64_t)temp128;
 #endif
-        
+
 #ifdef _WIN32
         #ifdef _MSC_VER
             if (temp >= 0xFFFFFFFF00000001ULL) {
@@ -461,11 +560,11 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out) {
             temp += (uint64_t)(temp128 >> 64) * 0xFFFFFFFFULL;
         }
 #endif
-        
+
         while (temp >= GOLDILOCKS_MODULUS) {
             temp -= GOLDILOCKS_MODULUS;
         }
-        
+
         state_out[i] = temp;
     }
 }
@@ -476,16 +575,15 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
     }
 }
 
-__device__ void tip5_permutation(uint64_t* state) {
+__device__ __noinline__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
-    
+
     // OPTIMIZATION: Fused round constants - no separate function call
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         sbox_layer(state, temp_state);
         mds_layer(temp_state, state);
-        
+
         // Fused round constants addition
-        #pragma unroll
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
         }
@@ -494,12 +592,12 @@ __device__ void tip5_permutation(uint64_t* state) {
 
 __host__ void tip5_permutation_host(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
-    
+
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         sbox_layer_host(state, temp_state);
         mds_layer_host(temp_state, state);
         round_constants_layer_host(round, state, temp_state);
-        
+
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = temp_state[i];
         }
@@ -510,7 +608,7 @@ __host__ void tip5_sponge_init_host(uint64_t* state, Domain domain) {
     for (int i = 0; i < STATE_SIZE; ++i) {
         state[i] = BFE_ZERO;
     }
-    
+
     if (domain == Domain::FixedLength) {
         for (int i = RATE; i < STATE_SIZE; ++i) {
             state[i] = static_cast<uint64_t>(domain);

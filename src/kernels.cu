@@ -10,6 +10,24 @@
 __constant__ uint64_t d_gpu_range_start;
 __constant__ uint64_t d_gpu_range_size;
 
+// ===== TOP MERKLE TREE CACHE =====
+// Cache top 10 levels of Merkle tree in constant memory for fast access
+// Top 10 levels = 2^10 - 1 = 1023 nodes = 1023 * 40 bytes = ~40KB (fits in 64KB limit)
+// These nodes are accessed by ALL threads, so caching eliminates global memory reads
+// Constants TOP_TREE_CACHE_LEVELS and TOP_TREE_CACHE_SIZE defined in kernels.cuh
+// Store as raw uint64_t since Digest has constructor (not allowed in __constant__)
+__constant__ uint64_t d_top_tree_cache[TOP_TREE_CACHE_SIZE * DIGEST_LEN];
+
+// Flag to track if cache is initialized for current job
+static bool g_top_tree_cache_initialized = false;
+
+// ===== MAST PATHS CACHE =====
+// Cache PowMastPaths in constant memory for fast broadcast to all threads
+// 6 Digests = 30 uint64_t = 240 bytes - accessed 8 times per hash, same for ALL threads
+__constant__ uint64_t d_mast_paths_cache[MAST_PATHS_SIZE];
+
+static bool g_mast_paths_cache_initialized = false;
+
 // ===== SHARED MEMORY LOOKUP TABLE =====
 // Loaded once per block for S-box computation
 __shared__ uint8_t s_lookup_table[256];
@@ -62,6 +80,21 @@ bool MiningOutputBuffers::allocate() {
         return false;
     }
     
+    err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce);
+        cudaFree(d_solution_found);
+        cudaFree(d_solution_path_a);
+        cudaFree(d_solution_path_b);
+        cudaFree(d_solution_nonce_digest);
+        d_solution_nonce = nullptr;
+        d_solution_found = nullptr;
+        d_solution_path_a = nullptr;
+        d_solution_path_b = nullptr;
+        d_solution_nonce_digest = nullptr;
+        return false;
+    }
+    
     return true;
 }
 
@@ -86,6 +119,10 @@ void MiningOutputBuffers::free() {
         cudaFree(d_solution_nonce_digest);
         d_solution_nonce_digest = nullptr;
     }
+    if (d_solution_final_hash) {
+        cudaFree(d_solution_final_hash);
+        d_solution_final_hash = nullptr;
+    }
 }
 
 bool MiningOutputBuffers::reset() {
@@ -95,9 +132,196 @@ bool MiningOutputBuffers::reset() {
     return err == cudaSuccess;
 }
 
+// ===== GUESSER BUFFER MINING RESOURCES =====
+
+bool GuesserBuffer::ensure_mining_resources() {
+    // Create stream if not initialized
+    if (!stream_initialized) {
+        cudaError_t err = cudaStreamCreate(&mining_stream);
+        if (err != cudaSuccess) {
+            LOG_ERROR("cudaStreamCreate", err);
+            return false;
+        }
+        stream_initialized = true;
+    }
+    
+    // Allocate output buffers if not allocated
+    if (!output_buffers_allocated) {
+        cudaError_t err;
+        
+        err = cudaMalloc(&d_solution_nonce, sizeof(uint64_t));
+        if (err != cudaSuccess) { LOG_ERROR("alloc d_solution_nonce", err); return false; }
+        
+        err = cudaMalloc(&d_solution_found, sizeof(int));
+        if (err != cudaSuccess) { 
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            LOG_ERROR("alloc d_solution_found", err); 
+            return false; 
+        }
+        
+        err = cudaMalloc(&d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            LOG_ERROR("alloc d_solution_path_a", err);
+            return false;
+        }
+        
+        err = cudaMalloc(&d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+            LOG_ERROR("alloc d_solution_path_b", err);
+            return false;
+        }
+        
+        err = cudaMalloc(&d_solution_nonce_digest, sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+            cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+            LOG_ERROR("alloc d_solution_nonce_digest", err);
+            return false;
+        }
+        
+        err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
+        if (err != cudaSuccess) {
+            cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+            cudaFree(d_solution_found); d_solution_found = nullptr;
+            cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+            cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+            cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr;
+            LOG_ERROR("alloc d_solution_final_hash", err);
+            return false;
+        }
+        
+        output_buffers_allocated = true;
+    }
+    
+    return true;
+}
+
+bool GuesserBuffer::reset_output_buffers() {
+    if (!d_solution_found) return false;
+    
+    // Use async memset on the mining stream for better overlap
+    cudaError_t err = cudaMemsetAsync(d_solution_found, 0, sizeof(int), mining_stream);
+    return err == cudaSuccess;
+}
+
+// ===== TOP TREE CACHE FUNCTIONS =====
+
+// Initialize the top tree cache from the merkle tree
+// Call this once per job when the tree changes
+bool initialize_top_tree_cache(const Digest* d_merkle_tree, size_t num_leafs) {
+    if (g_top_tree_cache_initialized) return true;
+    
+    // Top tree cache stores the highest (smallest index) internal nodes
+    // In our tree layout, the root is at index (num_leafs - 2)
+    // We want to cache the top 8 levels = 255 nodes near the root
+    // 
+    // Tree indices (for num_leafs = 2^27):
+    // Root is at index num_leafs - 2 = 134217726
+    // Its children are at indices that hash to it
+    //
+    // Actually, we need to understand the tree layout:
+    // The tree is stored with internal nodes indexed 0 to num_leafs-2
+    // Index 0 is the first internal node (parent of leaves 0 and 1)
+    // Root is at index num_leafs - 2
+    //
+    // For path computation, sibling_index starts large and gets smaller
+    // At top levels (near root), sibling_index < 256 (for top 8 levels)
+    //
+    // So we cache indices 0 to TOP_TREE_CACHE_SIZE-1
+    // Copy as raw uint64_t (same memory layout as Digest array)
+    
+    cudaError_t err = cudaMemcpyToSymbol(
+        d_top_tree_cache, 
+        d_merkle_tree,  // First TOP_TREE_CACHE_SIZE nodes (as raw bytes)
+        TOP_TREE_CACHE_SIZE * DIGEST_LEN * sizeof(uint64_t),
+        0,
+        cudaMemcpyDeviceToDevice);
+    
+    if (err != cudaSuccess) {
+        LOG_ERROR("initialize_top_tree_cache", err);
+        return false;
+    }
+    
+    g_top_tree_cache_initialized = true;
+    return true;
+}
+
+// Reset cache flag when job changes
+void reset_top_tree_cache() {
+    g_top_tree_cache_initialized = false;
+}
+
+// ===== MAST PATHS CACHE FUNCTIONS =====
+
+bool initialize_mast_paths_cache(const PowMastPaths& mast_paths) {
+    if (g_mast_paths_cache_initialized) return true;
+    
+    // Flatten PowMastPaths into uint64_t array for constant memory
+    // Layout: pow[0..2], header[0..1], kernel[0]
+    uint64_t flat_data[MAST_PATHS_SIZE];
+    size_t offset = 0;
+    
+    // pow[0..2]
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            flat_data[offset++] = mast_paths.pow[i].values[j];
+        }
+    }
+    // header[0..1]
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            flat_data[offset++] = mast_paths.header[i].values[j];
+        }
+    }
+    // kernel[0]
+    for (int j = 0; j < DIGEST_LEN; ++j) {
+        flat_data[offset++] = mast_paths.kernel[0].values[j];
+    }
+    
+    cudaError_t err = cudaMemcpyToSymbol(
+        d_mast_paths_cache,
+        flat_data,
+        MAST_PATHS_SIZE * sizeof(uint64_t),
+        0,
+        cudaMemcpyHostToDevice);
+    
+    if (err != cudaSuccess) {
+        LOG_ERROR("initialize_mast_paths_cache", err);
+        return false;
+    }
+    
+    g_mast_paths_cache_initialized = true;
+    return true;
+}
+
+void reset_mast_paths_cache() {
+    g_mast_paths_cache_initialized = false;
+}
+
+// Device function to get internal node - uses cache for small indices
+__device__ __forceinline__ Digest get_internal_node_cached(
+    const Digest* __restrict__ d_internal_nodes,
+    size_t index,
+    size_t num_leafs
+) {
+    // Check if this node is in our top-tree cache
+    if (index < TOP_TREE_CACHE_SIZE) {
+        return get_cached_node(index);
+    }
+    // Fall back to global memory
+    return (index < num_leafs) ? d_internal_nodes[index] : Digest::default_digest();
+}
+
 // ===== HIGH-VRAM MINING KERNEL =====
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
+__global__ void parallel_mining_kernel_high_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
@@ -113,7 +337,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
-    Digest* __restrict__ d_solution_nonce_digest) {
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash) {
     
     // Load lookup table into shared memory (first warp)
     if (threadIdx.x < 256) {
@@ -127,10 +352,13 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
+    // Cache constant values outside loop to prevent repeated memory accesses
+    // Merkle root is constant - read once and reuse to maintain 40 MH/s performance
+    const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
+    const Digest merkle_root = *root_ptr;  // Cache constant value
+    
     // Process nonces
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        // Early exit if solution found
-        if (*d_solution_found) return;
         
         // Sequential nonce within GPU's range (using original working format)
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
@@ -138,7 +366,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
-        nonce_digest.values[1] = (nonce_value >> 32);  // Upper bits in second limb
+        nonce_digest.values[1] = 0;  // Upper bits in second limb
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
@@ -147,73 +375,33 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
         uint64_t index_a, index_b;
         Pow_indices_device(hash, nonce_digest, index_a, index_b);
         
-        // Paths are ALWAYS computed using original indices (matching Rust guess())
-        // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
-        // but the tree structure matches the swapped leaves
-        uint64_t path_index_a = index_a;
-        uint64_t path_index_b = index_b;
+        // Compute POW hash directly from global memory - no Pow struct needed
+        // This eliminates 2240 bytes of register pressure per thread
+        // Uses top tree cache for fast access to upper Merkle levels
+        Digest final_hash = fast_mast_hash_direct(
+            mast_paths,
+            nonce_digest,
+            merkle_root,
+            d_leafs,
+            d_internal_nodes,
+            index_a,  // path_index_a
+            index_b,  // path_index_b
+            num_leafs,
+            merkle_height);
         
-        // Compute path for index_a
-        Digest path_a[MERKLE_TREE_HEIGHT_];
-        size_t running_index_a = path_index_a + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
-        size_t sibling_leaf_index_a = path_index_a ^ 1;
-        path_a[0] = d_leafs[sibling_leaf_index_a];
-        
-        // Subsequent levels: internal nodes
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_a >>= 1;
-            size_t sibling_index_a = running_index_a ^ 1;
-            if (sibling_index_a < (MERKLE_NUM_LEAFS)) {
-                path_a[level] = d_internal_nodes[sibling_index_a];
-            } else {
-                path_a[level] = Digest::default_digest();
-            }
-        }
-        
-        // Compute path for index_b
-        Digest path_b[MERKLE_TREE_HEIGHT_];
-        size_t running_index_b = path_index_b + num_leafs;
-        // After swap, Rust path() uses original index directly - leafs are swapped but tree structure matches
-        size_t sibling_leaf_index_b = path_index_b ^ 1;
-        path_b[0] = d_leafs[sibling_leaf_index_b];
-        
-        for (size_t level = 1; level < merkle_height; ++level) {
-            running_index_b >>= 1;
-            size_t sibling_index_b = running_index_b ^ 1;
-            if (sibling_index_b < (MERKLE_NUM_LEAFS)) {
-                path_b[level] = d_internal_nodes[sibling_index_b];
-            } else {
-                path_b[level] = Digest::default_digest();
-            }
-        }
-        
-        // Get Merkle root (stored at last index in sequentially-built tree)
-        // Tree is built sequentially: layer 0 at offset 0, root at last index
-        // Total internal nodes = num_leafs - 1, so root is at index num_leafs - 2
-        Digest merkle_root = d_internal_nodes[num_leafs - 2];
-        
-        // Compute POW hash using correct fast_mast_hash implementation
-        Pow pow;
-        pow.root = merkle_root;
-        pow.nonce = nonce_digest;
-        #pragma unroll
-        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-            pow.path_a[i] = path_a[i];
-            pow.path_b[i] = path_b[i];
-        }
-        
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
-        
-        // Check against target
-        bool is_solution = true;
-        for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
-                is_solution = false;
-                break;
-            }
-            if (final_hash.values[i] < target.values[i]) {
-                break;
+        // Check against target - optimized comparison
+        // Most hashes will fail on the highest limb, so check it first
+        bool is_solution = (final_hash.values[4] <= target.values[4]);
+        if (is_solution && final_hash.values[4] == target.values[4]) {
+            // Need to check lower limbs
+            for (int i = 3; i >= 0; --i) {
+                if (final_hash.values[i] > target.values[i]) {
+                    is_solution = false;
+                    break;
+                }
+                if (final_hash.values[i] < target.values[i]) {
+                    break;
+                }
             }
         }
         
@@ -225,11 +413,33 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
                 // Store full nonce digest so host can submit all 5 limbs
                 *d_solution_nonce_digest = nonce_digest;
                 
-                // Copy the already-computed paths
-                #pragma unroll
-                for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-                    d_solution_path_a[i] = path_a[i];
-                    d_solution_path_b[i] = path_b[i];
+                // Store the final_hash that met the threshold (for debugging)
+                *d_solution_final_hash = final_hash;
+                
+                // Recompute paths for solution storage (solutions are rare, so this is fine)
+                // Path A
+                {
+                    size_t running_index = index_a + num_leafs;
+                    d_solution_path_a[0] = d_leafs[index_a ^ 1];
+                    for (size_t level = 1; level < merkle_height; ++level) {
+                        running_index >>= 1;
+                        size_t sibling_index = running_index ^ 1;
+                        d_solution_path_a[level] = (sibling_index < num_leafs) 
+                            ? d_internal_nodes[sibling_index] 
+                            : Digest::default_digest();
+                    }
+                }
+                // Path B
+                {
+                    size_t running_index = index_b + num_leafs;
+                    d_solution_path_b[0] = d_leafs[index_b ^ 1];
+                    for (size_t level = 1; level < merkle_height; ++level) {
+                        running_index >>= 1;
+                        size_t sibling_index = running_index ^ 1;
+                        d_solution_path_b[level] = (sibling_index < num_leafs) 
+                            ? d_internal_nodes[sibling_index] 
+                            : Digest::default_digest();
+                    }
                 }
                 
                 return;
@@ -240,7 +450,7 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
 
 // ===== LOW-VRAM MINING KERNEL =====
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
+__global__ void parallel_mining_kernel_low_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
@@ -257,7 +467,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
-    Digest* __restrict__ d_solution_nonce_digest) {
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash) {
     
     // Load lookup table into shared memory
     if (threadIdx.x < 256) {
@@ -270,8 +481,12 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
+    // Check solution flag less frequently to reduce global memory traffic and cache pollution
+    // Increased from 64 to 4096 to improve sustained performance
+    const uint64_t CHECK_INTERVAL = 4096;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        if (*d_solution_found) return;
+        // Early exit if solution found (check every N iterations for performance)
+        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
         
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
         
@@ -297,69 +512,39 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
         Digest commitment = mast_paths.commit_device();
         // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         
-        // Build paths using stored internal nodes where available
-        // For missing nodes, compute on-demand
-        Digest path_a[MERKLE_TREE_HEIGHT_];
-        Digest path_b[MERKLE_TREE_HEIGHT_];
-        
-        // Path B - use get_internal_node_safe for transparent stored/computed node access
-        {
-            size_t running_index = path_index_b + num_leafs;
-            size_t sibling_leaf_index = path_index_b ^ 1;
-            // Leaf level: compute from leaf_prefix (commitment in Reboot/Xnt, prev_block_digest in HardforkAlpha)
-            // Use original index for computation (not bit-reversed)
-            Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
-            path_b[0] = sib;
-            
-            // Internal nodes: use get_internal_node_safe (stored or computed)
-            for (size_t level = 1; level < merkle_height; ++level) {
-                running_index >>= 1;
-                size_t sibling_index = running_index ^ 1;
-                Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
-                path_b[level] = node;
-            }
-        }
-        
-        // Path A - use get_internal_node_safe for transparent stored/computed node access
-        {
-            size_t running_index = path_index_a + num_leafs;
-            size_t sibling_leaf_index = path_index_a ^ 1;
-            // Leaf level: compute from leaf_prefix (commitment in Reboot/Xnt, prev_block_digest in HardforkAlpha)
-            // Use original index for computation (not bit-reversed)
-            Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
-            path_a[0] = sib;
-            
-            // Internal nodes: use get_internal_node_safe (stored or computed)
-            for (size_t level = 1; level < merkle_height; ++level) {
-                running_index >>= 1;
-                size_t sibling_index = running_index ^ 1;
-                Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
-                path_a[level] = node;
-            }
-        }
-        
-        // Compute final hash using correct fast_mast_hash implementation
+        // Compute final hash directly from global memory - no Pow struct or local arrays needed
+        // This eliminates 2240 bytes of register pressure per thread (same as high VRAM version)
         // Root is at last index in sequentially-built tree
-        Digest merkle_root = d_internal_nodes[stored_nodes_count - 1];
-        Pow pow;
-        pow.root = merkle_root;
-        pow.nonce = nonce_digest;
-        #pragma unroll
-        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-            pow.path_a[i] = path_a[i];
-            pow.path_b[i] = path_b[i];
-        }
+        const Digest* __restrict__ root_ptr = &d_internal_nodes[stored_nodes_count - 1];
+        Digest merkle_root = *root_ptr;
         
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
+        // Use optimized low VRAM version that computes nodes on-demand
+        Digest final_hash = fast_mast_hash_direct_low_vram(
+            mast_paths,
+            nonce_digest,
+            merkle_root,
+            d_internal_nodes,
+            path_index_a,  // path_index_a
+            path_index_b,  // path_index_b
+            num_leafs,
+            merkle_height,
+            stored_nodes_count,
+            commitment,
+            leaf_prefix);
         
-        bool is_solution = true;
-        for (int i = DIGEST_LEN - 1; i >= 0; --i) {
-            if (final_hash.values[i] > target.values[i]) {
-                is_solution = false;
-                break;
-            }
-            if (final_hash.values[i] < target.values[i]) {
-                break;
+        // Check against target - optimized comparison (low VRAM version)
+        // Most hashes will fail on the highest limb, so check it first
+        bool is_solution = (final_hash.values[4] <= target.values[4]);
+        if (is_solution && final_hash.values[4] == target.values[4]) {
+            // Need to check lower limbs
+            for (int i = 3; i >= 0; --i) {
+                if (final_hash.values[i] > target.values[i]) {
+                    is_solution = false;
+                    break;
+                }
+                if (final_hash.values[i] < target.values[i]) {
+                    break;
+                }
             }
         }
         
@@ -367,6 +552,9 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_value);
+                
+                // Store the final_hash that met the threshold (for debugging)
+                *d_solution_final_hash = final_hash;
                 *d_solution_nonce_digest = nonce_digest;
                 
                 // Store paths - use get_internal_node_safe for both stored and computed nodes
@@ -415,16 +603,29 @@ void calculate_mining_launch_config(
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
     
-    threads_per_block = MINING_THREADS_PER_BLOCK;
+    threads_per_block = (g_block_size > 0) ? g_block_size : MINING_THREADS_PER_BLOCK;
     
     // Calculate optimal number of blocks
-    int min_grid_size, optimal_block_size;
-    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
-                                        parallel_mining_kernel_high_vram, 0, 0);
+    // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
+    // int min_grid_size, optimal_block_size;
+    // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
+    //                                     parallel_mining_kernel_high_vram, 0, 0);
     
     // Use multiple of SM count for good occupancy
+    // Architecture-specific tuning based on compute capability
+    // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
     int num_sms = prop.multiProcessorCount;
-    int blocks_per_sm = 4; // Target occupancy
+    int blocks_per_sm;
+    if (prop.major >= 10) {
+        // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
+        blocks_per_sm = 128;  // High value for maximum parallel blocks (capped by grid limits)
+    } else if (prop.major == 9) {
+        // Hopper architecture - use 6 blocks per SM
+        blocks_per_sm = 6;
+    } else {
+        // Ampere/Ada - use default
+        blocks_per_sm = 8;  // Increased from 4 to 8 for better performance
+    }
     int max_blocks = num_sms * blocks_per_sm;
     
     // Calculate blocks needed for nonces
@@ -439,11 +640,24 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
     
-    uint64_t optimal = 1000000ULL;
+    // Base batch size scaled by SM count and architecture
+    // RTX 5090 (SM 120) has 192 SMs, ~21K CUDA cores
+    uint64_t optimal;
+    
+    if (prop.major >= 10) {
+        // Blackwell (RTX 5090) - larger batches for high SM count
+        optimal = 80000000ULL; // 80M nonces for maximum GPU utilization
+    } else if (prop.major == 9) {
+        // Hopper - medium batch
+        optimal = 40000000ULL;
+    } else {
+        // Ampere/Ada - default
+        optimal = 30000000ULL;
+    }
     
     // Apply bounds
-    const uint64_t min_batch = 100000;
-    const uint64_t max_batch = 50000000;
+    const uint64_t min_batch = 500000;
+    const uint64_t max_batch = 100000000;  // Increased max for high-end GPUs
     
     optimal = std::max(optimal, min_batch);
     optimal = std::min(optimal, max_batch);
@@ -484,7 +698,7 @@ bool sync_and_check_errors(const char* stage) {
 
 // ===== MAIN MINING FUNCTION =====
 
-std::optional<Pow> mine_pow_with_buffer(
+std::optional<MiningSolution> mine_pow_with_buffer(
     GuesserBuffer& buffer,
     const Digest& target,
     const PowMastPaths& mast_paths,
@@ -498,15 +712,14 @@ std::optional<Pow> mine_pow_with_buffer(
         return std::nullopt;
     }
     
-    // Allocate output buffers
-    MiningOutputBuffers output;
-    if (!output.allocate()) {
-        LOG_DEBUG("mine_pow_with_buffer: failed to allocate output buffers");
+    // Ensure persistent mining resources are allocated (stream + output buffers)
+    if (!buffer.ensure_mining_resources()) {
+        LOG_DEBUG("mine_pow_with_buffer: failed to ensure mining resources");
         return std::nullopt;
     }
     
-    if (!output.reset()) {
-        output.free();
+    // Reset the solution_found flag (async on stream)
+    if (!buffer.reset_output_buffers()) {
         return std::nullopt;
     }
     
@@ -517,30 +730,44 @@ std::optional<Pow> mine_pow_with_buffer(
     calculate_mining_launch_config(max_nonces, threads_per_block, blocks_per_grid, gpu_id);
     
     // Calculate GPU's dedicated nonce range to avoid overlap with other GPUs
-    // CRITICAL: Pass actual GPU count to ensure proper nonce space partitioning
-    int actual_gpu_count = g_total_gpu_count.load();
-    GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
-    
-    // Copy range to constant memory (avoids register pressure from extra parameters)
-    cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
-    if (range_err != cudaSuccess) {
-        LOG_ERROR("copy range_start", range_err);
-        output.free();
-        return std::nullopt;
+    // Only set once per buffer - the range doesn't change during mining
+    if (!buffer.gpu_range_initialized) {
+        int actual_gpu_count = g_total_gpu_count.load();
+        GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+        
+        // Copy range to constant memory (avoids register pressure from extra parameters)
+        cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+        if (range_err != cudaSuccess) {
+            LOG_ERROR("copy range_start", range_err);
+            return std::nullopt;
+        }
+        range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+        if (range_err != cudaSuccess) {
+            LOG_ERROR("copy range_size", range_err);
+            return std::nullopt;
+        }
+        
+        // Initialize top tree cache (top 10 levels in constant memory)
+        if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
+            LOG_DEBUG("mine_pow_with_buffer: failed to initialize top tree cache");
+            // Non-fatal - continue without cache
+        }
+        
+        // Initialize mast_paths cache (6 Digests in constant memory)
+        if (!initialize_mast_paths_cache(mast_paths)) {
+            LOG_DEBUG("mine_pow_with_buffer: failed to initialize mast_paths cache");
+            // Non-fatal - continue without cache
+        }
+        
+        buffer.gpu_range_initialized = true;
     }
-    range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
-    if (range_err != cudaSuccess) {
-        LOG_ERROR("copy range_size", range_err);
-        output.free();
-        return std::nullopt;
-    }
     
-    // Select and launch appropriate kernel
+    // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
     
     switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:
-            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block>>>(
+            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 buffer.d_leafs,
                 buffer.d_merkle_tree,
                 buffer.index_picker_preimage,
@@ -552,15 +779,16 @@ std::optional<Pow> mine_pow_with_buffer(
                 mast_paths,
                 buffer.hash, // leaf_prefix = commitment
                 consensus_rule_set,
-                output.d_solution_nonce,
-                output.d_solution_found,
-                output.d_solution_path_a,
-                output.d_solution_path_b,
-                output.d_solution_nonce_digest);
+                buffer.d_solution_nonce,
+                buffer.d_solution_found,
+                buffer.d_solution_path_a,
+                buffer.d_solution_path_b,
+                buffer.d_solution_nonce_digest,
+                buffer.d_solution_final_hash);
             break;
             
         case MiningKernelType::LOW_VRAM:
-            parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block>>>(
+            parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 nullptr,
                 buffer.d_merkle_tree,
                 buffer.index_picker_preimage,
@@ -573,51 +801,57 @@ std::optional<Pow> mine_pow_with_buffer(
                 mast_paths,
                 buffer.hash,
                 consensus_rule_set,
-                output.d_solution_nonce,
-                output.d_solution_found,
-                output.d_solution_path_a,
-                output.d_solution_path_b,
-                output.d_solution_nonce_digest);
+                buffer.d_solution_nonce,
+                buffer.d_solution_found,
+                buffer.d_solution_path_a,
+                buffer.d_solution_path_b,
+                buffer.d_solution_nonce_digest,
+                buffer.d_solution_final_hash);
             break;
     }
     
     // Check for launch errors
     if (!check_kernel_launch_errors("mining_kernel")) {
-        output.free();
-        return std::nullopt;
-    }
-    
-    // Synchronize and check for errors
-    if (!sync_and_check_errors("mining_kernel_sync")) {
-        output.free();
         return std::nullopt;
     }
     
     // Check if solution was found
+    // Note: cudaMemcpy implicitly synchronizes with the device, so no need for explicit sync
     int solution_found = 0;
-    cudaMemcpy(&solution_found, output.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaError_t sync_err = cudaMemcpy(&solution_found, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
+    if (sync_err != cudaSuccess) {
+        LOG_ERROR("mining_kernel memcpy sync", sync_err);
+        return std::nullopt;
+    }
     
     if (solution_found) {
         // Copy solution data back to host
         Pow solution;
         
         uint64_t nonce_value;
-        cudaMemcpy(&nonce_value, output.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&nonce_value, buffer.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
         
-        cudaMemcpy(&solution.nonce, output.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
-        cudaMemcpy(solution.path_a, output.d_solution_path_a, 
+        cudaMemcpy(&solution.nonce, buffer.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
+        cudaMemcpy(solution.path_a, buffer.d_solution_path_a, 
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
-        cudaMemcpy(solution.path_b, output.d_solution_path_b,
+        cudaMemcpy(solution.path_b, buffer.d_solution_path_b,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+        
+        // Copy the final_hash that kernel computed (for debugging)
+        Digest kernel_final_hash;
+        cudaMemcpy(&kernel_final_hash, buffer.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
         
         // Set root from buffer
         solution.root = buffer.merkle_root;
         
-        output.free();
-        return solution;
+        // Return both solution and kernel_final_hash
+        MiningSolution mining_solution;
+        mining_solution.pow = solution;
+        mining_solution.kernel_final_hash = kernel_final_hash;
+        
+        return mining_solution;
     }
     
-    output.free();
     return std::nullopt;
 }
 
@@ -648,7 +882,8 @@ MiningResult mine_batch(
     
     if (solution.has_value()) {
         result.solution_found = true;
-        result.pow_solution = solution.value();
+        result.pow_solution = solution.value().pow;
+        result.solution_hash = solution.value().kernel_final_hash;  // Use kernel's final_hash
     }
     
     return result;

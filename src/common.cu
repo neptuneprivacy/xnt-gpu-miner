@@ -7,6 +7,11 @@ std::string g_miner_worker_name = "";
 std::atomic<int> g_total_gpu_count{1};
 int g_gpu_device_id = -1;
 bool g_test_mode = false;
+bool g_benchmark_mode = false;
 int g_fetch_interval_sec = 5;
 
 std::mutex g_log_mutex;
+
+// Tuning parameters (optimized defaults)
+int g_block_size = 256;              // Threads per block
+uint64_t g_batch_size = 67108864;    // 2^26 = 64M nonces per kernel

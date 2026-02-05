@@ -64,18 +64,39 @@ __device__ __forceinline__ uint64_t fast_bitreverse_64(uint64_t val, uint32_t bi
     return __brevll(val) >> (64 - bits);
 }
 
+// Optimized Montgomery reduction for Goldilocks prime p = 2^64 - 2^32 + 1
+// Input: 128-bit value (xh, xl) where result = (xh * 2^64 + xl) * R^(-1) mod p
+// Uses PTX setp/selp for truly branchless execution
 __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl) {
-    uint64_t shifted = xl << 32;
-    uint64_t a = xl + shifted;
-    bool e = (a < xl) | (a < shifted);
+    // Step 1: t = xl + (xl << 32), detect carry
+    uint64_t xl_lo = xl << 32;
+    uint64_t t = xl + xl_lo;
 
-    uint64_t b = a - (a >> 32);
-    if (e) b -= 1;
+    // Branchless carry detection: carry = (t < xl) ? 1 : 0
+    uint64_t carry;
+    asm("{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.lt.u64 p, %1, %2;\n\t"
+        "selp.u64 %0, 1, 0, p;\n\t"
+        "}" : "=l"(carry) : "l"(t), "l"(xl));
 
-    bool c = (xh < b);
-    a = xh - b;
+    // Step 2: u = t - (t >> 32) - carry
+    uint64_t t_hi = t >> 32;
+    uint64_t u = t - t_hi - carry;
 
-    return a - (0xFFFFFFFFULL & (c ? 0xFFFFFFFFFFFFFFFFULL : 0));
+    // Step 3: result = xh - u, with conditional correction
+    uint64_t result = xh - u;
+
+    // Branchless underflow correction: if xh < u, subtract 0xFFFFFFFF
+    uint64_t correction;
+    asm("{\n\t"
+        ".reg .pred q;\n\t"
+        "setp.lt.u64 q, %1, %2;\n\t"
+        "selp.u64 %0, 4294967295, 0, q;\n\t"
+        "}" : "=l"(correction) : "l"(xh), "l"(u));
+    result -= correction;
+
+    return result;
 }
 
 #ifdef _WIN32
@@ -141,15 +162,15 @@ __device__ __forceinline__ uint64_t x7_computer_pipelined(uint64_t x) {
     uint64_t lo2 = x * x;
     uint64_t hi2 = __umul64hi(x, x);
     uint64_t x2 = montyred_from_parts(hi2, lo2);
-    
+
     uint64_t lo4 = x2 * x2;
     uint64_t hi4 = __umul64hi(x2, x2);
     uint64_t x4 = montyred_from_parts(hi4, lo4);
-    
+
     uint64_t lo6 = x4 * x2;
     uint64_t hi6 = __umul64hi(x4, x2);
     uint64_t x6 = montyred_from_parts(hi6, lo6);
-    
+
     uint64_t lo7 = x6 * x;
     uint64_t hi7 = __umul64hi(x6, x);
     return montyred_from_parts(hi7, lo7);
@@ -170,7 +191,7 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint64_t lo1 = element_in * R2;
     uint64_t hi1 = __umul64hi(element_in, R2);
     uint64_t reduced_in = montyred_from_parts(hi1, lo1);
-    
+
     uint8_t addr0 = (uint8_t)(reduced_in >> 0);
     uint8_t addr1 = (uint8_t)(reduced_in >> 8);
     uint8_t addr2 = (uint8_t)(reduced_in >> 16);
@@ -179,7 +200,7 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint8_t addr5 = (uint8_t)(reduced_in >> 40);
     uint8_t addr6 = (uint8_t)(reduced_in >> 48);
     uint8_t addr7 = (uint8_t)(reduced_in >> 56);
-    
+
     uint64_t b0 = shared_lut[addr0];
     uint64_t b1 = shared_lut[addr1];
     uint64_t b2 = shared_lut[addr2];
@@ -188,10 +209,10 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint64_t b5 = shared_lut[addr5];
     uint64_t b6 = shared_lut[addr6];
     uint64_t b7 = shared_lut[addr7];
-    
+
     uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
                         (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
-    
+
     return montyred_from_parts(0, sbox_out);
 }
 
@@ -208,13 +229,13 @@ __host__ inline uint64_t split_lookup_host(uint64_t element_in) {
     __uint128_t stage1 = static_cast<__uint128_t>(element_in) * R2;
 #endif
     uint64_t reduced_in = montyred_host(stage1);
-    
+
     uint64_t sbox_out = 0;
     for (int i = 0; i < 8; ++i) {
         uint8_t byte = (reduced_in >> (i * 8)) & 0xFF;
         sbox_out |= static_cast<uint64_t>(LOOKUP_TABLE_HOST[byte]) << (i * 8);
     }
-    
+
 #ifdef _WIN32
     #ifdef _MSC_VER
         host_uint128 stage3(sbox_out, 0);
@@ -247,21 +268,20 @@ __host__ void sbox_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void round_constants_layer_host(int round_index, const uint64_t* state_in, uint64_t* state_out);
 
-__device__ void tip5_permutation(uint64_t* state);
+__device__ __noinline__ void tip5_permutation(uint64_t* state);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {
     // OPTIMIZATION #16: Combined initialization in single loop
     uint64_t capacity_val = (domain == Domain::FixedLength) ? static_cast<uint64_t>(domain) : BFE_ZERO;
-    
-    #pragma unroll
+
     for (int i = 0; i < STATE_SIZE; ++i) {
         state[i] = (i < RATE) ? BFE_ZERO : capacity_val;
     }
 }
 
-__device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ state, 
-                                                          const uint64_t* __restrict__ chunk, 
+__device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ state,
+                                                          const uint64_t* __restrict__ chunk,
                                                           size_t len) {
     for (size_t i = 0; i < len && i < RATE; ++i) {
         state[i] = chunk[i];
@@ -269,9 +289,8 @@ __device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ 
     tip5_permutation(state);
 }
 
-__device__ __forceinline__ void tip5_sponge_squeeze(uint64_t* __restrict__ state, 
+__device__ __forceinline__ void tip5_sponge_squeeze(uint64_t* __restrict__ state,
                                                      uint64_t* __restrict__ digest) {
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         digest[i] = state[i];
     }

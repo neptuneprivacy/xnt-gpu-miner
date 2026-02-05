@@ -73,28 +73,9 @@ bool GpuWorker::initializeCuda() {
     gpu_resources->gpu_name = prop.name;
     gpu_resources->gpu_vram_total = prop.totalGlobalMem;
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
-    gpu_resources->optimal_max_nonces = 1000000ULL;
     
-    // Calculate optimal batch size based on GPU capabilities
-    // For high-end GPUs (RTX 5090, etc.), use larger batches for better performance
-    // Target: ~900ms batch duration at ~16-20 MH/s = ~15-20M nonces per batch
-    int num_sms = prop.multiProcessorCount;
-    
-    // Scale by SM count (RTX 5090 has ~256 SMs, older GPUs have fewer)
-    // For modern high-end GPUs, use 15-20M nonces per batch
-    if (num_sms >= 200) {
-        // High-end GPU (RTX 5090, A100, H100, etc.)
-        gpu_resources->optimal_max_nonces = 20000000ULL; // 20M nonces
-    } else if (num_sms >= 100) {
-        // Mid-high end GPU (RTX 4090, A6000, etc.)
-        gpu_resources->optimal_max_nonces = 15000000ULL; // 15M nonces
-    } else if (num_sms >= 50) {
-        // Mid-range GPU
-        gpu_resources->optimal_max_nonces = 10000000ULL; // 10M nonces
-    } else {
-        // Lower-end GPU
-        gpu_resources->optimal_max_nonces = 5000000ULL; // 5M nonces
-    }
+    // Use fixed batch size: 2^26 = 64M nonces per kernel
+    gpu_resources->optimal_max_nonces = g_batch_size;
     
     return true;
 }
@@ -336,21 +317,8 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_vram_total = prop.totalGlobalMem;
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
     
-    // Calculate optimal batch size based on GPU capabilities
-    int num_sms = prop.multiProcessorCount;
-    if (num_sms >= 200) {
-        // High-end GPU (RTX 5090, A100, H100, etc.)
-        gpu_res->optimal_max_nonces = 20000000ULL; // 20M nonces
-    } else if (num_sms >= 100) {
-        // Mid-high end GPU (RTX 4090, A6000, etc.)
-        gpu_res->optimal_max_nonces = 15000000ULL; // 15M nonces
-    } else if (num_sms >= 50) {
-        // Mid-range GPU
-        gpu_res->optimal_max_nonces = 10000000ULL; // 10M nonces
-    } else {
-        // Lower-end GPU
-        gpu_res->optimal_max_nonces = 5000000ULL; // 5M nonces
-    }
+    // Use fixed batch size: 2^26 = 64M nonces per kernel
+    gpu_res->optimal_max_nonces = g_batch_size;
     gpu_res->mining_mode = mining_mode;
     
     // Create GpuWorker (uses shared connection through multiplexer)
@@ -501,13 +469,13 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         }
         
         // Check if template is stale - if so, pause mining and wait for new job
-        if (!template_obj.is_null() && !template_obj.empty()) {
+        if (!template_for_this_batch.is_null() && !template_for_this_batch.empty()) {
             auto& multiplexer = ConnectionMultiplexer::getInstance();
-            if (multiplexer.isTemplateStale(template_obj)) {
+            if (multiplexer.isTemplateStale(template_for_this_batch)) {
                 // Template is stale, pause mining to save GPU power
                 std::string prev_block = "unknown";
-                if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
-                    json metadata = template_obj["metadata"];
+                if (template_for_this_batch.contains("metadata") && !template_for_this_batch["metadata"].is_null()) {
+                    json metadata = template_for_this_batch["metadata"];
                     if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
                         prev_block = metadata.value("prevBlock", "");
                     } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
@@ -644,13 +612,13 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                       << " Submitting to " << submit_target << "..." << std::endl;
             
                 PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
-                Digest solution_hash = mast_paths.fast_mast_hash(result.value());
+                Digest solution_hash = mast_paths.fast_mast_hash(result.value().pow);
                 
             // Use the template captured at the start of this mining batch
             // This ensures we submit with the same template we were mining for
             auto future = worker->submitSolution(
                     proposal_id,
-                    result.value(),
+                    result.value().pow,
                     solution_hash,
                     template_for_this_batch
                 );

@@ -5,15 +5,35 @@ NVCC = nvcc
 CXX = g++
 
 # CUDA architecture flags
-# RTX 5090 has compute capability 12.0 (Blackwell)
-# CUDA 13.0 supports up to compute_100, so use native or all-major
-# Using -arch=native for automatic detection, or specify compute_100 for Blackwell
-CUDA_ARCH = -arch=native
+# RTX 5090 has compute capability 12.0 (Blackwell) = sm_100
+# Options: 
+#   -arch=sm_100 (Blackwell/RTX 5090 - optimal)
+#   -arch=sm_90  (Ada/Hopper - fallback compatibility)
+#   -arch=native (auto-detect)
+# Usage: make ARCH=sm_90 or make ARCH=sm_100
+ifdef ARCH
+    CUDA_ARCH = -arch=$(ARCH)
+else
+    CUDA_ARCH = -arch=sm_120  # Blackwell RTX 5090 (compute 12.0)
+endif
 
 # Compiler flags
 # Enable separable compilation for device functions across multiple files
-NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) -Xnvlink=-suppress-stack-size-warning
-NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) -dc
+# Register optimization flags:
+#   -maxrregcount=64: Limit registers to improve occupancy (can be adjusted)
+#   --ptxas-options=-v: Show register usage during compilation
+#   --ptxas-options=-O3: Aggressive PTX optimization
+# Note: Lower maxrregcount = better occupancy but may cause register spilling
+#       Start with 64, increase if you see performance degradation
+# MAX_REG_COUNT removed - forcing limits causes register spilling
+NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
+             --ptxas-options=-v \
+             --ptxas-options=-O3 \
+             -Xnvlink=-suppress-stack-size-warning
+NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
+                --ptxas-options=-v \
+                --ptxas-options=-O3 \
+                -dc
 CXX_FLAGS = -O3 -march=native -std=c++17
 
 # Include paths
@@ -90,3 +110,5 @@ help:
 	@echo "  make                  # Release build"
 	@echo "  make DEBUG=1          # Debug build"
 	@echo "  make clean && make    # Clean rebuild"
+	@echo "  make MAX_REG_COUNT=48 # Build with max 48 registers (higher occupancy)"
+	@echo "  make MAX_REG_COUNT=80 # Build with max 80 registers (if 64 causes spilling)"

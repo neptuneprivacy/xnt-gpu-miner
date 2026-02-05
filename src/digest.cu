@@ -1,11 +1,10 @@
 #include "digest.cuh"
 
-__device__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right) {
+__device__ __noinline__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::FixedLength);
     
     // OPTIMIZATION #10: Directly write to state instead of using intermediate array
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         state[i] = left.values[i];
         state[i + DIGEST_LEN] = right.values[i];
@@ -23,7 +22,6 @@ __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_le
     
     size_t pos = 0;
     while (pos + RATE <= input_len) {
-        #pragma unroll
         for (size_t i = 0; i < RATE; i++) {
             state[i] = input[pos + i];
         }
@@ -33,7 +31,6 @@ __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_le
     
     size_t remaining = input_len - pos;
     
-    #pragma unroll
     for (size_t i = 0; i < RATE; i++) {
         state[i] = BFE_ZERO;
     }
@@ -55,7 +52,6 @@ __host__ Digest tip5_hash_fixed_host(const Digest& left, const Digest& right) {
     tip5_sponge_init_host(state, Domain::FixedLength);
     
     uint64_t combined_input[RATE];
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         combined_input[i] = left.values[i];
         combined_input[i + DIGEST_LEN] = right.values[i];
@@ -75,7 +71,6 @@ __host__ std::array<uint64_t, DIGEST_LEN> tip5_hash_fixed_host(
     tip5_sponge_init_host(state, Domain::FixedLength);
     
     uint64_t combined_input[RATE];
-    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         combined_input[i] = left[i];
         combined_input[i + DIGEST_LEN] = right[i];

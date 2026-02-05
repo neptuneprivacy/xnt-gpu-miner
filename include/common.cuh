@@ -133,8 +133,13 @@ extern std::string g_miner_worker_name;
 extern std::atomic<int> g_total_gpu_count;
 extern int g_gpu_device_id;
 extern bool g_test_mode;
+extern bool g_benchmark_mode;
 extern int g_fetch_interval_sec;
 extern std::mutex g_log_mutex;
+
+// Tuning parameters (command-line configurable)
+extern int g_block_size;        // Threads per block (default: 256)
+extern uint64_t g_batch_size;   // Nonces per kernel launch (0 = auto)
 
 // Helper function to shorten wallet address for display
 inline std::string shorten_address(const std::string& addr, size_t prefix_len = 12, size_t suffix_len = 8) {
