@@ -66,36 +66,32 @@ __device__ __forceinline__ uint64_t fast_bitreverse_64(uint64_t val, uint32_t bi
 
 // Optimized Montgomery reduction for Goldilocks prime p = 2^64 - 2^32 + 1
 // Input: 128-bit value (xh, xl) where result = (xh * 2^64 + xl) * R^(-1) mod p
-// Uses PTX setp/selp for truly branchless execution
+// Uses PTX add.cc/addc for efficient carry chain operations
 __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl) {
-    // Step 1: t = xl + (xl << 32), detect carry
-    uint64_t xl_lo = xl << 32;
-    uint64_t t = xl + xl_lo;
-
-    // Branchless carry detection: carry = (t < xl) ? 1 : 0
-    uint64_t carry;
+    uint64_t result;
     asm("{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.lt.u64 p, %1, %2;\n\t"
-        "selp.u64 %0, 1, 0, p;\n\t"
-        "}" : "=l"(carry) : "l"(t), "l"(xl));
-
-    // Step 2: u = t - (t >> 32) - carry
-    uint64_t t_hi = t >> 32;
-    uint64_t u = t - t_hi - carry;
-
-    // Step 3: result = xh - u, with conditional correction
-    uint64_t result = xh - u;
-
-    // Branchless underflow correction: if xh < u, subtract 0xFFFFFFFF
-    uint64_t correction;
-    asm("{\n\t"
-        ".reg .pred q;\n\t"
-        "setp.lt.u64 q, %1, %2;\n\t"
-        "selp.u64 %0, 4294967295, 0, q;\n\t"
-        "}" : "=l"(correction) : "l"(xh), "l"(u));
-    result -= correction;
-
+        ".reg .u64 t, t_hi, u, xl_shifted;\n\t"
+        ".reg .pred p, q;\n\t"
+        // Step 1: t = xl + (xl << 32), detect overflow
+        "shl.b64 xl_shifted, %1, 32;\n\t"
+        "add.cc.u64 t, %1, xl_shifted;\n\t"        // t = xl + (xl << 32), set carry
+        // Get carry as predicate via comparison (t < xl means overflow)
+        "setp.lt.u64 p, t, %1;\n\t"
+        // Step 2: t_hi = t >> 32
+        "shr.b64 t_hi, t, 32;\n\t"
+        // Step 3: u = t - t_hi - carry
+        // Compute t - t_hi first
+        "sub.u64 u, t, t_hi;\n\t"
+        // Subtract carry (1 if overflow occurred)
+        "selp.u64 t_hi, 1, 0, p;\n\t"              // reuse t_hi as temp for carry value
+        "sub.u64 u, u, t_hi;\n\t"
+        // Step 4: result = xh - u
+        "sub.u64 %0, %2, u;\n\t"
+        // Branchless underflow correction: if xh < u, subtract 0xFFFFFFFF
+        "setp.lt.u64 q, %2, u;\n\t"
+        "selp.u64 t_hi, 4294967295, 0, q;\n\t"     // reuse t_hi for correction
+        "sub.u64 %0, %0, t_hi;\n\t"
+        "}" : "=l"(result) : "l"(xl), "l"(xh));
     return result;
 }
 
@@ -128,19 +124,20 @@ __host__ inline uint64_t montyred_host(__uint128_t x) {
 }
 
 __device__ __forceinline__ uint64_t fast_field_add(uint64_t a, uint64_t b) {
-    // PTX-optimized branchless field addition for Goldilocks prime
-    uint64_t sum = a + b;
-    
-    // Branchless: check if overflow OR sum >= p, then subtract p
-    uint64_t correction;
+    // PTX-optimized branchless field addition for Goldilocks prime p = 2^64 - 2^32 + 1
+    // Uses add.cc to detect overflow via carry flag
+    uint64_t result;
     asm("{\n\t"
+        ".reg .u64 sum, correction;\n\t"
         ".reg .pred p, q, r;\n\t"
-        "setp.lt.u64 p, %1, %2;\n\t"           // p = (sum < a) overflow
-        "setp.hs.u64 q, %1, %3;\n\t"           // q = (sum >= GOLDILOCKS_MODULUS)
-        "or.pred r, p, q;\n\t"                  // r = overflow OR needs_reduction
-        "selp.u64 %0, %3, 0, r;\n\t"           // correction = r ? GOLDILOCKS_MODULUS : 0
-        "}" : "=l"(correction) : "l"(sum), "l"(a), "l"(GOLDILOCKS_MODULUS));
-    return sum - correction;
+        "add.cc.u64 sum, %1, %2;\n\t"          // sum = a + b, set carry on overflow
+        "setp.lt.u64 p, sum, %1;\n\t"          // p = overflow (sum < a)
+        "setp.hs.u64 q, sum, %3;\n\t"          // q = (sum >= GOLDILOCKS_MODULUS)
+        "or.pred r, p, q;\n\t"                  // r = needs_reduction
+        "selp.u64 correction, %3, 0, r;\n\t"   // correction = r ? p : 0
+        "sub.u64 %0, sum, correction;\n\t"     // result = sum - correction
+        "}" : "=l"(result) : "l"(a), "l"(b), "l"(GOLDILOCKS_MODULUS));
+    return result;
 }
 
 __host__ inline uint64_t fast_field_add_host(uint64_t a, uint64_t b) {
@@ -200,16 +197,22 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint64_t hi1 = __umul64hi(element_in, R2);
     uint64_t reduced_in = montyred_from_parts(hi1, lo1);
 
-    uint8_t addr0 = (uint8_t)(reduced_in >> 0);
-    uint8_t addr1 = (uint8_t)(reduced_in >> 8);
-    uint8_t addr2 = (uint8_t)(reduced_in >> 16);
-    uint8_t addr3 = (uint8_t)(reduced_in >> 24);
-    uint8_t addr4 = (uint8_t)(reduced_in >> 32);
-    uint8_t addr5 = (uint8_t)(reduced_in >> 40);
-    uint8_t addr6 = (uint8_t)(reduced_in >> 48);
-    uint8_t addr7 = (uint8_t)(reduced_in >> 56);
+    // PTX-optimized byte extraction using bfe (bit field extract)
+    // Extract each byte directly into uint32_t for efficient LUT indexing
+    uint32_t addr0, addr1, addr2, addr3, addr4, addr5, addr6, addr7;
+    asm("bfe.u32 %0, %8, 0, 8;\n\t"
+        "bfe.u32 %1, %8, 8, 8;\n\t"
+        "bfe.u32 %2, %8, 16, 8;\n\t"
+        "bfe.u32 %3, %8, 24, 8;\n\t"
+        "bfe.u32 %4, %9, 0, 8;\n\t"
+        "bfe.u32 %5, %9, 8, 8;\n\t"
+        "bfe.u32 %6, %9, 16, 8;\n\t"
+        "bfe.u32 %7, %9, 24, 8;"
+        : "=r"(addr0), "=r"(addr1), "=r"(addr2), "=r"(addr3),
+          "=r"(addr4), "=r"(addr5), "=r"(addr6), "=r"(addr7)
+        : "r"((uint32_t)reduced_in), "r"((uint32_t)(reduced_in >> 32)));
 
-    // OPTIMIZATION: Direct loads - compiler will optimize access patterns
+    // LUT lookups
     uint64_t b0 = shared_lut[addr0];
     uint64_t b1 = shared_lut[addr1];
     uint64_t b2 = shared_lut[addr2];
@@ -219,10 +222,24 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint64_t b6 = shared_lut[addr6];
     uint64_t b7 = shared_lut[addr7];
 
-    // OPTIMIZATION: Combine shifts in single expression to reduce register pressure
-    uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
-                        (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+    // PTX-optimized byte packing using bfi (bit field insert)
+    uint32_t lo_result, hi_result;
+    asm("{\n\t"
+        ".reg .u32 t0, t1;\n\t"
+        // Pack low 4 bytes: b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        "bfi.b32 t0, %3, %2, 8, 8;\n\t"   // t0 = b0 | (b1 << 8)
+        "bfi.b32 t1, %5, %4, 8, 8;\n\t"   // t1 = b2 | (b3 << 8)
+        "bfi.b32 %0, t1, t0, 16, 16;\n\t" // lo = t0 | (t1 << 16)
+        // Pack high 4 bytes: b4 | (b5 << 8) | (b6 << 16) | (b7 << 24)
+        "bfi.b32 t0, %7, %6, 8, 8;\n\t"   // t0 = b4 | (b5 << 8)
+        "bfi.b32 t1, %9, %8, 8, 8;\n\t"   // t1 = b6 | (b7 << 8)
+        "bfi.b32 %1, t1, t0, 16, 16;\n\t" // hi = t0 | (t1 << 16)
+        "}"
+        : "=r"(lo_result), "=r"(hi_result)
+        : "r"((uint32_t)b0), "r"((uint32_t)b1), "r"((uint32_t)b2), "r"((uint32_t)b3),
+          "r"((uint32_t)b4), "r"((uint32_t)b5), "r"((uint32_t)b6), "r"((uint32_t)b7));
 
+    uint64_t sbox_out = ((uint64_t)hi_result << 32) | lo_result;
     return montyred_from_parts(0, sbox_out);
 }
 

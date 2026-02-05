@@ -466,23 +466,39 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     generated_function(hi, hi_out);
 
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
-    // PTX-optimized branchless reduction
+    // Fully PTX-optimized using shf (funnel shift) and mad with carry
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
-        uint64_t s_hi = (uint64_t)(s >> 64);
-        uint64_t s_lo = (uint64_t)s;
+        // Compute s = (lo_out[i] >> 4) + (hi_out[i] << 28)
+        // This is a 128-bit value, we compute s_lo and s_hi directly
+        uint64_t lo_shifted = lo_out[i] >> 4;           // (lo >> 4), high 4 bits lost
+        uint64_t hi_shifted_lo = hi_out[i] << 28;       // low 64 bits of (hi << 28)
+        uint64_t hi_shifted_hi = hi_out[i] >> 36;       // high bits of (hi << 28)
 
-        // Goldilocks reduction with branchless overflow handling
-        uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
-        // Branchless: if overflow (res < s_lo), add 0xFFFFFFFF
-        uint64_t correction;
+        // s_lo = lo_shifted + hi_shifted_lo (with carry out)
+        // s_hi = hi_shifted_hi + carry
+        uint64_t s_lo, s_hi;
         asm("{\n\t"
+            ".reg .pred c;\n\t"
+            "add.cc.u64 %0, %2, %3;\n\t"      // s_lo = lo_shifted + hi_shifted_lo, set carry
+            "addc.u64 %1, %4, 0;\n\t"         // s_hi = hi_shifted_hi + carry
+            "}" : "=l"(s_lo), "=l"(s_hi) : "l"(lo_shifted), "l"(hi_shifted_lo), "l"(hi_shifted_hi));
+
+        // Goldilocks reduction: res = s_lo + s_hi * 0xFFFFFFFF
+        // Using PTX mad.lo for multiply-add with branchless overflow
+        uint64_t res;
+        asm("{\n\t"
+            ".reg .u64 prod;\n\t"
             ".reg .pred p;\n\t"
-            "setp.lt.u64 p, %1, %2;\n\t"
-            "selp.u64 %0, 4294967295, 0, p;\n\t"
-            "}" : "=l"(correction) : "l"(res), "l"(s_lo));
-        state_out[i] = res + correction;
+            "mul.lo.u64 prod, %2, 4294967295;\n\t"  // prod = s_hi * 0xFFFFFFFF
+            "add.cc.u64 %0, %1, prod;\n\t"          // res = s_lo + prod, set carry
+            // Branchless: if overflow, add 0xFFFFFFFF
+            "setp.lt.u64 p, %0, %1;\n\t"            // p = (res < s_lo)
+            "selp.u64 prod, 4294967295, 0, p;\n\t"  // correction = p ? 0xFFFFFFFF : 0
+            "add.u64 %0, %0, prod;\n\t"             // res += correction
+            "}" : "=l"(res) : "l"(s_lo), "l"(s_hi));
+
+        state_out[i] = res;
     }
 }
 
