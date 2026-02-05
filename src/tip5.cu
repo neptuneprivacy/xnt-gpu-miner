@@ -291,7 +291,7 @@ __device__ void generated_function(const uint64_t* input, uint64_t* output) {
 
 // Extern declaration for the shared lookup table loaded by mining kernels
 // This is defined in kernels.cu and loaded ONCE at kernel start with __syncthreads
-extern __shared__ uint8_t s_lookup_table[256];
+extern __shared__ uint8_t s_lookup_table[257];  // 256 + 1 padding for bank conflict reduction
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
     // NO __syncthreads here - the lookup table is already loaded by the kernel
@@ -453,6 +453,7 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
 
     // Split each element into lo and hi 32-bit limbs
+    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         uint64_t b = state_in[i];
         lo[i] = b & 0xFFFFFFFFUL;
@@ -465,15 +466,23 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     generated_function(hi, hi_out);
 
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
+    // PTX-optimized branchless reduction
+    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
         __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
         uint64_t s_hi = (uint64_t)(s >> 64);
         uint64_t s_lo = (uint64_t)s;
 
-        // Goldilocks reduction with overflow check
+        // Goldilocks reduction with branchless overflow handling
         uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
-        bool overflow = (res < s_lo);
-        state_out[i] = overflow ? (res + 0xFFFFFFFFULL) : res;
+        // Branchless: if overflow (res < s_lo), add 0xFFFFFFFF
+        uint64_t correction;
+        asm("{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.lt.u64 p, %1, %2;\n\t"
+            "selp.u64 %0, 4294967295, 0, p;\n\t"
+            "}" : "=l"(correction) : "l"(res), "l"(s_lo));
+        state_out[i] = res + correction;
     }
 }
 

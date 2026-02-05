@@ -128,11 +128,19 @@ __host__ inline uint64_t montyred_host(__uint128_t x) {
 }
 
 __device__ __forceinline__ uint64_t fast_field_add(uint64_t a, uint64_t b) {
-    // OPTIMIZATION #11: Simplified logic - only one condition needed
+    // PTX-optimized branchless field addition for Goldilocks prime
     uint64_t sum = a + b;
-    bool overflow = (sum < a);
-    bool needs_reduction = overflow || (sum >= GOLDILOCKS_MODULUS);
-    return sum - (needs_reduction ? GOLDILOCKS_MODULUS : 0);
+    
+    // Branchless: check if overflow OR sum >= p, then subtract p
+    uint64_t correction;
+    asm("{\n\t"
+        ".reg .pred p, q, r;\n\t"
+        "setp.lt.u64 p, %1, %2;\n\t"           // p = (sum < a) overflow
+        "setp.hs.u64 q, %1, %3;\n\t"           // q = (sum >= GOLDILOCKS_MODULUS)
+        "or.pred r, p, q;\n\t"                  // r = overflow OR needs_reduction
+        "selp.u64 %0, %3, 0, r;\n\t"           // correction = r ? GOLDILOCKS_MODULUS : 0
+        "}" : "=l"(correction) : "l"(sum), "l"(a), "l"(GOLDILOCKS_MODULUS));
+    return sum - correction;
 }
 
 __host__ inline uint64_t fast_field_add_host(uint64_t a, uint64_t b) {
@@ -201,6 +209,7 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint8_t addr6 = (uint8_t)(reduced_in >> 48);
     uint8_t addr7 = (uint8_t)(reduced_in >> 56);
 
+    // OPTIMIZATION: Direct loads - compiler will optimize access patterns
     uint64_t b0 = shared_lut[addr0];
     uint64_t b1 = shared_lut[addr1];
     uint64_t b2 = shared_lut[addr2];
@@ -210,6 +219,7 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint64_t b6 = shared_lut[addr6];
     uint64_t b7 = shared_lut[addr7];
 
+    // OPTIMIZATION: Combine shifts in single expression to reduce register pressure
     uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
                         (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
 

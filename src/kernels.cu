@@ -11,8 +11,8 @@ __constant__ uint64_t d_gpu_range_start;
 __constant__ uint64_t d_gpu_range_size;
 
 // ===== TOP MERKLE TREE CACHE =====
-// Cache top 10 levels of Merkle tree in constant memory for fast access
-// Top 10 levels = 2^10 - 1 = 1023 nodes = 1023 * 40 bytes = ~40KB (fits in 64KB limit)
+// Cache top 8 levels of Merkle tree in constant memory for fast access
+// Top 8 levels = 2^8 - 1 = 255 nodes = 255 * 40 bytes = 10,200 bytes
 // These nodes are accessed by ALL threads, so caching eliminates global memory reads
 // Constants TOP_TREE_CACHE_LEVELS and TOP_TREE_CACHE_SIZE defined in kernels.cuh
 // Store as raw uint64_t since Digest has constructor (not allowed in __constant__)
@@ -21,16 +21,23 @@ __constant__ uint64_t d_top_tree_cache[TOP_TREE_CACHE_SIZE * DIGEST_LEN];
 // Flag to track if cache is initialized for current job
 static bool g_top_tree_cache_initialized = false;
 
-// ===== MAST PATHS CACHE =====
-// Cache PowMastPaths in constant memory for fast broadcast to all threads
-// 6 Digests = 30 uint64_t = 240 bytes - accessed 8 times per hash, same for ALL threads
-__constant__ uint64_t d_mast_paths_cache[MAST_PATHS_SIZE];
-
-static bool g_mast_paths_cache_initialized = false;
+// Helper to read cached node as Digest - defined here where d_top_tree_cache is visible
+__device__ Digest get_cached_node(size_t index) {
+    Digest d;
+    size_t base = index * DIGEST_LEN;
+    d.values[0] = d_top_tree_cache[base];
+    d.values[1] = d_top_tree_cache[base + 1];
+    d.values[2] = d_top_tree_cache[base + 2];
+    d.values[3] = d_top_tree_cache[base + 3];
+    d.values[4] = d_top_tree_cache[base + 4];
+    return d;
+}
 
 // ===== SHARED MEMORY LOOKUP TABLE =====
 // Loaded once per block for S-box computation
-__shared__ uint8_t s_lookup_table[256];
+// OPTIMIZATION: Pad to 257 bytes to reduce bank conflicts (256 + 1 padding)
+// This ensures adjacent threads don't hit the same bank
+__shared__ uint8_t s_lookup_table[257];  // 256 + 1 padding for bank conflict reduction
 
 // ===== MINING OUTPUT BUFFERS =====
 
@@ -258,53 +265,6 @@ void reset_top_tree_cache() {
     g_top_tree_cache_initialized = false;
 }
 
-// ===== MAST PATHS CACHE FUNCTIONS =====
-
-bool initialize_mast_paths_cache(const PowMastPaths& mast_paths) {
-    if (g_mast_paths_cache_initialized) return true;
-    
-    // Flatten PowMastPaths into uint64_t array for constant memory
-    // Layout: pow[0..2], header[0..1], kernel[0]
-    uint64_t flat_data[MAST_PATHS_SIZE];
-    size_t offset = 0;
-    
-    // pow[0..2]
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < DIGEST_LEN; ++j) {
-            flat_data[offset++] = mast_paths.pow[i].values[j];
-        }
-    }
-    // header[0..1]
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < DIGEST_LEN; ++j) {
-            flat_data[offset++] = mast_paths.header[i].values[j];
-        }
-    }
-    // kernel[0]
-    for (int j = 0; j < DIGEST_LEN; ++j) {
-        flat_data[offset++] = mast_paths.kernel[0].values[j];
-    }
-    
-    cudaError_t err = cudaMemcpyToSymbol(
-        d_mast_paths_cache,
-        flat_data,
-        MAST_PATHS_SIZE * sizeof(uint64_t),
-        0,
-        cudaMemcpyHostToDevice);
-    
-    if (err != cudaSuccess) {
-        LOG_ERROR("initialize_mast_paths_cache", err);
-        return false;
-    }
-    
-    g_mast_paths_cache_initialized = true;
-    return true;
-}
-
-void reset_mast_paths_cache() {
-    g_mast_paths_cache_initialized = false;
-}
-
 // Device function to get internal node - uses cache for small indices
 __device__ __forceinline__ Digest get_internal_node_cached(
     const Digest* __restrict__ d_internal_nodes,
@@ -341,8 +301,13 @@ __global__ void parallel_mining_kernel_high_vram(
     Digest* __restrict__ d_solution_final_hash) {
     
     // Load lookup table into shared memory (first warp)
+    // OPTIMIZATION: Load with padding to reduce bank conflicts
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    // Pad the last element to ensure proper alignment
+    if (threadIdx.x == 0) {
+        s_lookup_table[256] = 0;  // Padding byte
     }
     __syncthreads();
     
@@ -471,8 +436,13 @@ __global__ void parallel_mining_kernel_low_vram(
     Digest* __restrict__ d_solution_final_hash) {
     
     // Load lookup table into shared memory
+    // OPTIMIZATION: Load with padding to reduce bank conflicts
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    // Pad the last element to ensure proper alignment
+    if (threadIdx.x == 0) {
+        s_lookup_table[256] = 0;  // Padding byte
     }
     __syncthreads();
     
@@ -747,15 +717,9 @@ std::optional<MiningSolution> mine_pow_with_buffer(
             return std::nullopt;
         }
         
-        // Initialize top tree cache (top 10 levels in constant memory)
+        // Initialize top tree cache (top 8 levels in constant memory)
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             LOG_DEBUG("mine_pow_with_buffer: failed to initialize top tree cache");
-            // Non-fatal - continue without cache
-        }
-        
-        // Initialize mast_paths cache (6 Digests in constant memory)
-        if (!initialize_mast_paths_cache(mast_paths)) {
-            LOG_DEBUG("mine_pow_with_buffer: failed to initialize mast_paths cache");
             // Non-fatal - continue without cache
         }
         
