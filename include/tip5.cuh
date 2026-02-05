@@ -66,32 +66,71 @@ __device__ __forceinline__ uint64_t fast_bitreverse_64(uint64_t val, uint32_t bi
 
 // Optimized Montgomery reduction for Goldilocks prime p = 2^64 - 2^32 + 1
 // Input: 128-bit value (xh, xl) where result = (xh * 2^64 + xl) * R^(-1) mod p
-// Uses PTX add.cc/addc for efficient carry chain operations
+// Uses 32-bit arithmetic with carry chain for better GPU efficiency
 __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl) {
     uint64_t result;
     asm("{\n\t"
-        ".reg .u64 t, t_hi, u, xl_shifted;\n\t"
-        ".reg .pred p, q;\n\t"
-        // Step 1: t = xl + (xl << 32), detect overflow
-        "shl.b64 xl_shifted, %1, 32;\n\t"
-        "add.cc.u64 t, %1, xl_shifted;\n\t"        // t = xl + (xl << 32), set carry
-        // Get carry as predicate via comparison (t < xl means overflow)
-        "setp.lt.u64 p, t, %1;\n\t"
-        // Step 2: t_hi = t >> 32
-        "shr.b64 t_hi, t, 32;\n\t"
-        // Step 3: u = t - t_hi - carry
-        // Compute t - t_hi first
-        "sub.u64 u, t, t_hi;\n\t"
-        // Subtract carry (1 if overflow occurred)
-        "selp.u64 t_hi, 1, 0, p;\n\t"              // reuse t_hi as temp for carry value
-        "sub.u64 u, u, t_hi;\n\t"
-        // Step 4: result = xh - u
+        ".reg .u64 neg_m, u;\n\t"
+        ".reg .u32 xl_lo, xl_hi, neg_m_lo, neg_m_hi, c;\n\t"
+        ".reg .pred q;\n\t"
+        // Split xl into 32-bit parts
+        "mov.b64 {xl_lo, xl_hi}, %1;\n\t"
+        // neg_m = xl + (xl << 32) using 32-bit arithmetic with carry
+        "add.cc.u32 neg_m_lo, xl_lo, 0;\n\t"
+        "addc.cc.u32 neg_m_hi, xl_hi, xl_lo;\n\t"
+        "addc.u32 c, 0, 0;\n\t"
+        // Reconstruct neg_m
+        "mov.b64 neg_m, {neg_m_lo, neg_m_hi};\n\t"
+        // u = neg_m - neg_m_hi - c
+        "cvt.u64.u32 u, neg_m_hi;\n\t"
+        "sub.u64 u, neg_m, u;\n\t"
+        "cvt.u64.u32 neg_m, c;\n\t"
+        "sub.u64 u, u, neg_m;\n\t"
+        // result = xh - u
         "sub.u64 %0, %2, u;\n\t"
-        // Branchless underflow correction: if xh < u, subtract 0xFFFFFFFF
+        // Branchless underflow correction
         "setp.lt.u64 q, %2, u;\n\t"
-        "selp.u64 t_hi, 4294967295, 0, q;\n\t"     // reuse t_hi for correction
-        "sub.u64 %0, %0, t_hi;\n\t"
+        "selp.u64 u, 4294967295, 0, q;\n\t"
+        "sub.u64 %0, %0, u;\n\t"
         "}" : "=l"(result) : "l"(xl), "l"(xh));
+    return result;
+}
+
+// PTX-optimized field multiplication: computes (a * b) mod p in Montgomery form
+// Fuses 64x64->128 multiplication with Montgomery reduction for better register usage
+// Uses funnel shift (shf) for efficient 32-bit extraction from 64-bit values
+__device__ __forceinline__ uint64_t field_mul_ptx(uint64_t a, uint64_t b) {
+    uint64_t result;
+    asm("{\n\t"
+        ".reg .u64 lo, hi, neg_m, u;\n\t"
+        ".reg .u32 lo_lo, lo_hi, neg_m_lo, neg_m_hi, t32, c;\n\t"
+        ".reg .pred p, q;\n\t"
+        // 64x64 -> 128-bit multiplication
+        "mul.lo.u64 lo, %1, %2;\n\t"
+        "mul.hi.u64 hi, %1, %2;\n\t"
+        // Split lo into 32-bit parts for efficient computation
+        "mov.b64 {lo_lo, lo_hi}, lo;\n\t"
+        // neg_m = lo + (lo << 32) using 32-bit arithmetic with carry
+        // neg_m_lo = lo_lo + 0 = lo_lo (low 32 bits of lo << 32 is 0)
+        // neg_m_hi = lo_hi + lo_lo + carry
+        "add.cc.u32 neg_m_lo, lo_lo, 0;\n\t"        // neg_m_lo = lo_lo, no carry in
+        "addc.cc.u32 neg_m_hi, lo_hi, lo_lo;\n\t"   // neg_m_hi = lo_hi + lo_lo + 0
+        "addc.u32 c, 0, 0;\n\t"                      // c = carry out
+        // Reconstruct neg_m
+        "mov.b64 neg_m, {neg_m_lo, neg_m_hi};\n\t"
+        // u = neg_m - (neg_m >> 32) - carry = neg_m - neg_m_hi - c
+        // Using 64-bit: u = neg_m - (uint64_t)neg_m_hi - c
+        "cvt.u64.u32 u, neg_m_hi;\n\t"
+        "sub.u64 u, neg_m, u;\n\t"
+        "cvt.u64.u32 neg_m, c;\n\t"                  // reuse neg_m for carry
+        "sub.u64 u, u, neg_m;\n\t"
+        // result = hi - u
+        "sub.u64 %0, hi, u;\n\t"
+        // Branchless underflow correction
+        "setp.lt.u64 q, hi, u;\n\t"
+        "selp.u64 u, 4294967295, 0, q;\n\t"
+        "sub.u64 %0, %0, u;\n\t"
+        "}" : "=l"(result) : "l"(a), "l"(b));
     return result;
 }
 
@@ -164,21 +203,11 @@ __host__ inline uint64_t field_mul_host(uint64_t a, uint64_t b) {
 }
 
 __device__ __forceinline__ uint64_t x7_computer_pipelined(uint64_t x) {
-    uint64_t lo2 = x * x;
-    uint64_t hi2 = __umul64hi(x, x);
-    uint64_t x2 = montyred_from_parts(hi2, lo2);
-
-    uint64_t lo4 = x2 * x2;
-    uint64_t hi4 = __umul64hi(x2, x2);
-    uint64_t x4 = montyred_from_parts(hi4, lo4);
-
-    uint64_t lo6 = x4 * x2;
-    uint64_t hi6 = __umul64hi(x4, x2);
-    uint64_t x6 = montyred_from_parts(hi6, lo6);
-
-    uint64_t lo7 = x6 * x;
-    uint64_t hi7 = __umul64hi(x6, x);
-    return montyred_from_parts(hi7, lo7);
+    // Use fused PTX multiply-reduce for better register efficiency
+    uint64_t x2 = field_mul_ptx(x, x);
+    uint64_t x4 = field_mul_ptx(x2, x2);
+    uint64_t x6 = field_mul_ptx(x4, x2);
+    return field_mul_ptx(x6, x);
 }
 
 __device__ __forceinline__ uint64_t x7_computer(uint64_t x) {
@@ -193,9 +222,8 @@ __host__ inline uint64_t x7_computer_host(uint64_t x) {
 }
 
 __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, const uint8_t* __restrict__ shared_lut) {
-    uint64_t lo1 = element_in * R2;
-    uint64_t hi1 = __umul64hi(element_in, R2);
-    uint64_t reduced_in = montyred_from_parts(hi1, lo1);
+    // Use fused PTX multiply-reduce for R2 multiplication
+    uint64_t reduced_in = field_mul_ptx(element_in, R2);
 
     // PTX-optimized byte extraction using bfe (bit field extract)
     // Extract each byte directly into uint32_t for efficient LUT indexing
