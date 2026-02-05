@@ -269,6 +269,19 @@ __device__ void Pow_indices_device(
     uint64_t& index_a, uint64_t& index_b);
 
 // Direct MAST hash - reads paths from global memory without building Pow struct
+__device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
+    const PowMastPaths& mast_paths,
+    const Digest& nonce,
+    const Digest& root,
+    const Digest* __restrict__ d_internal_nodes,
+    uint64_t path_index_a,
+    uint64_t path_index_b,
+    size_t num_leafs,
+    size_t merkle_height,
+    size_t stored_nodes_count,
+    const Digest& commitment,
+    const Digest& leaf_prefix);
+
 __device__ __noinline__ Digest fast_mast_hash_direct(
     const PowMastPaths& mast_paths,
     const Digest& nonce,

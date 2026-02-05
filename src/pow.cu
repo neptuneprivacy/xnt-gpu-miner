@@ -271,6 +271,92 @@ __device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& po
     return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), kernel[0]);
 }
 
+// Low VRAM version - uses get_internal_node_safe for on-demand node computation
+__device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
+    const Digest& nonce,
+    const Digest& root,
+    const Digest* __restrict__ d_internal_nodes,
+    uint64_t path_index_a,
+    uint64_t path_index_b,
+    size_t num_leafs,
+    size_t merkle_height,
+    size_t stored_nodes_count,
+    const Digest& commitment,
+    const Digest& leaf_prefix
+) {
+    uint64_t state[STATE_SIZE];
+    tip5_sponge_init(state, Domain::VariableLength);
+    
+    int chunk_pos = 0;
+    
+    #define ABSORB_VALUE(val) do { \
+        state[chunk_pos++] = (val); \
+        if (chunk_pos == RATE) { \
+            tip5_permutation(state); \
+            chunk_pos = 0; \
+        } \
+    } while(0)
+    
+    // 1. Add nonce (5 words)
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        ABSORB_VALUE(nonce.values[i]);
+    }
+    
+    // 2. Add path_b (27 * 5 = 135 words) - compute on-demand
+    {
+        size_t running_index = path_index_b + num_leafs;
+        size_t sibling_leaf_index = path_index_b ^ 1;
+        // Compute leaf on-demand
+        Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
+        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(sib.values[j]);
+        
+        // Levels 1-26: use get_internal_node_safe
+        for (size_t level = 1; level < merkle_height; ++level) {
+            running_index >>= 1;
+            size_t sibling_index = running_index ^ 1;
+            Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
+            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
+        }
+    }
+    
+    // 3. Add path_a (27 * 5 = 135 words) - compute on-demand
+    {
+        size_t running_index = path_index_a + num_leafs;
+        size_t sibling_leaf_index = path_index_a ^ 1;
+        // Compute leaf on-demand
+        Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
+        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(sib.values[j]);
+        
+        // Levels 1-26: use get_internal_node_safe
+        for (size_t level = 1; level < merkle_height; ++level) {
+            running_index >>= 1;
+            size_t sibling_index = running_index ^ 1;
+            Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
+            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
+        }
+    }
+    
+    // 4. Add root (5 words)
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        ABSORB_VALUE(root.values[i]);
+    }
+    
+    #undef ABSORB_VALUE
+    
+    // Final padding
+    for (int i = chunk_pos; i < RATE; ++i) {
+        state[i] = BFE_ZERO;
+    }
+    state[chunk_pos] = BFE_ONE;
+    tip5_permutation(state);
+    
+    Digest result;
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        result.values[i] = state[i];
+    }
+    return result;
+}
+
 // Direct version - reads paths from global memory without building Pow struct
 __device__ __noinline__ Digest fast_mast_hash_direct(
     const PowMastPaths& mast_paths,
@@ -287,6 +373,37 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
     Digest pow_encoding_digest = hash_pow_encoding_direct(
         nonce, root, d_leafs, d_internal_nodes,
         path_index_a, path_index_b, num_leafs, merkle_height);
+    
+    // MAST hash chain
+    Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, mast_paths.pow[0]);
+    header_mast_hash = tip5_hash_fixed_device(header_mast_hash, mast_paths.pow[1]);
+    header_mast_hash = tip5_hash_fixed_device(mast_paths.pow[2], header_mast_hash);
+    
+    Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), mast_paths.header[0]);
+    kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, mast_paths.header[1]);
+    
+    return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), mast_paths.kernel[0]);
+}
+
+// Low VRAM version - uses on-demand node computation
+__device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
+    const PowMastPaths& mast_paths,
+    const Digest& nonce,
+    const Digest& root,
+    const Digest* __restrict__ d_internal_nodes,
+    uint64_t path_index_a,
+    uint64_t path_index_b,
+    size_t num_leafs,
+    size_t merkle_height,
+    size_t stored_nodes_count,
+    const Digest& commitment,
+    const Digest& leaf_prefix
+) {
+    // Streaming hash with on-demand node computation
+    Digest pow_encoding_digest = hash_pow_encoding_direct_low_vram(
+        nonce, root, d_internal_nodes,
+        path_index_a, path_index_b, num_leafs, merkle_height,
+        stored_nodes_count, commitment, leaf_prefix);
     
     // MAST hash chain
     Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, mast_paths.pow[0]);

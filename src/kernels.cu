@@ -390,62 +390,25 @@ __global__ void parallel_mining_kernel_low_vram(
         Digest commitment = mast_paths.commit_device();
         // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         
-        // Build paths using stored internal nodes where available
-        // For missing nodes, compute on-demand
-        // Large local arrays - scope reduced to help register allocation
-        Digest path_a[MERKLE_TREE_HEIGHT_];
-        Digest path_b[MERKLE_TREE_HEIGHT_];
-        
-        // Path B - use get_internal_node_safe for transparent stored/computed node access
-        {
-            size_t running_index = path_index_b + num_leafs;
-            size_t sibling_leaf_index = path_index_b ^ 1;
-            // Leaf level: compute from leaf_prefix (commitment in Reboot/Xnt, prev_block_digest in HardforkAlpha)
-            // Use original index for computation (not bit-reversed)
-            Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
-            path_b[0] = sib;
-            
-            // Internal nodes: use get_internal_node_safe (stored or computed)
-            for (size_t level = 1; level < merkle_height; ++level) {
-                running_index >>= 1;
-                size_t sibling_index = running_index ^ 1;
-                Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
-                path_b[level] = node;
-            }
-        }
-        
-        // Path A - use get_internal_node_safe for transparent stored/computed node access
-        {
-            size_t running_index = path_index_a + num_leafs;
-            size_t sibling_leaf_index = path_index_a ^ 1;
-            // Leaf level: compute from leaf_prefix (commitment in Reboot/Xnt, prev_block_digest in HardforkAlpha)
-            // Use original index for computation (not bit-reversed)
-            Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
-            path_a[0] = sib;
-            
-            // Internal nodes: use get_internal_node_safe (stored or computed)
-            for (size_t level = 1; level < merkle_height; ++level) {
-                running_index >>= 1;
-                size_t sibling_index = running_index ^ 1;
-                Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
-                path_a[level] = node;
-            }
-        }
-        
-        // Compute final hash using correct fast_mast_hash implementation
+        // Compute final hash directly from global memory - no Pow struct or local arrays needed
+        // This eliminates 2240 bytes of register pressure per thread (same as high VRAM version)
         // Root is at last index in sequentially-built tree
-        // Use const pointer to hint compiler about read-only access
         const Digest* __restrict__ root_ptr = &d_internal_nodes[stored_nodes_count - 1];
         Digest merkle_root = *root_ptr;
-        Pow pow;
-        pow.root = merkle_root;
-        pow.nonce = nonce_digest;
-        for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
-            pow.path_a[i] = path_a[i];
-            pow.path_b[i] = path_b[i];
-        }
         
-        Digest final_hash = mast_paths.fast_mast_hash_device(pow);
+        // Use optimized low VRAM version that computes nodes on-demand
+        Digest final_hash = fast_mast_hash_direct_low_vram(
+            mast_paths,
+            nonce_digest,
+            merkle_root,
+            d_internal_nodes,
+            path_index_a,  // path_index_a
+            path_index_b,  // path_index_b
+            num_leafs,
+            merkle_height,
+            stored_nodes_count,
+            commitment,
+            leaf_prefix);
         
         // Check against target - optimized comparison (low VRAM version)
         // Most hashes will fail on the highest limb, so check it first
