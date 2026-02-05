@@ -1,4 +1,5 @@
 #include "pow.cuh"
+#include "kernels.cuh"
 #include <cstdlib>
 
 // d_gpu_range_start and d_gpu_range_size are defined via extern in tip5.cuh
@@ -140,7 +141,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         ABSORB_VALUE(nonce.values[i]);
     }
     
-    // 2. Add path_b (27 * 5 = 135 words) - read directly from global memory
+    // 2. Add path_b (27 * 5 = 135 words) - use cache for top levels
     {
         size_t running_index = path_index_b + num_leafs;
         // Level 0: leaf sibling
@@ -148,18 +149,24 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         Digest d = d_leafs[sibling_leaf];
         for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
         
-        // Levels 1-26: internal nodes
+        // Levels 1-26: internal nodes - use constant memory cache for top levels
         for (size_t level = 1; level < merkle_height; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
-            Digest node = (sibling_index < num_leafs) 
-                ? d_internal_nodes[sibling_index] 
-                : Digest::default_digest();
+            Digest node;
+            if (sibling_index < TOP_TREE_CACHE_SIZE) {
+                // Use constant memory cache for top tree levels
+                node = get_cached_node(sibling_index);
+            } else if (sibling_index < num_leafs) {
+                node = d_internal_nodes[sibling_index];
+            } else {
+                node = Digest::default_digest();
+            }
             for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
         }
     }
     
-    // 3. Add path_a (27 * 5 = 135 words) - read directly from global memory
+    // 3. Add path_a (27 * 5 = 135 words) - use cache for top levels
     {
         size_t running_index = path_index_a + num_leafs;
         // Level 0: leaf sibling
@@ -167,13 +174,19 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         Digest d = d_leafs[sibling_leaf];
         for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
         
-        // Levels 1-26: internal nodes
+        // Levels 1-26: internal nodes - use constant memory cache for top levels
         for (size_t level = 1; level < merkle_height; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
-            Digest node = (sibling_index < num_leafs) 
-                ? d_internal_nodes[sibling_index] 
-                : Digest::default_digest();
+            Digest node;
+            if (sibling_index < TOP_TREE_CACHE_SIZE) {
+                // Use constant memory cache for top tree levels
+                node = get_cached_node(sibling_index);
+            } else if (sibling_index < num_leafs) {
+                node = d_internal_nodes[sibling_index];
+            } else {
+                node = Digest::default_digest();
+            }
             for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
         }
     }
@@ -357,9 +370,40 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     return result;
 }
 
+// Helper: Fixed-length hash with state reuse (avoids reinitializing state array)
+__device__ __forceinline__ void tip5_hash_fixed_inplace(uint64_t* state, const Digest& left, const Digest& right) {
+    // Reset state for FixedLength domain
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        state[i] = left.values[i];
+        state[i + DIGEST_LEN] = right.values[i];
+    }
+    for (int i = RATE; i < STATE_SIZE; ++i) {
+        state[i] = static_cast<uint64_t>(Domain::FixedLength);
+    }
+    tip5_permutation(state);
+}
+
+// Helper: Varlen hash for 5 words with state reuse
+__device__ __forceinline__ void tip5_hash_varlen5_inplace(uint64_t* state, const Digest& in) {
+    // VariableLength domain
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        state[i] = in.values[i];
+    }
+    state[DIGEST_LEN] = BFE_ONE;  // padding marker
+    for (int i = DIGEST_LEN + 1; i < RATE; ++i) {
+        state[i] = 0ULL;
+    }
+    for (int i = RATE; i < STATE_SIZE; ++i) {
+        state[i] = static_cast<uint64_t>(Domain::VariableLength);
+    }
+    tip5_permutation(state);
+}
+
 // Direct version - reads paths from global memory without building Pow struct
+// OPTIMIZED: Reuses single state array for all hash operations
+// OPTIMIZED: Uses constant memory cache for mast_paths (broadcast to all threads)
 __device__ __noinline__ Digest fast_mast_hash_direct(
-    const PowMastPaths& mast_paths,
+    const PowMastPaths& mast_paths,  // Kept for API compatibility, but uses cached version
     const Digest& nonce,
     const Digest& root,
     const Digest* __restrict__ d_leafs,
@@ -374,20 +418,57 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
         nonce, root, d_leafs, d_internal_nodes,
         path_index_a, path_index_b, num_leafs, merkle_height);
     
-    // MAST hash chain
-    Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, mast_paths.pow[0]);
-    header_mast_hash = tip5_hash_fixed_device(header_mast_hash, mast_paths.pow[1]);
-    header_mast_hash = tip5_hash_fixed_device(mast_paths.pow[2], header_mast_hash);
+    // Load mast_paths from constant memory cache (fast broadcast to all threads)
+    Digest pow0, pow1, pow2, header0, header1, kernel0;
+    get_cached_mast_paths_digests(pow0, pow1, pow2, header0, header1, kernel0);
     
-    Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), mast_paths.header[0]);
-    kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, mast_paths.header[1]);
+    // OPTIMIZED MAST hash chain - reuse single state array
+    uint64_t state[STATE_SIZE];
     
-    return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), mast_paths.kernel[0]);
+    // Step 1: header_mast_hash = hash(pow_encoding_digest, pow[0])
+    tip5_hash_fixed_inplace(state, pow_encoding_digest, pow0);
+    Digest header_mast_hash;
+    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
+    
+    // Step 2: header_mast_hash = hash(header_mast_hash, pow[1])
+    tip5_hash_fixed_inplace(state, header_mast_hash, pow1);
+    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
+    
+    // Step 3: header_mast_hash = hash(pow[2], header_mast_hash)
+    tip5_hash_fixed_inplace(state, pow2, header_mast_hash);
+    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
+    
+    // Step 4: varlen_hash = tip5_hash_varlen_len5(header_mast_hash)
+    tip5_hash_varlen5_inplace(state, header_mast_hash);
+    Digest varlen_hash;
+    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
+    
+    // Step 5: kernel_mast_hash = hash(varlen_hash, header[0])
+    tip5_hash_fixed_inplace(state, varlen_hash, header0);
+    Digest kernel_mast_hash;
+    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
+    
+    // Step 6: kernel_mast_hash = hash(kernel_mast_hash, header[1])
+    tip5_hash_fixed_inplace(state, kernel_mast_hash, header1);
+    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
+    
+    // Step 7: varlen_hash = tip5_hash_varlen_len5(kernel_mast_hash)
+    tip5_hash_varlen5_inplace(state, kernel_mast_hash);
+    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
+    
+    // Step 8: final = hash(varlen_hash, kernel[0])
+    tip5_hash_fixed_inplace(state, varlen_hash, kernel0);
+    
+    Digest result;
+    for (int i = 0; i < DIGEST_LEN; ++i) result.values[i] = state[i];
+    return result;
 }
 
 // Low VRAM version - uses on-demand node computation
+// OPTIMIZED: Reuses single state array for all hash operations
+// OPTIMIZED: Uses constant memory cache for mast_paths (broadcast to all threads)
 __device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
-    const PowMastPaths& mast_paths,
+    const PowMastPaths& mast_paths,  // Kept for API compatibility, but uses cached version
     const Digest& nonce,
     const Digest& root,
     const Digest* __restrict__ d_internal_nodes,
@@ -405,15 +486,50 @@ __device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
         path_index_a, path_index_b, num_leafs, merkle_height,
         stored_nodes_count, commitment, leaf_prefix);
     
-    // MAST hash chain
-    Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, mast_paths.pow[0]);
-    header_mast_hash = tip5_hash_fixed_device(header_mast_hash, mast_paths.pow[1]);
-    header_mast_hash = tip5_hash_fixed_device(mast_paths.pow[2], header_mast_hash);
+    // Load mast_paths from constant memory cache (fast broadcast to all threads)
+    Digest pow0, pow1, pow2, header0, header1, kernel0;
+    get_cached_mast_paths_digests(pow0, pow1, pow2, header0, header1, kernel0);
     
-    Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), mast_paths.header[0]);
-    kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, mast_paths.header[1]);
+    // OPTIMIZED MAST hash chain - reuse single state array
+    uint64_t state[STATE_SIZE];
     
-    return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), mast_paths.kernel[0]);
+    // Step 1: header_mast_hash = hash(pow_encoding_digest, pow[0])
+    tip5_hash_fixed_inplace(state, pow_encoding_digest, pow0);
+    Digest header_mast_hash;
+    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
+    
+    // Step 2: header_mast_hash = hash(header_mast_hash, pow[1])
+    tip5_hash_fixed_inplace(state, header_mast_hash, pow1);
+    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
+    
+    // Step 3: header_mast_hash = hash(pow[2], header_mast_hash)
+    tip5_hash_fixed_inplace(state, pow2, header_mast_hash);
+    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
+    
+    // Step 4: varlen_hash = tip5_hash_varlen_len5(header_mast_hash)
+    tip5_hash_varlen5_inplace(state, header_mast_hash);
+    Digest varlen_hash;
+    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
+    
+    // Step 5: kernel_mast_hash = hash(varlen_hash, header[0])
+    tip5_hash_fixed_inplace(state, varlen_hash, header0);
+    Digest kernel_mast_hash;
+    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
+    
+    // Step 6: kernel_mast_hash = hash(kernel_mast_hash, header[1])
+    tip5_hash_fixed_inplace(state, kernel_mast_hash, header1);
+    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
+    
+    // Step 7: varlen_hash = tip5_hash_varlen_len5(kernel_mast_hash)
+    tip5_hash_varlen5_inplace(state, kernel_mast_hash);
+    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
+    
+    // Step 8: final = hash(varlen_hash, kernel[0])
+    tip5_hash_fixed_inplace(state, varlen_hash, kernel0);
+    
+    Digest result;
+    for (int i = 0; i < DIGEST_LEN; ++i) result.values[i] = state[i];
+    return result;
 }
 
 VramMode detect_vram_mode(int gpu_id) {
@@ -1045,18 +1161,42 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
 }
 
 __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
-    // Reduced variable scope to minimize register pressure
-    Digest indexer = tip5_hash_fixed_device(hash, nonce);
-    // Use fast right-zero hash variant for the bulk of repetitions
-    // Process in reduced scope to help compiler optimize register allocation
-    {
-        for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
-            indexer = tip5_hash_fixed_right_zero_device(indexer);
+    // OPTIMIZED: Reuse state array across all 63 iterations instead of recreating each time
+    // This saves 62 state initializations and reduces register pressure
+    uint64_t state[STATE_SIZE];
+    
+    // First hash: hash(hash, nonce) with FixedLength domain
+    tip5_sponge_init(state, Domain::FixedLength);
+    for (int i = 0; i < DIGEST_LEN; ++i) {
+        state[i] = hash.values[i];
+        state[i + DIGEST_LEN] = nonce.values[i];
+    }
+    tip5_permutation(state);
+    
+    // Remaining 62 iterations: hash(state, zeros) - reuse state directly
+    // For FixedLength domain with right=0, we just need to:
+    // 1. Keep left 5 values from previous output
+    // 2. Set right 5 values to 0
+    // 3. Reset capacity to FixedLength domain
+    // 4. Permute
+    for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
+        // Copy output (first 5 values) to input position
+        // state[0..4] already has output, keep it as left input
+        // Set right input (state[5..9]) to zeros
+        state[5] = 0;
+        state[6] = 0;
+        state[7] = 0;
+        state[8] = 0;
+        state[9] = 0;
+        // Reset capacity for FixedLength domain
+        for (int j = RATE; j < STATE_SIZE; ++j) {
+            state[j] = static_cast<uint64_t>(Domain::FixedLength);
         }
+        tip5_permutation(state);
     }
 
-    index_a = indexer.values[0] & MERKLE_INDEX_MASK;
-    index_b = indexer.values[1] & MERKLE_INDEX_MASK;
+    index_a = state[0] & MERKLE_INDEX_MASK;
+    index_b = state[1] & MERKLE_INDEX_MASK;
 }
 
 // Mining pool configuration

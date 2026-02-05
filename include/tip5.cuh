@@ -247,7 +247,7 @@ __host__ void sbox_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void round_constants_layer_host(int round_index, const uint64_t* state_in, uint64_t* state_out);
 
-__device__ void tip5_permutation(uint64_t* state);
+__device__ __noinline__ void tip5_permutation(uint64_t* state);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {

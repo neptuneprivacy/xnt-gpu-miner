@@ -469,7 +469,7 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
     }
 }
 
-__device__ void tip5_permutation(uint64_t* state) {
+__device__ __noinline__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
     
     // OPTIMIZATION: Fused round constants - no separate function call

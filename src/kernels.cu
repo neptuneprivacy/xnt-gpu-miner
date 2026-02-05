@@ -10,6 +10,24 @@
 __constant__ uint64_t d_gpu_range_start;
 __constant__ uint64_t d_gpu_range_size;
 
+// ===== TOP MERKLE TREE CACHE =====
+// Cache top 10 levels of Merkle tree in constant memory for fast access
+// Top 10 levels = 2^10 - 1 = 1023 nodes = 1023 * 40 bytes = ~40KB (fits in 64KB limit)
+// These nodes are accessed by ALL threads, so caching eliminates global memory reads
+// Constants TOP_TREE_CACHE_LEVELS and TOP_TREE_CACHE_SIZE defined in kernels.cuh
+// Store as raw uint64_t since Digest has constructor (not allowed in __constant__)
+__constant__ uint64_t d_top_tree_cache[TOP_TREE_CACHE_SIZE * DIGEST_LEN];
+
+// Flag to track if cache is initialized for current job
+static bool g_top_tree_cache_initialized = false;
+
+// ===== MAST PATHS CACHE =====
+// Cache PowMastPaths in constant memory for fast broadcast to all threads
+// 6 Digests = 30 uint64_t = 240 bytes - accessed 8 times per hash, same for ALL threads
+__constant__ uint64_t d_mast_paths_cache[MAST_PATHS_SIZE];
+
+static bool g_mast_paths_cache_initialized = false;
+
 // ===== SHARED MEMORY LOOKUP TABLE =====
 // Loaded once per block for S-box computation
 __shared__ uint8_t s_lookup_table[256];
@@ -193,6 +211,114 @@ bool GuesserBuffer::reset_output_buffers() {
     return err == cudaSuccess;
 }
 
+// ===== TOP TREE CACHE FUNCTIONS =====
+
+// Initialize the top tree cache from the merkle tree
+// Call this once per job when the tree changes
+bool initialize_top_tree_cache(const Digest* d_merkle_tree, size_t num_leafs) {
+    if (g_top_tree_cache_initialized) return true;
+    
+    // Top tree cache stores the highest (smallest index) internal nodes
+    // In our tree layout, the root is at index (num_leafs - 2)
+    // We want to cache the top 8 levels = 255 nodes near the root
+    // 
+    // Tree indices (for num_leafs = 2^27):
+    // Root is at index num_leafs - 2 = 134217726
+    // Its children are at indices that hash to it
+    //
+    // Actually, we need to understand the tree layout:
+    // The tree is stored with internal nodes indexed 0 to num_leafs-2
+    // Index 0 is the first internal node (parent of leaves 0 and 1)
+    // Root is at index num_leafs - 2
+    //
+    // For path computation, sibling_index starts large and gets smaller
+    // At top levels (near root), sibling_index < 256 (for top 8 levels)
+    //
+    // So we cache indices 0 to TOP_TREE_CACHE_SIZE-1
+    // Copy as raw uint64_t (same memory layout as Digest array)
+    
+    cudaError_t err = cudaMemcpyToSymbol(
+        d_top_tree_cache, 
+        d_merkle_tree,  // First TOP_TREE_CACHE_SIZE nodes (as raw bytes)
+        TOP_TREE_CACHE_SIZE * DIGEST_LEN * sizeof(uint64_t),
+        0,
+        cudaMemcpyDeviceToDevice);
+    
+    if (err != cudaSuccess) {
+        LOG_ERROR("initialize_top_tree_cache", err);
+        return false;
+    }
+    
+    g_top_tree_cache_initialized = true;
+    return true;
+}
+
+// Reset cache flag when job changes
+void reset_top_tree_cache() {
+    g_top_tree_cache_initialized = false;
+}
+
+// ===== MAST PATHS CACHE FUNCTIONS =====
+
+bool initialize_mast_paths_cache(const PowMastPaths& mast_paths) {
+    if (g_mast_paths_cache_initialized) return true;
+    
+    // Flatten PowMastPaths into uint64_t array for constant memory
+    // Layout: pow[0..2], header[0..1], kernel[0]
+    uint64_t flat_data[MAST_PATHS_SIZE];
+    size_t offset = 0;
+    
+    // pow[0..2]
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            flat_data[offset++] = mast_paths.pow[i].values[j];
+        }
+    }
+    // header[0..1]
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            flat_data[offset++] = mast_paths.header[i].values[j];
+        }
+    }
+    // kernel[0]
+    for (int j = 0; j < DIGEST_LEN; ++j) {
+        flat_data[offset++] = mast_paths.kernel[0].values[j];
+    }
+    
+    cudaError_t err = cudaMemcpyToSymbol(
+        d_mast_paths_cache,
+        flat_data,
+        MAST_PATHS_SIZE * sizeof(uint64_t),
+        0,
+        cudaMemcpyHostToDevice);
+    
+    if (err != cudaSuccess) {
+        LOG_ERROR("initialize_mast_paths_cache", err);
+        return false;
+    }
+    
+    g_mast_paths_cache_initialized = true;
+    return true;
+}
+
+void reset_mast_paths_cache() {
+    g_mast_paths_cache_initialized = false;
+}
+
+// Device function to get internal node - uses cache for small indices
+__device__ __forceinline__ Digest get_internal_node_cached(
+    const Digest* __restrict__ d_internal_nodes,
+    size_t index,
+    size_t num_leafs
+) {
+    // Check if this node is in our top-tree cache
+    if (index < TOP_TREE_CACHE_SIZE) {
+        return get_cached_node(index);
+    }
+    // Fall back to global memory
+    return (index < num_leafs) ? d_internal_nodes[index] : Digest::default_digest();
+}
+
 // ===== HIGH-VRAM MINING KERNEL =====
 
 __global__ void parallel_mining_kernel_high_vram(
@@ -251,6 +377,7 @@ __global__ void parallel_mining_kernel_high_vram(
         
         // Compute POW hash directly from global memory - no Pow struct needed
         // This eliminates 2240 bytes of register pressure per thread
+        // Uses top tree cache for fast access to upper Merkle levels
         Digest final_hash = fast_mast_hash_direct(
             mast_paths,
             nonce_digest,
@@ -619,6 +746,19 @@ std::optional<MiningSolution> mine_pow_with_buffer(
             LOG_ERROR("copy range_size", range_err);
             return std::nullopt;
         }
+        
+        // Initialize top tree cache (top 10 levels in constant memory)
+        if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
+            LOG_DEBUG("mine_pow_with_buffer: failed to initialize top tree cache");
+            // Non-fatal - continue without cache
+        }
+        
+        // Initialize mast_paths cache (6 Digests in constant memory)
+        if (!initialize_mast_paths_cache(mast_paths)) {
+            LOG_DEBUG("mine_pow_with_buffer: failed to initialize mast_paths cache");
+            // Non-fatal - continue without cache
+        }
+        
         buffer.gpu_range_initialized = true;
     }
     
