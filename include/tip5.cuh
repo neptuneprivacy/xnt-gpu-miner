@@ -327,12 +327,21 @@ __device__ __noinline__ void tip5_permutation(uint64_t* state);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {
-    // OPTIMIZATION #16: Combined initialization in single loop
+    // PTX-optimized state initialization using vectorized stores
     uint64_t capacity_val = (domain == Domain::FixedLength) ? static_cast<uint64_t>(domain) : BFE_ZERO;
-
-    for (int i = 0; i < STATE_SIZE; ++i) {
-        state[i] = (i < RATE) ? BFE_ZERO : capacity_val;
-    }
+    
+    // Vectorized zero initialization for RATE elements (0-9)
+    // Using ulonglong2 for 128-bit stores
+    *reinterpret_cast<ulonglong2*>(&state[0]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[2]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[4]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[6]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[8]) = make_ulonglong2(0ULL, 0ULL);
+    
+    // Capacity elements (10-15) - set to domain value
+    *reinterpret_cast<ulonglong2*>(&state[10]) = make_ulonglong2(capacity_val, capacity_val);
+    *reinterpret_cast<ulonglong2*>(&state[12]) = make_ulonglong2(capacity_val, capacity_val);
+    *reinterpret_cast<ulonglong2*>(&state[14]) = make_ulonglong2(capacity_val, capacity_val);
 }
 
 __device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ state,
@@ -346,9 +355,11 @@ __device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ 
 
 __device__ __forceinline__ void tip5_sponge_squeeze(uint64_t* __restrict__ state,
                                                      uint64_t* __restrict__ digest) {
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        digest[i] = state[i];
-    }
+    // Vectorized copy for DIGEST_LEN (5) elements
+    // Copy first 4 as two ulonglong2, then the 5th separately
+    *reinterpret_cast<ulonglong2*>(&digest[0]) = *reinterpret_cast<ulonglong2*>(&state[0]);
+    *reinterpret_cast<ulonglong2*>(&digest[2]) = *reinterpret_cast<ulonglong2*>(&state[2]);
+    digest[4] = state[4];
 }
 
 __host__ void tip5_sponge_init_host(uint64_t* state, Domain domain);

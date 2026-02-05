@@ -354,21 +354,8 @@ __global__ void parallel_mining_kernel_high_vram(
             num_leafs,
             merkle_height);
         
-        // Check against target - optimized comparison
-        // Most hashes will fail on the highest limb, so check it first
-        bool is_solution = (final_hash.values[4] <= target.values[4]);
-        if (is_solution && final_hash.values[4] == target.values[4]) {
-            // Need to check lower limbs
-            for (int i = 3; i >= 0; --i) {
-                if (final_hash.values[i] > target.values[i]) {
-                    is_solution = false;
-                    break;
-                }
-                if (final_hash.values[i] < target.values[i]) {
-                    break;
-                }
-            }
-        }
+        // Check against target - PTX-optimized comparison
+        bool is_solution = digest_less_equal_ptx(final_hash, target);
         
         if (is_solution) {
             int was = atomicCAS(d_solution_found, 0, 1);
@@ -502,21 +489,8 @@ __global__ void parallel_mining_kernel_low_vram(
             commitment,
             leaf_prefix);
         
-        // Check against target - optimized comparison (low VRAM version)
-        // Most hashes will fail on the highest limb, so check it first
-        bool is_solution = (final_hash.values[4] <= target.values[4]);
-        if (is_solution && final_hash.values[4] == target.values[4]) {
-            // Need to check lower limbs
-            for (int i = 3; i >= 0; --i) {
-                if (final_hash.values[i] > target.values[i]) {
-                    is_solution = false;
-                    break;
-                }
-                if (final_hash.values[i] < target.values[i]) {
-                    break;
-                }
-            }
-        }
+        // Check against target - PTX-optimized comparison
+        bool is_solution = digest_less_equal_ptx(final_hash, target);
         
         if (is_solution) {
             int was = atomicCAS(d_solution_found, 0, 1);
