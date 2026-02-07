@@ -121,7 +121,7 @@ const uint64_t ROUND_CONSTANTS_HOST[5][16] = {
     }
 };
 
-__device__ void generated_function(const uint64_t* input, uint64_t* output) {
+__device__ void generated_function(const uint64_t* __restrict__ input, uint64_t* __restrict__ output) {
     uint64_t node_34 = input[0] + input[8];
     uint64_t node_38 = input[4] + input[12];
     uint64_t node_36 = input[2] + input[10];

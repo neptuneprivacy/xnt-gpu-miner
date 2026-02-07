@@ -388,31 +388,59 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
 }
 
 // Helper: Fixed-length hash with state reuse (avoids reinitializing state array)
+// OPTIMIZED: Fully unrolled loops
 __device__ __forceinline__ void tip5_hash_fixed_inplace(uint64_t* state, const Digest& left, const Digest& right) {
-    // Reset state for FixedLength domain
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        state[i] = left.values[i];
-        state[i + DIGEST_LEN] = right.values[i];
-    }
-    for (int i = RATE; i < STATE_SIZE; ++i) {
-        state[i] = static_cast<uint64_t>(Domain::FixedLength);
-    }
+    // Load left digest into state[0..4]
+    state[0] = left.values[0];
+    state[1] = left.values[1];
+    state[2] = left.values[2];
+    state[3] = left.values[3];
+    state[4] = left.values[4];
+    
+    // Load right digest into state[5..9]
+    state[5] = right.values[0];
+    state[6] = right.values[1];
+    state[7] = right.values[2];
+    state[8] = right.values[3];
+    state[9] = right.values[4];
+    
+    // Capacity region (state[10..15]) = FixedLength domain
+    constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
+    state[10] = FIXED_LEN_VAL;
+    state[11] = FIXED_LEN_VAL;
+    state[12] = FIXED_LEN_VAL;
+    state[13] = FIXED_LEN_VAL;
+    state[14] = FIXED_LEN_VAL;
+    state[15] = FIXED_LEN_VAL;
+    
     tip5_permutation(state);
 }
 
 // Helper: Varlen hash for 5 words with state reuse
+// OPTIMIZED: Fully unrolled loops
 __device__ __forceinline__ void tip5_hash_varlen5_inplace(uint64_t* state, const Digest& in) {
-    // VariableLength domain
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        state[i] = in.values[i];
-    }
-    state[DIGEST_LEN] = BFE_ONE;  // padding marker
-    for (int i = DIGEST_LEN + 1; i < RATE; ++i) {
-        state[i] = 0ULL;
-    }
-    for (int i = RATE; i < STATE_SIZE; ++i) {
-        state[i] = static_cast<uint64_t>(Domain::VariableLength);
-    }
+    // Load input digest into state[0..4]
+    state[0] = in.values[0];
+    state[1] = in.values[1];
+    state[2] = in.values[2];
+    state[3] = in.values[3];
+    state[4] = in.values[4];
+    
+    // Padding: state[5] = 1, state[6..9] = 0
+    state[5] = BFE_ONE;
+    state[6] = 0ULL;
+    state[7] = 0ULL;
+    state[8] = 0ULL;
+    state[9] = 0ULL;
+    
+    // Capacity region (state[10..15]) = VariableLength domain (0)
+    state[10] = 0ULL;
+    state[11] = 0ULL;
+    state[12] = 0ULL;
+    state[13] = 0ULL;
+    state[14] = 0ULL;
+    state[15] = 0ULL;
+    
     tip5_permutation(state);
 }
 
@@ -1173,11 +1201,30 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     uint64_t state[STATE_SIZE];
     
     // First hash: hash(hash, nonce) with FixedLength domain
-    tip5_sponge_init(state, Domain::FixedLength);
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        state[i] = hash.values[i];
-        state[i + DIGEST_LEN] = nonce.values[i];
-    }
+    // OPTIMIZATION: Inline the state setup instead of calling tip5_sponge_init + loop
+    // Load hash into state[0..4]
+    state[0] = hash.values[0];
+    state[1] = hash.values[1];
+    state[2] = hash.values[2];
+    state[3] = hash.values[3];
+    state[4] = hash.values[4];
+    
+    // Load nonce into state[5..9]
+    state[5] = nonce.values[0];
+    state[6] = nonce.values[1];
+    state[7] = nonce.values[2];
+    state[8] = nonce.values[3];
+    state[9] = nonce.values[4];
+    
+    // Capacity region for FixedLength domain
+    constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
+    state[10] = FIXED_LEN_VAL;
+    state[11] = FIXED_LEN_VAL;
+    state[12] = FIXED_LEN_VAL;
+    state[13] = FIXED_LEN_VAL;
+    state[14] = FIXED_LEN_VAL;
+    state[15] = FIXED_LEN_VAL;
+    
     tip5_permutation(state);
     
     // Remaining 62 iterations: hash(state, zeros) - reuse state directly
@@ -1186,19 +1233,26 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     // 2. Set right 5 values to 0
     // 3. Reset capacity to FixedLength domain
     // 4. Permute
+    // FIXED_LEN_VAL already defined above
+    
+    #pragma unroll 1
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
-        // Copy output (first 5 values) to input position
-        // state[0..4] already has output, keep it as left input
+        // state[0..4] already has output from previous permutation
         // Set right input (state[5..9]) to zeros
         state[5] = 0;
         state[6] = 0;
         state[7] = 0;
         state[8] = 0;
         state[9] = 0;
-        // Reset capacity for FixedLength domain
-        for (int j = RATE; j < STATE_SIZE; ++j) {
-            state[j] = static_cast<uint64_t>(Domain::FixedLength);
-        }
+        
+        // Reset capacity for FixedLength domain (fully unrolled)
+        state[10] = FIXED_LEN_VAL;
+        state[11] = FIXED_LEN_VAL;
+        state[12] = FIXED_LEN_VAL;
+        state[13] = FIXED_LEN_VAL;
+        state[14] = FIXED_LEN_VAL;
+        state[15] = FIXED_LEN_VAL;
+        
         tip5_permutation(state);
     }
 

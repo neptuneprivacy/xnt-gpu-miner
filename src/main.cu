@@ -205,6 +205,9 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         return;
     }
     
+    // Set optimal batch size from global config (default 64M nonces)
+    gpu_res->optimal_max_nonces = g_batch_size;
+    
     std::cout << "\n" << Color::BOLD << "Starting benchmark..." << Color::RESET << std::endl;
     std::cout << "Press Ctrl+C to stop\n" << std::endl;
     
@@ -244,6 +247,12 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     std::cout << "  Checking trailing zeros and threshold comparison" << std::endl;
     std::cout << std::endl;
     
+    // Debug: per-batch timing
+    bool debug_batch_timing = true;
+    int batch_count = 0;
+    int full_batch_count = 0;
+    double full_batch_total_ms = 0.0;
+    
     while (!stop_mining) {
         auto batch_start = std::chrono::steady_clock::now();
         
@@ -258,6 +267,28 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
             gpu_res->buffer->consensus_rule_set,
             nullptr
         );
+        
+        auto batch_end = std::chrono::steady_clock::now();
+        auto batch_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(batch_end - batch_start).count();
+        double batch_duration_ms = batch_duration_us / 1000.0;
+        double batch_hashrate = (NONCES_PER_BATCH / 1000000.0) / (batch_duration_ms / 1000.0);
+        
+        batch_count++;
+        
+        // Track full batches (no solution found = processed all nonces)
+        if (!result.has_value()) {
+            full_batch_count++;
+            full_batch_total_ms += batch_duration_ms;
+        }
+        
+        if (debug_batch_timing) {
+            std::cout << "\n[DEBUG] Batch #" << batch_count 
+                      << " | Nonces: " << NONCES_PER_BATCH 
+                      << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
+                      << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
+                      << " | Solution: " << (result.has_value() ? "YES" : "NO")
+                      << std::endl;
+        }
         
         // Validate any solution found by the kernel
         if (result.has_value()) {
@@ -365,9 +396,20 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     
     std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
     std::cout << "  Total Nonces:  " << total_nonces << std::endl;
+    std::cout << "  Total Batches: " << batch_count << std::endl;
+    std::cout << "  Batch Size:    " << NONCES_PER_BATCH << " (" << (NONCES_PER_BATCH / 1000000.0) << "M)" << std::endl;
     std::cout << "  Duration:      " << (total_elapsed / 1000.0) << " seconds" << std::endl;
+    std::cout << "  Avg ms/batch:  " << std::fixed << std::setprecision(2) << (total_elapsed / (double)batch_count) << " ms" << std::endl;
     std::cout << "  Average Rate:  " << Color::GREEN << std::fixed << std::setprecision(2) 
-              << total_hash_rate << " MH/s" << Color::RESET << std::endl;
+              << total_hash_rate << " MH/s" << Color::RESET << " (includes early exits)" << std::endl;
+    
+    // Show sustained rate from full batches only
+    if (full_batch_count > 0) {
+        double full_batch_avg_ms = full_batch_total_ms / full_batch_count;
+        double sustained_rate = (NONCES_PER_BATCH / 1000000.0) / (full_batch_avg_ms / 1000.0);
+        std::cout << "  " << Color::BOLD << "Sustained Rate: " << Color::YELLOW << std::setprecision(2) 
+                  << sustained_rate << " MH/s" << Color::RESET << " (full batches only, n=" << full_batch_count << ")" << std::endl;
+    }
     std::cout << std::endl;
     
     std::cout << Color::BOLD << "=== Validation Results ===" << Color::RESET << std::endl;
