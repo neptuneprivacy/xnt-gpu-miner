@@ -137,12 +137,23 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
             chunk_pos = 0; \
         } \
     } while(0)
+    #define ABSORB_DIGEST(d) do { \
+        ABSORB_VALUE((d).values[0]); \
+        ABSORB_VALUE((d).values[1]); \
+        ABSORB_VALUE((d).values[2]); \
+        ABSORB_VALUE((d).values[3]); \
+        ABSORB_VALUE((d).values[4]); \
+    } while(0)
+    #define ABSORB_DIGEST_PTR_LDG(p) do { \
+        ABSORB_VALUE(__ldg(&(p)->values[0])); \
+        ABSORB_VALUE(__ldg(&(p)->values[1])); \
+        ABSORB_VALUE(__ldg(&(p)->values[2])); \
+        ABSORB_VALUE(__ldg(&(p)->values[3])); \
+        ABSORB_VALUE(__ldg(&(p)->values[4])); \
+    } while(0)
     
     // 1. Add nonce (5 words)
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        ABSORB_VALUE(nonce.values[i]);
-    }
+    ABSORB_DIGEST(nonce);
     
     // 2. Add path_b (27 * 5 = 135 words) - optimized with read-only cache hints
     {
@@ -150,32 +161,24 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         // Level 0: leaf sibling - use read-only cache hint for better caching
         size_t sibling_leaf = path_index_b ^ 1;
         // Use __ldg() for read-only global memory - enables read-only cache
-        Digest d;
-        #pragma unroll
-        for (int j = 0; j < DIGEST_LEN; ++j) {
-            d.values[j] = __ldg(&d_leafs[sibling_leaf].values[j]);
-        }
-        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
+        ABSORB_DIGEST_PTR_LDG(&d_leafs[sibling_leaf]);
         
         // Levels 1-26: internal nodes - use read-only cache and constant memory
         #pragma unroll
         for (size_t level = 1; level < kMerkleHeight; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
-            Digest node;
-            if (sibling_index < TOP_TREE_CACHE_SIZE) {
-                // Use constant memory cache for top tree levels (fastest)
-                node = get_cached_node(sibling_index);
-            } else if (sibling_index < num_leafs) {
-                // Global memory - use read-only cache hint for better caching
-                #pragma unroll
-                for (int j = 0; j < DIGEST_LEN; ++j) {
-                    node.values[j] = __ldg(&d_internal_nodes[sibling_index].values[j]);
+                if (sibling_index < TOP_TREE_CACHE_SIZE) {
+                    // Use constant memory cache for top tree levels (fastest)
+                    Digest node = get_cached_node(sibling_index);
+                    ABSORB_DIGEST(node);
+                } else if (sibling_index < num_leafs) {
+                    // Global memory - use read-only cache hint for better caching
+                    ABSORB_DIGEST_PTR_LDG(&d_internal_nodes[sibling_index]);
+                } else {
+                    Digest node = Digest::default_digest();
+                    ABSORB_DIGEST(node);
                 }
-            } else {
-                node = Digest::default_digest();
-            }
-            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
         }
     }
     
@@ -184,41 +187,32 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         size_t running_index = path_index_a + num_leafs;
         // Level 0: leaf sibling - use read-only cache hint for better caching
         size_t sibling_leaf = path_index_a ^ 1;
-        Digest d;
-        #pragma unroll
-        for (int j = 0; j < DIGEST_LEN; ++j) {
-            d.values[j] = __ldg(&d_leafs[sibling_leaf].values[j]);
-        }
-        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
+        ABSORB_DIGEST_PTR_LDG(&d_leafs[sibling_leaf]);
         
         // Levels 1-26: internal nodes - use read-only cache and constant memory
         #pragma unroll
         for (size_t level = 1; level < kMerkleHeight; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
-            Digest node;
-            if (sibling_index < TOP_TREE_CACHE_SIZE) {
-                // Use constant memory cache for top tree levels (fastest)
-                node = get_cached_node(sibling_index);
-            } else if (sibling_index < num_leafs) {
-                // Global memory - use read-only cache hint for better caching
-                #pragma unroll
-                for (int j = 0; j < DIGEST_LEN; ++j) {
-                    node.values[j] = __ldg(&d_internal_nodes[sibling_index].values[j]);
+                if (sibling_index < TOP_TREE_CACHE_SIZE) {
+                    // Use constant memory cache for top tree levels (fastest)
+                    Digest node = get_cached_node(sibling_index);
+                    ABSORB_DIGEST(node);
+                } else if (sibling_index < num_leafs) {
+                    // Global memory - use read-only cache hint for better caching
+                    ABSORB_DIGEST_PTR_LDG(&d_internal_nodes[sibling_index]);
+                } else {
+                    Digest node = Digest::default_digest();
+                    ABSORB_DIGEST(node);
                 }
-            } else {
-                node = Digest::default_digest();
-            }
-            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
         }
     }
     
     // 4. Add root (5 words)
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        ABSORB_VALUE(root.values[i]);
-    }
+    ABSORB_DIGEST(root);
     
+    #undef ABSORB_DIGEST_PTR_LDG
+    #undef ABSORB_DIGEST
     #undef ABSORB_VALUE
     
     // Final padding (280 % 10 = 0, so chunk_pos should be 0)
@@ -251,6 +245,13 @@ __device__ __noinline__ Digest hash_pow_encoding_streaming(const Pow& pow_obj) {
             tip5_permutation(state); \
             chunk_pos = 0; \
         } \
+    } while(0)
+    #define ABSORB_DIGEST(d) do { \
+        ABSORB_VALUE((d).values[0]); \
+        ABSORB_VALUE((d).values[1]); \
+        ABSORB_VALUE((d).values[2]); \
+        ABSORB_VALUE((d).values[3]); \
+        ABSORB_VALUE((d).values[4]); \
     } while(0)
     
     // 1. Add nonce (5 words)
@@ -338,10 +339,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     } while(0)
     
     // 1. Add nonce (5 words)
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        ABSORB_VALUE(nonce.values[i]);
-    }
+    ABSORB_DIGEST(nonce);
     
     // 2. Add path_b (27 * 5 = 135 words) - compute on-demand
     {
@@ -349,7 +347,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
         size_t sibling_leaf_index = path_index_b ^ 1;
         // Compute leaf on-demand
         Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
-        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(sib.values[j]);
+        ABSORB_DIGEST(sib);
         
         // Levels 1-26: use get_internal_node_safe
         #pragma unroll
@@ -357,7 +355,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
             Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
-            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
+            ABSORB_DIGEST(node);
         }
     }
     
@@ -367,7 +365,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
         size_t sibling_leaf_index = path_index_a ^ 1;
         // Compute leaf on-demand
         Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
-        for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(sib.values[j]);
+        ABSORB_DIGEST(sib);
         
         // Levels 1-26: use get_internal_node_safe
         #pragma unroll
@@ -375,16 +373,14 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
             Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
-            for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(node.values[j]);
+            ABSORB_DIGEST(node);
         }
     }
     
     // 4. Add root (5 words)
-    #pragma unroll
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        ABSORB_VALUE(root.values[i]);
-    }
+    ABSORB_DIGEST(root);
     
+    #undef ABSORB_DIGEST
     #undef ABSORB_VALUE
     
     // Final padding

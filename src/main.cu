@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
+#include <cstdlib>
 
 void print_usage(const char* program_name) {
     std::cerr << "\n" << Color::BOLD << "Usage:" << Color::RESET << std::endl;
@@ -228,10 +229,17 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     std::string original_threshold_hex = digest_to_hex(original_threshold);
     
     
-    uint64_t total_nonces = 0;
+    uint64_t total_nonces = 0;        // Always increases to avoid nonce reuse
+    uint64_t measured_nonces = 0;     // Excludes warmup batches for steady-state rate
     uint64_t solutions_found = 0;
     uint64_t valid_solutions = 0;
     uint64_t invalid_threshold = 0;
+    
+    const char* warmup_env = std::getenv("XNT_WARMUP_BATCHES");
+    int warmup_batches = 5;
+    if (warmup_env && warmup_env[0] != '\0') {
+        warmup_batches = std::max(0, std::atoi(warmup_env));
+    }
     
     auto start_time = std::chrono::steady_clock::now();
     auto last_update = start_time;
@@ -247,9 +255,13 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     std::cout << "  Checking trailing zeros and threshold comparison" << std::endl;
     std::cout << std::endl;
     
-    // Debug: per-batch timing
-    bool debug_batch_timing = true;
+    // Debug: per-batch timing (disabled by default for steady performance)
+    bool debug_batch_timing = false;
+    if (const char* dbg_env = std::getenv("XNT_DEBUG_BATCH"); dbg_env && dbg_env[0] == '1') {
+        debug_batch_timing = true;
+    }
     int batch_count = 0;
+    int measured_batch_count = 0;
     int full_batch_count = 0;
     double full_batch_total_ms = 0.0;
     
@@ -274,6 +286,37 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         double batch_hashrate = (NONCES_PER_BATCH / 1000000.0) / (batch_duration_ms / 1000.0);
         
         batch_count++;
+        total_nonces += NONCES_PER_BATCH;
+        
+        const bool in_warmup = batch_count <= warmup_batches;
+        if (in_warmup) {
+            if (debug_batch_timing) {
+                std::cout << "\n[DEBUG] Warmup Batch #" << batch_count 
+                          << " | Nonces: " << NONCES_PER_BATCH 
+                          << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
+                          << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
+                          << " | Solution: " << (result.has_value() ? "YES" : "NO")
+                          << std::endl;
+            }
+            
+            if (batch_count == warmup_batches) {
+                // Reset measurement after warmup to avoid boost/thermal ramp affecting results
+                measured_nonces = 0;
+                measured_batch_count = 0;
+                full_batch_count = 0;
+                full_batch_total_ms = 0.0;
+                solutions_found = 0;
+                valid_solutions = 0;
+                invalid_threshold = 0;
+                start_time = std::chrono::steady_clock::now();
+                last_update = start_time;
+                last_nonces = 0;
+            }
+            continue;
+        }
+        
+        measured_batch_count++;
+        measured_nonces += NONCES_PER_BATCH;
         
         // Track full batches (no solution found = processed all nonces)
         if (!result.has_value()) {
@@ -282,7 +325,7 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         }
         
         if (debug_batch_timing) {
-            std::cout << "\n[DEBUG] Batch #" << batch_count 
+            std::cout << "\n[DEBUG] Batch #" << measured_batch_count 
                       << " | Nonces: " << NONCES_PER_BATCH 
                       << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
                       << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
@@ -292,8 +335,6 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         
         // Validate any solution found by the kernel
         if (result.has_value()) {
-            // Solution found - count full batch for accurate hash rate
-            total_nonces += NONCES_PER_BATCH;
             solutions_found++;
             
             // Extract solution components
@@ -357,9 +398,6 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
                     }
                 }
             }
-        } else {
-            // No solution found: processed full batch
-            total_nonces += NONCES_PER_BATCH;
         }
         
         iteration++;
@@ -372,16 +410,16 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         // Update hash rate display every second
         // Calculate instantaneous rate (nonces processed in last second) instead of cumulative average
         if (since_update >= 1000) {
-            uint64_t nonces_since_update = total_nonces - last_nonces;
+            uint64_t nonces_since_update = measured_nonces - last_nonces;
             double time_since_update_sec = since_update / 1000.0;
             // Calculate instantaneous hash rate: nonces in last second / time elapsed
             double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
             std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
                       << hash_rate << " MH/s" << Color::RESET 
-                      << " | Nonces: " << total_nonces 
+                      << " | Nonces: " << measured_nonces 
                       << " | Time: " << elapsed << "s" << std::flush;
             last_update = now;
-            last_nonces = total_nonces;  // Update tracked nonces for next calculation
+            last_nonces = measured_nonces;  // Update tracked nonces for next calculation
         }
         
         // Stop benchmark after the configured duration
@@ -392,14 +430,19 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     
     auto end_time = std::chrono::steady_clock::now();
     auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    double total_hash_rate = (total_nonces / 1000000.0) / (total_elapsed / 1000.0);
+    double total_hash_rate = (measured_nonces / 1000000.0) / (total_elapsed / 1000.0);
     
     std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
-    std::cout << "  Total Nonces:  " << total_nonces << std::endl;
-    std::cout << "  Total Batches: " << batch_count << std::endl;
+    std::cout << "  Total Nonces:  " << measured_nonces << std::endl;
+    std::cout << "  Total Batches: " << measured_batch_count << std::endl;
+    if (warmup_batches > 0) {
+        std::cout << "  Warmup Batches: " << warmup_batches << std::endl;
+    }
     std::cout << "  Batch Size:    " << NONCES_PER_BATCH << " (" << (NONCES_PER_BATCH / 1000000.0) << "M)" << std::endl;
     std::cout << "  Duration:      " << (total_elapsed / 1000.0) << " seconds" << std::endl;
-    std::cout << "  Avg ms/batch:  " << std::fixed << std::setprecision(2) << (total_elapsed / (double)batch_count) << " ms" << std::endl;
+    if (measured_batch_count > 0) {
+        std::cout << "  Avg ms/batch:  " << std::fixed << std::setprecision(2) << (total_elapsed / (double)measured_batch_count) << " ms" << std::endl;
+    }
     std::cout << "  Average Rate:  " << Color::GREEN << std::fixed << std::setprecision(2) 
               << total_hash_rate << " MH/s" << Color::RESET << " (includes early exits)" << std::endl;
     
