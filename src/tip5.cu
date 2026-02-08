@@ -294,29 +294,25 @@ __device__ void generated_function(const uint64_t* __restrict__ input, uint64_t*
 extern __shared__ uint8_t s_lookup_table[257];  // 256 + 1 padding for bank conflict reduction
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
-    // NO __syncthreads here - the lookup table is already loaded by the kernel
-    // and synced before any thread enters the mining loop
+    // Load all 16 elements into registers
+    uint64_t e0  = state_in[0];
+    uint64_t e1  = state_in[1];
+    uint64_t e2  = state_in[2];
+    uint64_t e3  = state_in[3];
+    uint64_t e4  = state_in[4];
+    uint64_t e5  = state_in[5];
+    uint64_t e6  = state_in[6];
+    uint64_t e7  = state_in[7];
+    uint64_t e8  = state_in[8];
+    uint64_t e9  = state_in[9];
+    uint64_t e10 = state_in[10];
+    uint64_t e11 = state_in[11];
+    uint64_t e12 = state_in[12];
+    uint64_t e13 = state_in[13];
+    uint64_t e14 = state_in[14];
+    uint64_t e15 = state_in[15];
 
-    // Vectorized load of all 16 elements
-    ulonglong2 v0 = *reinterpret_cast<const ulonglong2*>(&state_in[0]);
-    ulonglong2 v1 = *reinterpret_cast<const ulonglong2*>(&state_in[2]);
-    ulonglong2 v2 = *reinterpret_cast<const ulonglong2*>(&state_in[4]);
-    ulonglong2 v3 = *reinterpret_cast<const ulonglong2*>(&state_in[6]);
-    ulonglong2 v4 = *reinterpret_cast<const ulonglong2*>(&state_in[8]);
-    ulonglong2 v5 = *reinterpret_cast<const ulonglong2*>(&state_in[10]);
-    ulonglong2 v6 = *reinterpret_cast<const ulonglong2*>(&state_in[12]);
-    ulonglong2 v7 = *reinterpret_cast<const ulonglong2*>(&state_in[14]);
-
-    uint64_t e0 = v0.x, e1 = v0.y;
-    uint64_t e2 = v1.x, e3 = v1.y;
-    uint64_t e4 = v2.x, e5 = v2.y;
-    uint64_t e6 = v3.x, e7 = v3.y;
-    uint64_t e8 = v4.x, e9 = v4.y;
-    uint64_t e10 = v5.x, e11 = v5.y;
-    uint64_t e12 = v6.x, e13 = v6.y;
-    uint64_t e14 = v7.x, e15 = v7.y;
-
-    // Use the kernel's pre-loaded s_lookup_table (no sync needed)
+    // S-box lookup for elements 0-3
     e0 = split_lookup_shared(e0, s_lookup_table);
     e1 = split_lookup_shared(e1, s_lookup_table);
     e2 = split_lookup_shared(e2, s_lookup_table);
@@ -382,15 +378,23 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     e14 = field_mul_ptx(x14_6, e14);
     e15 = field_mul_ptx(x15_6, e15);
 
-    // Vectorized store
-    *reinterpret_cast<ulonglong2*>(&state_out[0]) = make_ulonglong2(e0, e1);
-    *reinterpret_cast<ulonglong2*>(&state_out[2]) = make_ulonglong2(e2, e3);
-    *reinterpret_cast<ulonglong2*>(&state_out[4]) = make_ulonglong2(e4, e5);
-    *reinterpret_cast<ulonglong2*>(&state_out[6]) = make_ulonglong2(e6, e7);
-    *reinterpret_cast<ulonglong2*>(&state_out[8]) = make_ulonglong2(e8, e9);
-    *reinterpret_cast<ulonglong2*>(&state_out[10]) = make_ulonglong2(e10, e11);
-    *reinterpret_cast<ulonglong2*>(&state_out[12]) = make_ulonglong2(e12, e13);
-    *reinterpret_cast<ulonglong2*>(&state_out[14]) = make_ulonglong2(e14, e15);
+    // Store results
+    state_out[0]  = e0;
+    state_out[1]  = e1;
+    state_out[2]  = e2;
+    state_out[3]  = e3;
+    state_out[4]  = e4;
+    state_out[5]  = e5;
+    state_out[6]  = e6;
+    state_out[7]  = e7;
+    state_out[8]  = e8;
+    state_out[9]  = e9;
+    state_out[10] = e10;
+    state_out[11] = e11;
+    state_out[12] = e12;
+    state_out[13] = e13;
+    state_out[14] = e14;
+    state_out[15] = e15;
 }
 
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
