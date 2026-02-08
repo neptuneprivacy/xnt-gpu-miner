@@ -121,6 +121,8 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
 ) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);
+    constexpr size_t kMerkleHeight = MERKLE_TREE_HEIGHT_;
+    (void)merkle_height; // Mining uses fixed height; keep param to avoid API churn.
     
     // Total encoding: nonce(5) + path_b(135) + path_a(135) + root(5) = 280 words
     // RATE = 10, so 28 full chunks
@@ -137,6 +139,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
     } while(0)
     
     // 1. Add nonce (5 words)
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         ABSORB_VALUE(nonce.values[i]);
     }
@@ -155,7 +158,8 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
         
         // Levels 1-26: internal nodes - use read-only cache and constant memory
-        for (size_t level = 1; level < merkle_height; ++level) {
+        #pragma unroll
+        for (size_t level = 1; level < kMerkleHeight; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
             Digest node;
@@ -188,7 +192,8 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(d.values[j]);
         
         // Levels 1-26: internal nodes - use read-only cache and constant memory
-        for (size_t level = 1; level < merkle_height; ++level) {
+        #pragma unroll
+        for (size_t level = 1; level < kMerkleHeight; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
             Digest node;
@@ -209,6 +214,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
     }
     
     // 4. Add root (5 words)
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         ABSORB_VALUE(root.values[i]);
     }
@@ -217,6 +223,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
     
     // Final padding (280 % 10 = 0, so chunk_pos should be 0)
     // Zero remaining slots and add padding marker
+    #pragma unroll
     for (int i = chunk_pos; i < RATE; ++i) {
         state[i] = BFE_ZERO;
     }
@@ -224,6 +231,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
     tip5_permutation(state);
     
     Digest result;
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         result.values[i] = state[i];
     }
@@ -316,6 +324,8 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
 ) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);
+    constexpr size_t kMerkleHeight = MERKLE_TREE_HEIGHT_;
+    (void)merkle_height; // Mining uses fixed height; keep param to avoid API churn.
     
     int chunk_pos = 0;
     
@@ -328,6 +338,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     } while(0)
     
     // 1. Add nonce (5 words)
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         ABSORB_VALUE(nonce.values[i]);
     }
@@ -341,7 +352,8 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
         for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(sib.values[j]);
         
         // Levels 1-26: use get_internal_node_safe
-        for (size_t level = 1; level < merkle_height; ++level) {
+        #pragma unroll
+        for (size_t level = 1; level < kMerkleHeight; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
             Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
@@ -358,7 +370,8 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
         for (int j = 0; j < DIGEST_LEN; ++j) ABSORB_VALUE(sib.values[j]);
         
         // Levels 1-26: use get_internal_node_safe
-        for (size_t level = 1; level < merkle_height; ++level) {
+        #pragma unroll
+        for (size_t level = 1; level < kMerkleHeight; ++level) {
             running_index >>= 1;
             size_t sibling_index = running_index ^ 1;
             Digest node = get_internal_node_safe(d_internal_nodes, sibling_index, stored_nodes_count, commitment, leaf_prefix, num_leafs);
@@ -367,6 +380,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     }
     
     // 4. Add root (5 words)
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         ABSORB_VALUE(root.values[i]);
     }
@@ -374,6 +388,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     #undef ABSORB_VALUE
     
     // Final padding
+    #pragma unroll
     for (int i = chunk_pos; i < RATE; ++i) {
         state[i] = BFE_ZERO;
     }
@@ -381,6 +396,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     tip5_permutation(state);
     
     Digest result;
+    #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
         result.values[i] = state[i];
     }
