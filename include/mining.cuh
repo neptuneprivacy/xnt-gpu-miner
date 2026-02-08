@@ -103,8 +103,11 @@ void startUnifiedMining(
     MiningMode mode = MiningMode::Solo,
     const std::string& stratum_pass = "x");
 
-// Continuous mining loop (uses GpuWorker)
+// Continuous mining loop (uses GpuWorker) - async double-buffered version
 bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker);
+
+// Synchronous mining loop (fallback if async fails)
+bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker);
 
 bool preprocessPuzzle(const PowPuzzle& puzzle, GpuResources* gpu_res);
 

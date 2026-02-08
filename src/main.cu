@@ -267,38 +267,237 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     if (const char* dbg_env = std::getenv("XNT_DEBUG_BATCH"); dbg_env && dbg_env[0] == '1') {
         debug_batch_timing = true;
     }
+    
+    // Async mode: use double-buffered pipelining (set XNT_ASYNC_BENCH=1)
+    bool use_async = false;
+    if (const char* async_env = std::getenv("XNT_ASYNC_BENCH"); async_env && async_env[0] == '1') {
+        use_async = true;
+        std::cout << Color::CYAN << "  Mode: ASYNC (double-buffered, 2 streams)" << Color::RESET << std::endl;
+    } else {
+        std::cout << Color::CYAN << "  Mode: SYNC (single stream)" << Color::RESET << std::endl;
+    }
+    std::cout << std::endl;
+    
     int batch_count = 0;
     int measured_batch_count = 0;
     int full_batch_count = 0;
     double full_batch_total_ms = 0.0;
     
+    // Initialize async miner if using async mode
+    std::unique_ptr<DoubleBufferedMiner> async_miner;
+    int active_slot = 0;
+    struct AsyncBatchInfo {
+        uint64_t start_nonce;
+        std::chrono::steady_clock::time_point start_time;
+        bool pending;
+    };
+    AsyncBatchInfo async_batch_info[2] = {};
+    
+    if (use_async) {
+        async_miner = std::make_unique<DoubleBufferedMiner>();
+        if (!async_miner->initialize()) {
+            std::cerr << Color::RED << "Failed to initialize async miner" << Color::RESET << std::endl;
+            return;
+        }
+    }
+    
     while (!stop_mining) {
+        std::optional<MiningSolution> result;
         auto batch_start = std::chrono::steady_clock::now();
-        
-        // Mine a batch of nonces using the easier test target
         Digest target = test_target;
-        auto result = mine_pow_with_buffer(
-            *gpu_res->buffer,
-            target,
-            gpu_res->buffer->mast_paths,
-            total_nonces,
-            NONCES_PER_BATCH,
-            gpu_res->buffer->consensus_rule_set,
-            nullptr
-        );
         
-        auto batch_end = std::chrono::steady_clock::now();
-        auto batch_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(batch_end - batch_start).count();
-        double batch_duration_ms = batch_duration_us / 1000.0;
-        double batch_hashrate = (NONCES_PER_BATCH / 1000000.0) / (batch_duration_ms / 1000.0);
+        if (use_async) {
+            // ============ ASYNC DOUBLE-BUFFERED MODE ============
+            AsyncMiningSlot& slot = async_miner->slots[active_slot];
+            AsyncBatchInfo& info = async_batch_info[active_slot];
+            
+            // Check if current slot has a pending result
+            if (info.pending) {
+                cudaError_t status = cudaEventQuery(slot.completion_event);
+                if (status == cudaSuccess) {
+                    // Kernel done - process result
+                    auto now = std::chrono::steady_clock::now();
+                    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(now - info.start_time).count();
+                    double batch_duration_ms = duration_us / 1000.0;
+                    
+                    batch_count++;
+                    total_nonces += NONCES_PER_BATCH;
+                    
+                    const bool in_warmup = batch_count <= warmup_batches;
+                    if (!in_warmup) {
+                        measured_batch_count++;
+                        measured_nonces += NONCES_PER_BATCH;
+                        
+                        int sol_found = *slot.h_solution_found_pinned;
+                        if (!sol_found) {
+                            full_batch_count++;
+                            full_batch_total_ms += batch_duration_ms;
+                        } else {
+                            // Retrieve solution
+                            MiningSolution sol;
+                            cudaMemcpy(&sol.pow.nonce, slot.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(sol.pow.path_a, slot.d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(sol.pow.path_b, slot.d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(&sol.kernel_final_hash, slot.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
+                            sol.pow.root = gpu_res->buffer->merkle_root;
+                            solutions_found++;
+                            
+                            // Validate solution
+                            bool meets_threshold = digest_less_than_or_equal(sol.kernel_final_hash, test_target);
+                            if (meets_threshold) {
+                                valid_solutions++;
+                                if (solutions_found <= 3) {
+                                    std::string hash_hex = digest_to_hex(sol.kernel_final_hash);
+                                    std::cout << "\n" << Color::GREEN << "[ASYNC VALIDATION] Valid solution found!" << Color::RESET << std::endl;
+                                    std::cout << "  Kernel final_hash: " << hash_hex << std::endl;
+                                }
+                            } else {
+                                invalid_threshold++;
+                            }
+                        }
+                    } else if (batch_count == warmup_batches) {
+                        // Reset after warmup
+                        measured_nonces = 0;
+                        measured_batch_count = 0;
+                        full_batch_count = 0;
+                        full_batch_total_ms = 0.0;
+                        solutions_found = 0;
+                        valid_solutions = 0;
+                        invalid_threshold = 0;
+                        start_time = std::chrono::steady_clock::now();
+                        last_update = start_time;
+                        last_nonces = 0;
+                    }
+                    
+                    info.pending = false;
+                } else if (status == cudaErrorNotReady) {
+                    // Switch to other slot
+                    active_slot = 1 - active_slot;
+                    if (async_batch_info[active_slot].pending) {
+                        // Both busy, wait
+                        cudaStreamSynchronize(slot.stream);
+                    }
+                    continue;
+                }
+            }
+            
+            // Launch new batch on current slot
+            *slot.h_solution_found_pinned = 0;
+            cudaMemsetAsync(slot.d_solution_found, 0, sizeof(int), slot.stream);
+            
+            int threads_per_block, blocks_per_grid;
+            calculate_mining_launch_config(NONCES_PER_BATCH, threads_per_block, blocks_per_grid, device_id);
+            
+            if (!gpu_res->buffer->gpu_range_initialized) {
+                GpuNonceRange gpu_range = calculate_gpu_range(device_id, 1);
+                cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+                cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+                initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
+                gpu_res->buffer->gpu_range_initialized = true;
+            }
+            
+            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
+                gpu_res->buffer->d_leafs,
+                gpu_res->buffer->d_merkle_tree,
+                gpu_res->buffer->index_picker_preimage,
+                target,
+                total_nonces,
+                NONCES_PER_BATCH,
+                gpu_res->buffer->num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                gpu_res->buffer->mast_paths,
+                gpu_res->buffer->hash,
+                gpu_res->buffer->consensus_rule_set,
+                slot.d_solution_nonce,
+                slot.d_solution_found,
+                slot.d_solution_path_a,
+                slot.d_solution_path_b,
+                slot.d_solution_nonce_digest,
+                slot.d_solution_final_hash);
+            
+            cudaMemcpyAsync(slot.h_solution_found_pinned, slot.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost, slot.stream);
+            cudaEventRecord(slot.completion_event, slot.stream);
+            
+            info.start_nonce = total_nonces;
+            info.start_time = std::chrono::steady_clock::now();
+            info.pending = true;
+            
+            active_slot = 1 - active_slot;
+            
+            // Update progress display
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
+            if (since_update >= 1000 && measured_nonces > 0) {
+                uint64_t nonces_since_update = measured_nonces - last_nonces;
+                double time_since_update_sec = since_update / 1000.0;
+                double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
+                std::cout << "\r[Benchmark ASYNC] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
+                          << hash_rate << " MH/s" << Color::RESET 
+                          << " | Nonces: " << measured_nonces 
+                          << " | Time: " << elapsed << "s" << std::flush;
+                last_update = now;
+                last_nonces = measured_nonces;
+            }
+            if (elapsed >= BENCHMARK_DURATION_SEC) break;
+        } else {
+            // ============ SYNC MODE (original) ============
+            result = mine_pow_with_buffer(
+                *gpu_res->buffer,
+                target,
+                gpu_res->buffer->mast_paths,
+                total_nonces,
+                NONCES_PER_BATCH,
+                gpu_res->buffer->consensus_rule_set,
+                nullptr
+            );
         
-        batch_count++;
-        total_nonces += NONCES_PER_BATCH;
-        
-        const bool in_warmup = batch_count <= warmup_batches;
-        if (in_warmup) {
+            auto batch_end = std::chrono::steady_clock::now();
+            auto batch_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(batch_end - batch_start).count();
+            double batch_duration_ms = batch_duration_us / 1000.0;
+            double batch_hashrate = (NONCES_PER_BATCH / 1000000.0) / (batch_duration_ms / 1000.0);
+            
+            batch_count++;
+            total_nonces += NONCES_PER_BATCH;
+            
+            const bool in_warmup = batch_count <= warmup_batches;
+            if (in_warmup) {
+                if (debug_batch_timing) {
+                    std::cout << "\n[DEBUG] Warmup Batch #" << batch_count 
+                              << " | Nonces: " << NONCES_PER_BATCH 
+                              << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
+                              << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
+                              << " | Solution: " << (result.has_value() ? "YES" : "NO")
+                              << std::endl;
+                }
+                
+                if (batch_count == warmup_batches) {
+                    // Reset measurement after warmup to avoid boost/thermal ramp affecting results
+                    measured_nonces = 0;
+                    measured_batch_count = 0;
+                    full_batch_count = 0;
+                    full_batch_total_ms = 0.0;
+                    solutions_found = 0;
+                    valid_solutions = 0;
+                    invalid_threshold = 0;
+                    start_time = std::chrono::steady_clock::now();
+                    last_update = start_time;
+                    last_nonces = 0;
+                }
+                continue;
+            }
+            
+            measured_batch_count++;
+            measured_nonces += NONCES_PER_BATCH;
+            
+            // Track full batches (no solution found = processed all nonces)
+            if (!result.has_value()) {
+                full_batch_count++;
+                full_batch_total_ms += batch_duration_ms;
+            }
+            
             if (debug_batch_timing) {
-                std::cout << "\n[DEBUG] Warmup Batch #" << batch_count 
+                std::cout << "\n[DEBUG] Batch #" << measured_batch_count 
                           << " | Nonces: " << NONCES_PER_BATCH 
                           << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
                           << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
@@ -306,132 +505,108 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
                           << std::endl;
             }
             
-            if (batch_count == warmup_batches) {
-                // Reset measurement after warmup to avoid boost/thermal ramp affecting results
-                measured_nonces = 0;
-                measured_batch_count = 0;
-                full_batch_count = 0;
-                full_batch_total_ms = 0.0;
-                solutions_found = 0;
-                valid_solutions = 0;
-                invalid_threshold = 0;
-                start_time = std::chrono::steady_clock::now();
-                last_update = start_time;
-                last_nonces = 0;
-            }
-            continue;
-        }
-        
-        measured_batch_count++;
-        measured_nonces += NONCES_PER_BATCH;
-        
-        // Track full batches (no solution found = processed all nonces)
-        if (!result.has_value()) {
-            full_batch_count++;
-            full_batch_total_ms += batch_duration_ms;
-        }
-        
-        if (debug_batch_timing) {
-            std::cout << "\n[DEBUG] Batch #" << measured_batch_count 
-                      << " | Nonces: " << NONCES_PER_BATCH 
-                      << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
-                      << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
-                      << " | Solution: " << (result.has_value() ? "YES" : "NO")
-                      << std::endl;
-        }
-        
-        // Validate any solution found by the kernel
-        if (result.has_value()) {
-            solutions_found++;
-            
-            // Extract solution components
-            const MiningSolution& mining_solution = result.value();
-            const Digest& kernel_final_hash = mining_solution.kernel_final_hash;
-            
-            // Convert to hex for display
-            std::string kernel_final_hash_hex = digest_to_hex(kernel_final_hash);
-            
-            // Validate using the kernel's final_hash (the value the kernel actually checked)
-            // This matches the Rust node's validation: final_hash <= threshold
-            bool meets_threshold = digest_less_than_or_equal(kernel_final_hash, test_target);
-            
-            // Extract trailing hex digits for display (matches the format shown in node logs)
-            std::string pow_trailing = "";
-            std::string threshold_trailing = "";
-            if (kernel_final_hash_hex.length() >= 16) {
-                pow_trailing = kernel_final_hash_hex.substr(kernel_final_hash_hex.length() - 16);
-            }
-            if (test_target_hex.length() >= 16) {
-                threshold_trailing = test_target_hex.substr(test_target_hex.length() - 16);
-            }
-            
-            // Validate solution: kernel_final_hash must be <= threshold
-            if (meets_threshold) {
-                valid_solutions++;
+            // Validate any solution found by the kernel
+            if (result.has_value()) {
+                solutions_found++;
                 
-                // Log first few valid solutions for verification (limit output to avoid spam)
-                if (solutions_found <= 3) {
-                    std::cout << "\n" << Color::GREEN << "[VALIDATION] ✓ Valid solution found! (Kernel final_hash <= threshold)" << Color::RESET << std::endl;
-                    std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
-                    std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
-                    std::cout << "  Meets threshold:    " << Color::GREEN << "YES" << Color::RESET << std::endl;
-                    if (!pow_trailing.empty()) {
-                        std::cout << "  Final Hash Trailing: " << pow_trailing << std::endl;
-                    }
-                    if (!threshold_trailing.empty()) {
-                        std::cout << "  Threshold Trailing:  " << threshold_trailing << std::endl;
-                    }
+                // Extract solution components
+                const MiningSolution& mining_solution = result.value();
+                const Digest& kernel_final_hash = mining_solution.kernel_final_hash;
+                
+                // Convert to hex for display
+                std::string kernel_final_hash_hex = digest_to_hex(kernel_final_hash);
+                
+                // Validate using the kernel's final_hash (the value the kernel actually checked)
+                // This matches the Rust node's validation: final_hash <= threshold
+                bool meets_threshold = digest_less_than_or_equal(kernel_final_hash, test_target);
+                
+                // Extract trailing hex digits for display (matches the format shown in node logs)
+                std::string pow_trailing = "";
+                std::string threshold_trailing = "";
+                if (kernel_final_hash_hex.length() >= 16) {
+                    pow_trailing = kernel_final_hash_hex.substr(kernel_final_hash_hex.length() - 16);
                 }
-            } else {
-                invalid_threshold++;
-                // Log first few invalid solutions for debugging
-                if (solutions_found <= 3) {
-                    std::cout << "\n" << Color::YELLOW << "[VALIDATION] ✗ Solution does not meet threshold" << Color::RESET << std::endl;
-                    std::cout << "  " << Color::DIM << "Note: kernel_final_hash > threshold" << Color::RESET << std::endl;
-                    std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
-                    std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
-                    std::cout << "  Meets threshold:   " << Color::RED << "NO" << Color::RESET << std::endl;
-                    if (!pow_trailing.empty()) {
-                        std::cout << "  Final Hash Trailing: " << pow_trailing << std::endl;
-                        // Check for trailing zeros (valid solutions typically have trailing zeros,
-                        // matching the pattern shown in the Rust node's validation logs)
-                        bool has_trailing_zeros = (pow_trailing.find_first_not_of('0') == std::string::npos) || 
-                                                  (pow_trailing.back() == '0');
-                        std::cout << "  Has trailing zeros:  " << (has_trailing_zeros ? Color::GREEN : Color::RED) 
-                                  << (has_trailing_zeros ? "YES" : "NO") << Color::RESET << std::endl;
+                if (test_target_hex.length() >= 16) {
+                    threshold_trailing = test_target_hex.substr(test_target_hex.length() - 16);
+                }
+                
+                // Validate solution: kernel_final_hash must be <= threshold
+                if (meets_threshold) {
+                    valid_solutions++;
+                    
+                    // Log first few valid solutions for verification (limit output to avoid spam)
+                    if (solutions_found <= 3) {
+                        std::cout << "\n" << Color::GREEN << "[VALIDATION] ✓ Valid solution found! (Kernel final_hash <= threshold)" << Color::RESET << std::endl;
+                        std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
+                        std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
+                        std::cout << "  Meets threshold:    " << Color::GREEN << "YES" << Color::RESET << std::endl;
+                        if (!pow_trailing.empty()) {
+                            std::cout << "  Final Hash Trailing: " << pow_trailing << std::endl;
+                        }
+                        if (!threshold_trailing.empty()) {
+                            std::cout << "  Threshold Trailing:  " << threshold_trailing << std::endl;
+                        }
                     }
-                    if (!threshold_trailing.empty()) {
-                        std::cout << "  Threshold Trailing:  " << threshold_trailing << std::endl;
+                } else {
+                    invalid_threshold++;
+                    // Log first few invalid solutions for debugging
+                    if (solutions_found <= 3) {
+                        std::cout << "\n" << Color::YELLOW << "[VALIDATION] ✗ Solution does not meet threshold" << Color::RESET << std::endl;
+                        std::cout << "  " << Color::DIM << "Note: kernel_final_hash > threshold" << Color::RESET << std::endl;
+                        std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
+                        std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
+                        std::cout << "  Meets threshold:   " << Color::RED << "NO" << Color::RESET << std::endl;
+                        if (!pow_trailing.empty()) {
+                            std::cout << "  Final Hash Trailing: " << pow_trailing << std::endl;
+                            // Check for trailing zeros (valid solutions typically have trailing zeros,
+                            // matching the pattern shown in the Rust node's validation logs)
+                            bool has_trailing_zeros = (pow_trailing.find_first_not_of('0') == std::string::npos) || 
+                                                      (pow_trailing.back() == '0');
+                            std::cout << "  Has trailing zeros:  " << (has_trailing_zeros ? Color::GREEN : Color::RED) 
+                                      << (has_trailing_zeros ? "YES" : "NO") << Color::RESET << std::endl;
+                        }
+                        if (!threshold_trailing.empty()) {
+                            std::cout << "  Threshold Trailing:  " << threshold_trailing << std::endl;
+                        }
                     }
                 }
             }
-        }
-        
-        iteration++;
-        
-        // Update progress display and check if benchmark duration has elapsed
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-        auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
-        
-        // Update hash rate display every second
-        // Calculate instantaneous rate (nonces processed in last second) instead of cumulative average
-        if (since_update >= 1000) {
-            uint64_t nonces_since_update = measured_nonces - last_nonces;
-            double time_since_update_sec = since_update / 1000.0;
-            // Calculate instantaneous hash rate: nonces in last second / time elapsed
-            double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
-            std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
-                      << hash_rate << " MH/s" << Color::RESET 
-                      << " | Nonces: " << measured_nonces 
-                      << " | Time: " << elapsed << "s" << std::flush;
-            last_update = now;
-            last_nonces = measured_nonces;  // Update tracked nonces for next calculation
-        }
-        
-        // Stop benchmark after the configured duration
-        if (elapsed >= BENCHMARK_DURATION_SEC) {
-            break;
+            
+            iteration++;
+            
+            // Update progress display and check if benchmark duration has elapsed
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
+            
+            // Update hash rate display every second
+            // Calculate instantaneous rate (nonces processed in last second) instead of cumulative average
+            if (since_update >= 1000) {
+                uint64_t nonces_since_update = measured_nonces - last_nonces;
+                double time_since_update_sec = since_update / 1000.0;
+                // Calculate instantaneous hash rate: nonces in last second / time elapsed
+                double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
+                std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
+                          << hash_rate << " MH/s" << Color::RESET 
+                          << " | Nonces: " << measured_nonces 
+                          << " | Time: " << elapsed << "s" << std::flush;
+                last_update = now;
+                last_nonces = measured_nonces;  // Update tracked nonces for next calculation
+            }
+            
+            // Stop benchmark after the configured duration
+            if (elapsed >= BENCHMARK_DURATION_SEC) {
+                break;
+            }
+        } // end else (sync mode)
+    }
+    
+    // Drain any pending async batches
+    if (use_async && async_miner) {
+        for (int i = 0; i < 2; i++) {
+            if (async_batch_info[i].pending) {
+                cudaStreamSynchronize(async_miner->slots[i].stream);
+            }
         }
     }
     
