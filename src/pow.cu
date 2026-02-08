@@ -1293,33 +1293,18 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     
     tip5_permutation(state);
     
-    // Remaining 62 iterations: hash(state, zeros) - reuse state directly
-    // For FixedLength domain with right=0, we just need to:
-    // 1. Keep left 5 values from previous output
-    // 2. Set right 5 values to 0
-    // 3. Reset capacity to FixedLength domain
-    // 4. Permute
-    // FIXED_LEN_VAL already defined above
+    // Remaining 62 iterations: hash(state, zeros) with FixedLength domain
+    // OPTIMIZATION: Use specialized permutation that exploits known right side:
+    //   state[5..9]=0, state[10..15]=FIXED_LEN_VAL(=1)
+    // This saves 44 field_mul_ptx per iteration by skipping x^7 for 11 elements
+    // Precompute x^7(FIXED_LEN_VAL) once for all 62 iterations
+    uint64_t x7_fixed = x7_computer_pipelined(FIXED_LEN_VAL);
     
     #pragma unroll 1
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
-        // state[0..4] already has output from previous permutation
-        // Set right input (state[5..9]) to zeros
-        state[5] = 0;
-        state[6] = 0;
-        state[7] = 0;
-        state[8] = 0;
-        state[9] = 0;
-        
-        // Reset capacity for FixedLength domain (fully unrolled)
-        state[10] = FIXED_LEN_VAL;
-        state[11] = FIXED_LEN_VAL;
-        state[12] = FIXED_LEN_VAL;
-        state[13] = FIXED_LEN_VAL;
-        state[14] = FIXED_LEN_VAL;
-        state[15] = FIXED_LEN_VAL;
-        
-        tip5_permutation(state);
+        // Specialized permutation handles the known right-side values internally
+        // — no need to write state[5..15] here (saves 11 writes per iteration)
+        tip5_permutation_fixed_right_zero(state, x7_fixed);
     }
 
     index_a = state[0] & MERKLE_INDEX_MASK;

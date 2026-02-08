@@ -3,6 +3,7 @@
 
 #include "pow.cuh"
 #include "mining_client.h"
+#include "kernels.cuh"
 
 class NeptuneCudaMinerClient;
 class MiningClient;
@@ -166,6 +167,7 @@ struct GpuResources {
     
     std::unique_ptr<EventHandler> event_handler;
     std::unique_ptr<GuesserBuffer> buffer;
+    std::unique_ptr<DoubleBufferedMiner> async_miner;  // Double-buffered async mining
     MiningClient* client;  // Polymorphic client (Solo or Stratum)
     MiningMode mining_mode;  // Current mining mode
     

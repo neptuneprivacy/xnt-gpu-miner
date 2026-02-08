@@ -826,3 +826,356 @@ MiningResult mine_batch(
     
     return result;
 }
+
+// ============================================================================
+// Double-Buffered Async Mining Implementation
+// ============================================================================
+
+bool AsyncMiningSlot::allocate() {
+    if (allocated) return true;
+    
+    cudaError_t err;
+    
+    // Allocate device buffers
+    err = cudaMalloc(&d_solution_nonce, sizeof(uint64_t));
+    if (err != cudaSuccess) { LOG_ERROR("AsyncMiningSlot alloc d_solution_nonce", err); return false; }
+    
+    err = cudaMalloc(&d_solution_found, sizeof(int));
+    if (err != cudaSuccess) { 
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        LOG_ERROR("AsyncMiningSlot alloc d_solution_found", err); 
+        return false; 
+    }
+    
+    err = cudaMalloc(&d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        LOG_ERROR("AsyncMiningSlot alloc d_solution_path_a", err);
+        return false;
+    }
+    
+    err = cudaMalloc(&d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+        LOG_ERROR("AsyncMiningSlot alloc d_solution_path_b", err);
+        return false;
+    }
+    
+    err = cudaMalloc(&d_solution_nonce_digest, sizeof(Digest));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+        cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+        LOG_ERROR("AsyncMiningSlot alloc d_solution_nonce_digest", err);
+        return false;
+    }
+    
+    err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+        cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+        cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr;
+        LOG_ERROR("AsyncMiningSlot alloc d_solution_final_hash", err);
+        return false;
+    }
+    
+    // Allocate pinned host memory for async copy
+    err = cudaMallocHost(&h_solution_found_pinned, sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+        cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+        cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr;
+        cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr;
+        LOG_ERROR("AsyncMiningSlot alloc h_solution_found_pinned", err);
+        return false;
+    }
+    
+    // Create stream with high priority for mining
+    int least_priority, greatest_priority;
+    cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+    err = cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest_priority);
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+        cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+        cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr;
+        cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr;
+        cudaFreeHost(h_solution_found_pinned); h_solution_found_pinned = nullptr;
+        LOG_ERROR("AsyncMiningSlot create stream", err);
+        return false;
+    }
+    
+    // Create event for completion tracking
+    err = cudaEventCreateWithFlags(&completion_event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
+        cudaFree(d_solution_found); d_solution_found = nullptr;
+        cudaFree(d_solution_path_a); d_solution_path_a = nullptr;
+        cudaFree(d_solution_path_b); d_solution_path_b = nullptr;
+        cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr;
+        cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr;
+        cudaFreeHost(h_solution_found_pinned); h_solution_found_pinned = nullptr;
+        cudaStreamDestroy(stream); stream = nullptr;
+        LOG_ERROR("AsyncMiningSlot create event", err);
+        return false;
+    }
+    
+    allocated = true;
+    kernel_launched = false;
+    return true;
+}
+
+void AsyncMiningSlot::free() {
+    if (d_solution_nonce) { cudaFree(d_solution_nonce); d_solution_nonce = nullptr; }
+    if (d_solution_found) { cudaFree(d_solution_found); d_solution_found = nullptr; }
+    if (d_solution_path_a) { cudaFree(d_solution_path_a); d_solution_path_a = nullptr; }
+    if (d_solution_path_b) { cudaFree(d_solution_path_b); d_solution_path_b = nullptr; }
+    if (d_solution_nonce_digest) { cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr; }
+    if (d_solution_final_hash) { cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr; }
+    if (h_solution_found_pinned) { cudaFreeHost(h_solution_found_pinned); h_solution_found_pinned = nullptr; }
+    if (completion_event) { cudaEventDestroy(completion_event); completion_event = nullptr; }
+    if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+    allocated = false;
+    kernel_launched = false;
+}
+
+bool AsyncMiningSlot::reset() {
+    if (!d_solution_found || !stream) return false;
+    *h_solution_found_pinned = 0;
+    cudaError_t err = cudaMemsetAsync(d_solution_found, 0, sizeof(int), stream);
+    kernel_launched = false;
+    return err == cudaSuccess;
+}
+
+bool DoubleBufferedMiner::initialize() {
+    if (initialized) return true;
+    
+    for (int i = 0; i < 2; ++i) {
+        if (!slots[i].allocate()) {
+            cleanup();
+            return false;
+        }
+    }
+    
+    current_slot = 0;
+    initialized = true;
+    return true;
+}
+
+void DoubleBufferedMiner::cleanup() {
+    for (int i = 0; i < 2; ++i) {
+        slots[i].free();
+    }
+    initialized = false;
+}
+
+bool DoubleBufferedMiner::launch_async(
+    GuesserBuffer& buffer,
+    const Digest& target,
+    const PowMastPaths& mast_paths,
+    uint64_t start_nonce,
+    uint64_t num_nonces,
+    int consensus_rule_set) {
+    
+    return launch_mining_kernel_async(
+        slots[current_slot], buffer, target, mast_paths,
+        start_nonce, num_nonces, consensus_rule_set);
+}
+
+int DoubleBufferedMiner::check_previous_slot(MiningSolution* out_solution, GuesserBuffer& buffer) {
+    int prev = previous_slot();
+    if (!slots[prev].kernel_launched) {
+        return 0;  // No previous kernel to check
+    }
+    return check_async_mining_result(slots[prev], out_solution, buffer);
+}
+
+bool DoubleBufferedMiner::wait_current_slot() {
+    AsyncMiningSlot& slot = slots[current_slot];
+    if (!slot.kernel_launched) return true;
+    
+    cudaError_t err = cudaStreamSynchronize(slot.stream);
+    return err == cudaSuccess;
+}
+
+bool launch_mining_kernel_async(
+    AsyncMiningSlot& slot,
+    GuesserBuffer& buffer,
+    const Digest& target,
+    const PowMastPaths& mast_paths,
+    uint64_t start_nonce,
+    uint64_t num_nonces,
+    int consensus_rule_set) {
+    
+    if (!buffer.is_valid() || !slot.allocated) {
+        return false;
+    }
+    
+    // Reset slot for new batch
+    if (!slot.reset()) {
+        return false;
+    }
+    
+    // Store batch info for later retrieval
+    slot.batch_start_nonce = start_nonce;
+    slot.batch_size = num_nonces;
+    
+    // Ensure GPU range is initialized (one-time setup)
+    if (!buffer.gpu_range_initialized) {
+        int gpu_id;
+        cudaGetDevice(&gpu_id);
+        int actual_gpu_count = g_total_gpu_count.load();
+        GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+        
+        cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+        if (range_err != cudaSuccess) {
+            LOG_ERROR("async copy range_start", range_err);
+            return false;
+        }
+        range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+        if (range_err != cudaSuccess) {
+            LOG_ERROR("async copy range_size", range_err);
+            return false;
+        }
+        
+        if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
+            // Non-fatal
+        }
+        
+        buffer.gpu_range_initialized = true;
+    }
+    
+    // Get launch configuration
+    int threads_per_block, blocks_per_grid;
+    int gpu_id;
+    cudaGetDevice(&gpu_id);
+    calculate_mining_launch_config(num_nonces, threads_per_block, blocks_per_grid, gpu_id);
+    
+    // Select and launch kernel on slot's stream
+    MiningKernelType kernel_type = select_mining_kernel(gpu_id);
+    
+    switch (kernel_type) {
+        case MiningKernelType::HIGH_VRAM:
+            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
+                buffer.d_leafs,
+                buffer.d_merkle_tree,
+                buffer.index_picker_preimage,
+                target,
+                start_nonce,
+                num_nonces,
+                buffer.num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                mast_paths,
+                buffer.hash,
+                consensus_rule_set,
+                slot.d_solution_nonce,
+                slot.d_solution_found,
+                slot.d_solution_path_a,
+                slot.d_solution_path_b,
+                slot.d_solution_nonce_digest,
+                slot.d_solution_final_hash);
+            break;
+            
+        case MiningKernelType::LOW_VRAM:
+            parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
+                nullptr,
+                buffer.d_merkle_tree,
+                buffer.index_picker_preimage,
+                target,
+                start_nonce,
+                num_nonces,
+                buffer.num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                buffer.tree_size,
+                mast_paths,
+                buffer.hash,
+                consensus_rule_set,
+                slot.d_solution_nonce,
+                slot.d_solution_found,
+                slot.d_solution_path_a,
+                slot.d_solution_path_b,
+                slot.d_solution_nonce_digest,
+                slot.d_solution_final_hash);
+            break;
+    }
+    
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        LOG_ERROR("async mining kernel launch", err);
+        return false;
+    }
+    
+    // Queue async copy of solution_found flag to pinned host memory
+    cudaMemcpyAsync(slot.h_solution_found_pinned, slot.d_solution_found, 
+                    sizeof(int), cudaMemcpyDeviceToHost, slot.stream);
+    
+    // Record completion event
+    cudaEventRecord(slot.completion_event, slot.stream);
+    
+    slot.kernel_launched = true;
+    return true;
+}
+
+int check_async_mining_result(
+    AsyncMiningSlot& slot,
+    MiningSolution* out_solution,
+    GuesserBuffer& buffer) {
+    
+    if (!slot.kernel_launched) {
+        return 0;  // No kernel was launched
+    }
+    
+    // Check if kernel has completed (non-blocking)
+    cudaError_t status = cudaEventQuery(slot.completion_event);
+    
+    if (status == cudaErrorNotReady) {
+        return -1;  // Kernel still running
+    }
+    
+    if (status != cudaSuccess) {
+        LOG_ERROR("check_async_mining_result event query", status);
+        slot.kernel_launched = false;
+        return 0;
+    }
+    
+    // Kernel completed - check if solution was found
+    slot.kernel_launched = false;
+    
+    int solution_found = *slot.h_solution_found_pinned;
+    
+    if (solution_found && out_solution) {
+        // Copy solution data back to host (blocking, but solutions are rare)
+        Pow solution;
+        
+        uint64_t nonce_value;
+        cudaMemcpy(&nonce_value, slot.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        
+        cudaMemcpy(&solution.nonce, slot.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
+        cudaMemcpy(solution.path_a, slot.d_solution_path_a, 
+                   MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+        cudaMemcpy(solution.path_b, slot.d_solution_path_b,
+                   MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+        
+        Digest kernel_final_hash;
+        cudaMemcpy(&kernel_final_hash, slot.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
+        
+        solution.root = buffer.merkle_root;
+        
+        out_solution->pow = solution;
+        out_solution->kernel_final_hash = kernel_final_hash;
+        
+        return 1;  // Solution found
+    }
+    
+    return 0;  // No solution
+}
