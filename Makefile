@@ -33,12 +33,15 @@ NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
                 --ptxas-options=-v \
                 --ptxas-options=-O3 \
                 -dc
-# Optional device link-time optimization (enables cross-TU inlining)
-ifdef DLTO
+# Device link-time optimization (enables cross-TU inlining, better reg allocation)
+# Disable with DLTO=0 if build is too slow
+DLTO ?= 1
+ifeq ($(DLTO),1)
     NVCC_FLAGS += -dlto
     NVCC_DC_FLAGS += -dlto
 endif
-# Optional register limit (set MAX_REG_COUNT=128/160 to test occupancy tradeoffs)
+# Register limit: 255 gives best perf on Blackwell (override with MAX_REG_COUNT=<n>)
+MAX_REG_COUNT ?= 255
 ifdef MAX_REG_COUNT
     NVCC_FLAGS += -maxrregcount=$(MAX_REG_COUNT)
     NVCC_DC_FLAGS += -maxrregcount=$(MAX_REG_COUNT)

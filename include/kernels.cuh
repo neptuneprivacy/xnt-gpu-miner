@@ -13,7 +13,7 @@ constexpr int MERKLE_THREADS_PER_BLOCK = 256;
 constexpr int MAX_GRID_DIM_X = 65535;
 constexpr size_t SHARED_LUT_SIZE = 256;
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
+__global__ void __launch_bounds__(256, 2) parallel_mining_kernel_high_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,

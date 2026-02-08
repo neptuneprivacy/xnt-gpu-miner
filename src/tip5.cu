@@ -552,12 +552,57 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
 __device__ __noinline__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
 
-    // OPTIMIZATION: Fused round constants - no separate function call
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         sbox_layer(state, temp_state);
         mds_layer(temp_state, state);
 
         // Fused round constants addition
+        for (int i = 0; i < STATE_SIZE; ++i) {
+            state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
+        }
+    }
+}
+
+// Specialized permutation for Pow_indices hot loop (62 iterations).
+// PRECONDITION: state[5..9]=0, state[10..15]=FIXED_LEN_VAL (=1).
+// First round skips x^7 for 11 elements (saves 44 field_mul_ptx per call).
+__device__ __noinline__ void tip5_permutation_fixed_right_zero(uint64_t* state, uint64_t x7_one) {
+    uint64_t temp_state[STATE_SIZE];
+
+    // === ROUND 0: exploit known right side ===
+    // Elements 0-3: normal S-box lookup (data-dependent)
+    temp_state[0] = split_lookup_shared(state[0], s_lookup_table);
+    temp_state[1] = split_lookup_shared(state[1], s_lookup_table);
+    temp_state[2] = split_lookup_shared(state[2], s_lookup_table);
+    temp_state[3] = split_lookup_shared(state[3], s_lookup_table);
+
+    // Element 4: x^7 of unknown value (must compute)
+    temp_state[4] = x7_computer_pipelined(state[4]);
+
+    // Elements 5-9: x^7(0) = 0 (trivially)
+    temp_state[5]  = 0;
+    temp_state[6]  = 0;
+    temp_state[7]  = 0;
+    temp_state[8]  = 0;
+    temp_state[9]  = 0;
+
+    // Elements 10-15: x^7(1) = precomputed constant (passed as arg)
+    temp_state[10] = x7_one;
+    temp_state[11] = x7_one;
+    temp_state[12] = x7_one;
+    temp_state[13] = x7_one;
+    temp_state[14] = x7_one;
+    temp_state[15] = x7_one;
+
+    mds_layer(temp_state, state);
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        state[i] = fast_field_add(state[i], ROUND_CONSTANTS[0][i]);
+    }
+
+    // === ROUNDS 1-4: normal ===
+    for (int round = 1; round < NUM_ROUNDS; ++round) {
+        sbox_layer(state, temp_state);
+        mds_layer(temp_state, state);
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
         }
