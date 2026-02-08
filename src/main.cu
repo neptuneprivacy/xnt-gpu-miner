@@ -628,12 +628,16 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     std::cout << "  Average Rate:  " << Color::GREEN << std::fixed << std::setprecision(2) 
               << total_hash_rate << " MH/s" << Color::RESET << " (includes early exits)" << std::endl;
     
-    // Show sustained rate from full batches only
-    if (full_batch_count > 0) {
+    // Show sustained rate from full batches only (only meaningful for sync mode)
+    if (full_batch_count > 0 && !use_async) {
         double full_batch_avg_ms = full_batch_total_ms / full_batch_count;
         double sustained_rate = (NONCES_PER_BATCH / 1000000.0) / (full_batch_avg_ms / 1000.0);
         std::cout << "  " << Color::BOLD << "Sustained Rate: " << Color::YELLOW << std::setprecision(2) 
                   << sustained_rate << " MH/s" << Color::RESET << " (full batches only, n=" << full_batch_count << ")" << std::endl;
+    } else if (use_async) {
+        // For async mode, the average rate IS the sustained rate due to double-buffering
+        std::cout << "  " << Color::BOLD << "Sustained Rate: " << Color::YELLOW << std::setprecision(2) 
+                  << total_hash_rate << " MH/s" << Color::RESET << " (async double-buffered)" << std::endl;
     }
     std::cout << std::endl;
     
