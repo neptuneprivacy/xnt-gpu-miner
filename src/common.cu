@@ -13,5 +13,5 @@ int g_fetch_interval_sec = 5;
 std::mutex g_log_mutex;
 
 // Tuning parameters (optimized defaults)
-int g_block_size = 256;              // Threads per block
-uint64_t g_batch_size = 67108864;    // 2^26 = 64M nonces per kernel
+int g_block_size = 256;              // Threads per block (optimal for LUT loading)
+uint64_t g_batch_size = 5120000;     // 5.12M nonces per kernel

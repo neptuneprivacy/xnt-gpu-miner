@@ -13,7 +13,7 @@ constexpr int MERKLE_THREADS_PER_BLOCK = 256;
 constexpr int MAX_GRID_DIM_X = 65535;
 constexpr size_t SHARED_LUT_SIZE = 256;
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
+__global__ void __launch_bounds__(256, 2) parallel_mining_kernel_high_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
@@ -29,7 +29,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
-    Digest* __restrict__ d_solution_nonce_digest);
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash);
 
 __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     const Digest* __restrict__ d_leafs,
@@ -48,7 +49,8 @@ __global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
     Digest* __restrict__ d_solution_path_b,
-    Digest* __restrict__ d_solution_nonce_digest);
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash);
 
 __device__ Digest fast_mast_hash_device(
     const Pow& pow,
@@ -153,84 +155,115 @@ inline const char* kernel_type_name(MiningKernelType type) {
 bool check_kernel_launch_errors(const char* kernel_name);
 bool sync_and_check_errors(const char* stage);
 
-// Top tree cache - constants defined in kernels.cu
+// Top tree cache - constants defined here for all TUs
 constexpr size_t TOP_TREE_CACHE_LEVELS = 10;
-constexpr size_t TOP_TREE_CACHE_SIZE = (1 << TOP_TREE_CACHE_LEVELS) - 1;  // 1023 nodes
+constexpr size_t TOP_TREE_CACHE_SIZE = (1 << TOP_TREE_CACHE_LEVELS) - 1;  // 255 nodes
 
-// Declared in kernels.cu, extern here for use in pow.cu
-// Store as raw uint64_t array since Digest has constructor (not allowed in __constant__)
-extern __constant__ uint64_t d_top_tree_cache[TOP_TREE_CACHE_SIZE * DIGEST_LEN];
-
-// Helper to read cached node as Digest
-__device__ __forceinline__ Digest get_cached_node(size_t index) {
-    Digest d;
-    size_t base = index * DIGEST_LEN;
-    d.values[0] = d_top_tree_cache[base];
-    d.values[1] = d_top_tree_cache[base + 1];
-    d.values[2] = d_top_tree_cache[base + 2];
-    d.values[3] = d_top_tree_cache[base + 3];
-    d.values[4] = d_top_tree_cache[base + 4];
-    return d;
-}
+// d_top_tree_cache is defined in kernels.cu only
+// Helper function is defined in kernels.cu where it can access the constant
+__device__ Digest get_cached_node(size_t index);
 
 // Top tree cache functions
 bool initialize_top_tree_cache(const Digest* d_merkle_tree, size_t num_leafs);
 void reset_top_tree_cache();
 
-// ===== MAST PATHS CACHE =====
-// Cache PowMastPaths in constant memory for fast broadcast to all threads
-// PowMastPaths = 6 Digests = 30 uint64_t = 240 bytes (tiny compared to 64KB limit)
-// Accessed 8 times per hash in MAST chain, same for ALL threads
-constexpr size_t MAST_PATHS_SIZE = 30;  // 6 Digests * 5 uint64_t each
+// ============================================================================
+// Double-Buffered Async Mining
+// ============================================================================
+// This allows overlapping kernel execution with solution checking.
+// While one batch is being mined on the GPU, we can check if the previous
+// batch found a solution, achieving better GPU utilization.
 
-extern __constant__ uint64_t d_mast_paths_cache[MAST_PATHS_SIZE];
+struct AsyncMiningSlot {
+    // Device-side output buffers (separate from GuesserBuffer's to allow double-buffering)
+    uint64_t* d_solution_nonce;
+    int* d_solution_found;
+    Digest* d_solution_path_a;
+    Digest* d_solution_path_b;
+    Digest* d_solution_nonce_digest;
+    Digest* d_solution_final_hash;
+    
+    // Host-side pinned memory for async copy
+    int* h_solution_found_pinned;
+    
+    // CUDA stream and event for this slot
+    cudaStream_t stream;
+    cudaEvent_t completion_event;
+    
+    // State tracking
+    bool allocated;
+    bool kernel_launched;
+    uint64_t batch_start_nonce;
+    uint64_t batch_size;
+    
+    AsyncMiningSlot() 
+        : d_solution_nonce(nullptr)
+        , d_solution_found(nullptr)
+        , d_solution_path_a(nullptr)
+        , d_solution_path_b(nullptr)
+        , d_solution_nonce_digest(nullptr)
+        , d_solution_final_hash(nullptr)
+        , h_solution_found_pinned(nullptr)
+        , stream(nullptr)
+        , completion_event(nullptr)
+        , allocated(false)
+        , kernel_launched(false)
+        , batch_start_nonce(0)
+        , batch_size(0) {}
+    
+    bool allocate();
+    void free();
+    bool reset();
+};
 
-// Helper to read cached mast_paths as PowMastPaths structure
-__device__ __forceinline__ void get_cached_mast_paths_digests(
-    Digest& pow0, Digest& pow1, Digest& pow2,
-    Digest& header0, Digest& header1,
-    Digest& kernel0
-) {
-    // pow[0] at offset 0
-    pow0.values[0] = d_mast_paths_cache[0];
-    pow0.values[1] = d_mast_paths_cache[1];
-    pow0.values[2] = d_mast_paths_cache[2];
-    pow0.values[3] = d_mast_paths_cache[3];
-    pow0.values[4] = d_mast_paths_cache[4];
-    // pow[1] at offset 5
-    pow1.values[0] = d_mast_paths_cache[5];
-    pow1.values[1] = d_mast_paths_cache[6];
-    pow1.values[2] = d_mast_paths_cache[7];
-    pow1.values[3] = d_mast_paths_cache[8];
-    pow1.values[4] = d_mast_paths_cache[9];
-    // pow[2] at offset 10
-    pow2.values[0] = d_mast_paths_cache[10];
-    pow2.values[1] = d_mast_paths_cache[11];
-    pow2.values[2] = d_mast_paths_cache[12];
-    pow2.values[3] = d_mast_paths_cache[13];
-    pow2.values[4] = d_mast_paths_cache[14];
-    // header[0] at offset 15
-    header0.values[0] = d_mast_paths_cache[15];
-    header0.values[1] = d_mast_paths_cache[16];
-    header0.values[2] = d_mast_paths_cache[17];
-    header0.values[3] = d_mast_paths_cache[18];
-    header0.values[4] = d_mast_paths_cache[19];
-    // header[1] at offset 20
-    header1.values[0] = d_mast_paths_cache[20];
-    header1.values[1] = d_mast_paths_cache[21];
-    header1.values[2] = d_mast_paths_cache[22];
-    header1.values[3] = d_mast_paths_cache[23];
-    header1.values[4] = d_mast_paths_cache[24];
-    // kernel[0] at offset 25
-    kernel0.values[0] = d_mast_paths_cache[25];
-    kernel0.values[1] = d_mast_paths_cache[26];
-    kernel0.values[2] = d_mast_paths_cache[27];
-    kernel0.values[3] = d_mast_paths_cache[28];
-    kernel0.values[4] = d_mast_paths_cache[29];
-}
+struct DoubleBufferedMiner {
+    AsyncMiningSlot slots[2];
+    int current_slot;  // Which slot to launch next kernel on
+    bool initialized;
+    
+    DoubleBufferedMiner() : current_slot(0), initialized(false) {}
+    
+    bool initialize();
+    void cleanup();
+    
+    // Launch kernel on current slot (non-blocking)
+    bool launch_async(
+        GuesserBuffer& buffer,
+        const Digest& target,
+        const PowMastPaths& mast_paths,
+        uint64_t start_nonce,
+        uint64_t num_nonces,
+        int consensus_rule_set);
+    
+    // Check if the OTHER slot (previous batch) has completed and found a solution
+    // Returns: 0 = no solution, 1 = solution found, -1 = not ready yet
+    int check_previous_slot(MiningSolution* out_solution, GuesserBuffer& buffer);
+    
+    // Wait for current slot to complete (blocking)
+    bool wait_current_slot();
+    
+    // Swap to next slot
+    void swap_slots() { current_slot = 1 - current_slot; }
+    
+    // Get previous slot index
+    int previous_slot() const { return 1 - current_slot; }
+};
 
-// Mast paths cache functions
-bool initialize_mast_paths_cache(const PowMastPaths& mast_paths);
-void reset_mast_paths_cache();
+// Async mining function - launches kernel and returns immediately
+bool launch_mining_kernel_async(
+    AsyncMiningSlot& slot,
+    GuesserBuffer& buffer,
+    const Digest& target,
+    const PowMastPaths& mast_paths,
+    uint64_t start_nonce,
+    uint64_t num_nonces,
+    int consensus_rule_set);
+
+// Check if async kernel completed and get result
+// Returns: 0 = no solution, 1 = solution found, -1 = kernel not finished
+int check_async_mining_result(
+    AsyncMiningSlot& slot,
+    MiningSolution* out_solution,
+    GuesserBuffer& buffer);
 
 #endif

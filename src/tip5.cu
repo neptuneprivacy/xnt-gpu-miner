@@ -121,7 +121,7 @@ const uint64_t ROUND_CONSTANTS_HOST[5][16] = {
     }
 };
 
-__device__ void generated_function(const uint64_t* input, uint64_t* output) {
+__device__ __forceinline__ void generated_function(const uint64_t* __restrict__ input, uint64_t* __restrict__ output) {
     uint64_t node_34 = input[0] + input[8];
     uint64_t node_38 = input[4] + input[12];
     uint64_t node_36 = input[2] + input[10];
@@ -291,172 +291,122 @@ __device__ void generated_function(const uint64_t* input, uint64_t* output) {
 
 // Extern declaration for the shared lookup table loaded by mining kernels
 // This is defined in kernels.cu and loaded ONCE at kernel start with __syncthreads
-extern __shared__ uint8_t s_lookup_table[256];
+extern __shared__ uint8_t s_lookup_table[257];  // 256 + 1 padding for bank conflict reduction
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
-    // NO __syncthreads here - the lookup table is already loaded by the kernel
-    // and synced before any thread enters the mining loop
+    // Load all 16 elements into registers
+    uint64_t e0  = state_in[0];
+    uint64_t e1  = state_in[1];
+    uint64_t e2  = state_in[2];
+    uint64_t e3  = state_in[3];
+    uint64_t e4  = state_in[4];
+    uint64_t e5  = state_in[5];
+    uint64_t e6  = state_in[6];
+    uint64_t e7  = state_in[7];
+    uint64_t e8  = state_in[8];
+    uint64_t e9  = state_in[9];
+    uint64_t e10 = state_in[10];
+    uint64_t e11 = state_in[11];
+    uint64_t e12 = state_in[12];
+    uint64_t e13 = state_in[13];
+    uint64_t e14 = state_in[14];
+    uint64_t e15 = state_in[15];
 
-    // Vectorized load of all 16 elements
-    ulonglong2 v0 = *reinterpret_cast<const ulonglong2*>(&state_in[0]);
-    ulonglong2 v1 = *reinterpret_cast<const ulonglong2*>(&state_in[2]);
-    ulonglong2 v2 = *reinterpret_cast<const ulonglong2*>(&state_in[4]);
-    ulonglong2 v3 = *reinterpret_cast<const ulonglong2*>(&state_in[6]);
-    ulonglong2 v4 = *reinterpret_cast<const ulonglong2*>(&state_in[8]);
-    ulonglong2 v5 = *reinterpret_cast<const ulonglong2*>(&state_in[10]);
-    ulonglong2 v6 = *reinterpret_cast<const ulonglong2*>(&state_in[12]);
-    ulonglong2 v7 = *reinterpret_cast<const ulonglong2*>(&state_in[14]);
-
-    uint64_t e0 = v0.x, e1 = v0.y;
-    uint64_t e2 = v1.x, e3 = v1.y;
-    uint64_t e4 = v2.x, e5 = v2.y;
-    uint64_t e6 = v3.x, e7 = v3.y;
-    uint64_t e8 = v4.x, e9 = v4.y;
-    uint64_t e10 = v5.x, e11 = v5.y;
-    uint64_t e12 = v6.x, e13 = v6.y;
-    uint64_t e14 = v7.x, e15 = v7.y;
-
-    // Use the kernel's pre-loaded s_lookup_table (no sync needed)
+    // S-box lookup for elements 0-3
     e0 = split_lookup_shared(e0, s_lookup_table);
     e1 = split_lookup_shared(e1, s_lookup_table);
     e2 = split_lookup_shared(e2, s_lookup_table);
     e3 = split_lookup_shared(e3, s_lookup_table);
 
     // ILP-OPTIMIZED x^7 computation for elements 4-15 (12 elements)
-    // Interleave multiplications across all elements to hide latency
+    // Using fused PTX field_mul_ptx for better register efficiency
     // x^7 = x * x^2 * x^4 where x^2 = x*x, x^4 = x^2*x^2, x^6 = x^4*x^2
 
-    // Stage 1: Compute x^2 for all 12 elements (issue all multiplications together)
-    uint64_t lo4_2  = e4 * e4,   hi4_2  = __umul64hi(e4, e4);
-    uint64_t lo5_2  = e5 * e5,   hi5_2  = __umul64hi(e5, e5);
-    uint64_t lo6_2  = e6 * e6,   hi6_2  = __umul64hi(e6, e6);
-    uint64_t lo7_2  = e7 * e7,   hi7_2  = __umul64hi(e7, e7);
-    uint64_t lo8_2  = e8 * e8,   hi8_2  = __umul64hi(e8, e8);
-    uint64_t lo9_2  = e9 * e9,   hi9_2  = __umul64hi(e9, e9);
-    uint64_t lo10_2 = e10 * e10, hi10_2 = __umul64hi(e10, e10);
-    uint64_t lo11_2 = e11 * e11, hi11_2 = __umul64hi(e11, e11);
-    uint64_t lo12_2 = e12 * e12, hi12_2 = __umul64hi(e12, e12);
-    uint64_t lo13_2 = e13 * e13, hi13_2 = __umul64hi(e13, e13);
-    uint64_t lo14_2 = e14 * e14, hi14_2 = __umul64hi(e14, e14);
-    uint64_t lo15_2 = e15 * e15, hi15_2 = __umul64hi(e15, e15);
-
-    // Reduce all x^2 results
-    uint64_t x4_2  = montyred_from_parts(hi4_2, lo4_2);
-    uint64_t x5_2  = montyred_from_parts(hi5_2, lo5_2);
-    uint64_t x6_2  = montyred_from_parts(hi6_2, lo6_2);
-    uint64_t x7_2  = montyred_from_parts(hi7_2, lo7_2);
-    uint64_t x8_2  = montyred_from_parts(hi8_2, lo8_2);
-    uint64_t x9_2  = montyred_from_parts(hi9_2, lo9_2);
-    uint64_t x10_2 = montyred_from_parts(hi10_2, lo10_2);
-    uint64_t x11_2 = montyred_from_parts(hi11_2, lo11_2);
-    uint64_t x12_2 = montyred_from_parts(hi12_2, lo12_2);
-    uint64_t x13_2 = montyred_from_parts(hi13_2, lo13_2);
-    uint64_t x14_2 = montyred_from_parts(hi14_2, lo14_2);
-    uint64_t x15_2 = montyred_from_parts(hi15_2, lo15_2);
+    // Stage 1: Compute x^2 for all 12 elements
+    uint64_t x4_2  = field_mul_ptx(e4, e4);
+    uint64_t x5_2  = field_mul_ptx(e5, e5);
+    uint64_t x6_2  = field_mul_ptx(e6, e6);
+    uint64_t x7_2  = field_mul_ptx(e7, e7);
+    uint64_t x8_2  = field_mul_ptx(e8, e8);
+    uint64_t x9_2  = field_mul_ptx(e9, e9);
+    uint64_t x10_2 = field_mul_ptx(e10, e10);
+    uint64_t x11_2 = field_mul_ptx(e11, e11);
+    uint64_t x12_2 = field_mul_ptx(e12, e12);
+    uint64_t x13_2 = field_mul_ptx(e13, e13);
+    uint64_t x14_2 = field_mul_ptx(e14, e14);
+    uint64_t x15_2 = field_mul_ptx(e15, e15);
 
     // Stage 2: Compute x^4 for all 12 elements
-    uint64_t lo4_4  = x4_2 * x4_2,   hi4_4  = __umul64hi(x4_2, x4_2);
-    uint64_t lo5_4  = x5_2 * x5_2,   hi5_4  = __umul64hi(x5_2, x5_2);
-    uint64_t lo6_4  = x6_2 * x6_2,   hi6_4  = __umul64hi(x6_2, x6_2);
-    uint64_t lo7_4  = x7_2 * x7_2,   hi7_4  = __umul64hi(x7_2, x7_2);
-    uint64_t lo8_4  = x8_2 * x8_2,   hi8_4  = __umul64hi(x8_2, x8_2);
-    uint64_t lo9_4  = x9_2 * x9_2,   hi9_4  = __umul64hi(x9_2, x9_2);
-    uint64_t lo10_4 = x10_2 * x10_2, hi10_4 = __umul64hi(x10_2, x10_2);
-    uint64_t lo11_4 = x11_2 * x11_2, hi11_4 = __umul64hi(x11_2, x11_2);
-    uint64_t lo12_4 = x12_2 * x12_2, hi12_4 = __umul64hi(x12_2, x12_2);
-    uint64_t lo13_4 = x13_2 * x13_2, hi13_4 = __umul64hi(x13_2, x13_2);
-    uint64_t lo14_4 = x14_2 * x14_2, hi14_4 = __umul64hi(x14_2, x14_2);
-    uint64_t lo15_4 = x15_2 * x15_2, hi15_4 = __umul64hi(x15_2, x15_2);
-
-    // Reduce all x^4 results
-    uint64_t x4_4  = montyred_from_parts(hi4_4, lo4_4);
-    uint64_t x5_4  = montyred_from_parts(hi5_4, lo5_4);
-    uint64_t x6_4  = montyred_from_parts(hi6_4, lo6_4);
-    uint64_t x7_4  = montyred_from_parts(hi7_4, lo7_4);
-    uint64_t x8_4  = montyred_from_parts(hi8_4, lo8_4);
-    uint64_t x9_4  = montyred_from_parts(hi9_4, lo9_4);
-    uint64_t x10_4 = montyred_from_parts(hi10_4, lo10_4);
-    uint64_t x11_4 = montyred_from_parts(hi11_4, lo11_4);
-    uint64_t x12_4 = montyred_from_parts(hi12_4, lo12_4);
-    uint64_t x13_4 = montyred_from_parts(hi13_4, lo13_4);
-    uint64_t x14_4 = montyred_from_parts(hi14_4, lo14_4);
-    uint64_t x15_4 = montyred_from_parts(hi15_4, lo15_4);
+    uint64_t x4_4  = field_mul_ptx(x4_2, x4_2);
+    uint64_t x5_4  = field_mul_ptx(x5_2, x5_2);
+    uint64_t x6_4  = field_mul_ptx(x6_2, x6_2);
+    uint64_t x7_4  = field_mul_ptx(x7_2, x7_2);
+    uint64_t x8_4  = field_mul_ptx(x8_2, x8_2);
+    uint64_t x9_4  = field_mul_ptx(x9_2, x9_2);
+    uint64_t x10_4 = field_mul_ptx(x10_2, x10_2);
+    uint64_t x11_4 = field_mul_ptx(x11_2, x11_2);
+    uint64_t x12_4 = field_mul_ptx(x12_2, x12_2);
+    uint64_t x13_4 = field_mul_ptx(x13_2, x13_2);
+    uint64_t x14_4 = field_mul_ptx(x14_2, x14_2);
+    uint64_t x15_4 = field_mul_ptx(x15_2, x15_2);
 
     // Stage 3: Compute x^6 = x^4 * x^2 for all 12 elements
-    uint64_t lo4_6  = x4_4 * x4_2,   hi4_6  = __umul64hi(x4_4, x4_2);
-    uint64_t lo5_6  = x5_4 * x5_2,   hi5_6  = __umul64hi(x5_4, x5_2);
-    uint64_t lo6_6  = x6_4 * x6_2,   hi6_6  = __umul64hi(x6_4, x6_2);
-    uint64_t lo7_6  = x7_4 * x7_2,   hi7_6  = __umul64hi(x7_4, x7_2);
-    uint64_t lo8_6  = x8_4 * x8_2,   hi8_6  = __umul64hi(x8_4, x8_2);
-    uint64_t lo9_6  = x9_4 * x9_2,   hi9_6  = __umul64hi(x9_4, x9_2);
-    uint64_t lo10_6 = x10_4 * x10_2, hi10_6 = __umul64hi(x10_4, x10_2);
-    uint64_t lo11_6 = x11_4 * x11_2, hi11_6 = __umul64hi(x11_4, x11_2);
-    uint64_t lo12_6 = x12_4 * x12_2, hi12_6 = __umul64hi(x12_4, x12_2);
-    uint64_t lo13_6 = x13_4 * x13_2, hi13_6 = __umul64hi(x13_4, x13_2);
-    uint64_t lo14_6 = x14_4 * x14_2, hi14_6 = __umul64hi(x14_4, x14_2);
-    uint64_t lo15_6 = x15_4 * x15_2, hi15_6 = __umul64hi(x15_4, x15_2);
-
-    // Reduce all x^6 results
-    uint64_t x4_6  = montyred_from_parts(hi4_6, lo4_6);
-    uint64_t x5_6  = montyred_from_parts(hi5_6, lo5_6);
-    uint64_t x6_6  = montyred_from_parts(hi6_6, lo6_6);
-    uint64_t x7_6  = montyred_from_parts(hi7_6, lo7_6);
-    uint64_t x8_6  = montyred_from_parts(hi8_6, lo8_6);
-    uint64_t x9_6  = montyred_from_parts(hi9_6, lo9_6);
-    uint64_t x10_6 = montyred_from_parts(hi10_6, lo10_6);
-    uint64_t x11_6 = montyred_from_parts(hi11_6, lo11_6);
-    uint64_t x12_6 = montyred_from_parts(hi12_6, lo12_6);
-    uint64_t x13_6 = montyred_from_parts(hi13_6, lo13_6);
-    uint64_t x14_6 = montyred_from_parts(hi14_6, lo14_6);
-    uint64_t x15_6 = montyred_from_parts(hi15_6, lo15_6);
+    uint64_t x4_6  = field_mul_ptx(x4_4, x4_2);
+    uint64_t x5_6  = field_mul_ptx(x5_4, x5_2);
+    uint64_t x6_6  = field_mul_ptx(x6_4, x6_2);
+    uint64_t x7_6  = field_mul_ptx(x7_4, x7_2);
+    uint64_t x8_6  = field_mul_ptx(x8_4, x8_2);
+    uint64_t x9_6  = field_mul_ptx(x9_4, x9_2);
+    uint64_t x10_6 = field_mul_ptx(x10_4, x10_2);
+    uint64_t x11_6 = field_mul_ptx(x11_4, x11_2);
+    uint64_t x12_6 = field_mul_ptx(x12_4, x12_2);
+    uint64_t x13_6 = field_mul_ptx(x13_4, x13_2);
+    uint64_t x14_6 = field_mul_ptx(x14_4, x14_2);
+    uint64_t x15_6 = field_mul_ptx(x15_4, x15_2);
 
     // Stage 4: Compute x^7 = x^6 * x for all 12 elements
-    uint64_t lo4_7  = x4_6 * e4,   hi4_7  = __umul64hi(x4_6, e4);
-    uint64_t lo5_7  = x5_6 * e5,   hi5_7  = __umul64hi(x5_6, e5);
-    uint64_t lo6_7  = x6_6 * e6,   hi6_7  = __umul64hi(x6_6, e6);
-    uint64_t lo7_7  = x7_6 * e7,   hi7_7  = __umul64hi(x7_6, e7);
-    uint64_t lo8_7  = x8_6 * e8,   hi8_7  = __umul64hi(x8_6, e8);
-    uint64_t lo9_7  = x9_6 * e9,   hi9_7  = __umul64hi(x9_6, e9);
-    uint64_t lo10_7 = x10_6 * e10, hi10_7 = __umul64hi(x10_6, e10);
-    uint64_t lo11_7 = x11_6 * e11, hi11_7 = __umul64hi(x11_6, e11);
-    uint64_t lo12_7 = x12_6 * e12, hi12_7 = __umul64hi(x12_6, e12);
-    uint64_t lo13_7 = x13_6 * e13, hi13_7 = __umul64hi(x13_6, e13);
-    uint64_t lo14_7 = x14_6 * e14, hi14_7 = __umul64hi(x14_6, e14);
-    uint64_t lo15_7 = x15_6 * e15, hi15_7 = __umul64hi(x15_6, e15);
+    e4  = field_mul_ptx(x4_6, e4);
+    e5  = field_mul_ptx(x5_6, e5);
+    e6  = field_mul_ptx(x6_6, e6);
+    e7  = field_mul_ptx(x7_6, e7);
+    e8  = field_mul_ptx(x8_6, e8);
+    e9  = field_mul_ptx(x9_6, e9);
+    e10 = field_mul_ptx(x10_6, e10);
+    e11 = field_mul_ptx(x11_6, e11);
+    e12 = field_mul_ptx(x12_6, e12);
+    e13 = field_mul_ptx(x13_6, e13);
+    e14 = field_mul_ptx(x14_6, e14);
+    e15 = field_mul_ptx(x15_6, e15);
 
-    // Final reduction for x^7 results
-    e4  = montyred_from_parts(hi4_7, lo4_7);
-    e5  = montyred_from_parts(hi5_7, lo5_7);
-    e6  = montyred_from_parts(hi6_7, lo6_7);
-    e7  = montyred_from_parts(hi7_7, lo7_7);
-    e8  = montyred_from_parts(hi8_7, lo8_7);
-    e9  = montyred_from_parts(hi9_7, lo9_7);
-    e10 = montyred_from_parts(hi10_7, lo10_7);
-    e11 = montyred_from_parts(hi11_7, lo11_7);
-    e12 = montyred_from_parts(hi12_7, lo12_7);
-    e13 = montyred_from_parts(hi13_7, lo13_7);
-    e14 = montyred_from_parts(hi14_7, lo14_7);
-    e15 = montyred_from_parts(hi15_7, lo15_7);
-
-    // Vectorized store
-    *reinterpret_cast<ulonglong2*>(&state_out[0]) = make_ulonglong2(e0, e1);
-    *reinterpret_cast<ulonglong2*>(&state_out[2]) = make_ulonglong2(e2, e3);
-    *reinterpret_cast<ulonglong2*>(&state_out[4]) = make_ulonglong2(e4, e5);
-    *reinterpret_cast<ulonglong2*>(&state_out[6]) = make_ulonglong2(e6, e7);
-    *reinterpret_cast<ulonglong2*>(&state_out[8]) = make_ulonglong2(e8, e9);
-    *reinterpret_cast<ulonglong2*>(&state_out[10]) = make_ulonglong2(e10, e11);
-    *reinterpret_cast<ulonglong2*>(&state_out[12]) = make_ulonglong2(e12, e13);
-    *reinterpret_cast<ulonglong2*>(&state_out[14]) = make_ulonglong2(e14, e15);
+    // Store results
+    state_out[0]  = e0;
+    state_out[1]  = e1;
+    state_out[2]  = e2;
+    state_out[3]  = e3;
+    state_out[4]  = e4;
+    state_out[5]  = e5;
+    state_out[6]  = e6;
+    state_out[7]  = e7;
+    state_out[8]  = e8;
+    state_out[9]  = e9;
+    state_out[10] = e10;
+    state_out[11] = e11;
+    state_out[12] = e12;
+    state_out[13] = e13;
+    state_out[14] = e14;
+    state_out[15] = e15;
 }
 
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
 
-    // Split each element into lo and hi 32-bit limbs
+    // Split each element into lo and hi 32-bit limbs using PTX
+    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        uint64_t b = state_in[i];
-        lo[i] = b & 0xFFFFFFFFUL;
-        hi[i] = b >> 32;
+        uint32_t lo32, hi32;
+        asm("mov.b64 {%0, %1}, %2;" : "=r"(lo32), "=r"(hi32) : "l"(state_in[i]));
+        lo[i] = lo32;
+        hi[i] = hi32;
     }
 
     // Process each limb with FFT-based generated_function
@@ -465,15 +415,39 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     generated_function(hi, hi_out);
 
     // Combine elementwise: (lo >> 4) + (hi << 28), then reduce
+    // Fully PTX-optimized using shf (funnel shift) and mad with carry
+    #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        __uint128_t s = (lo_out[i] >> 4) + ((__uint128_t)hi_out[i] << 28);
-        uint64_t s_hi = (uint64_t)(s >> 64);
-        uint64_t s_lo = (uint64_t)s;
+        // Compute s = (lo_out[i] >> 4) + (hi_out[i] << 28)
+        // This is a 128-bit value, we compute s_lo and s_hi directly
+        uint64_t lo_shifted = lo_out[i] >> 4;           // (lo >> 4), high 4 bits lost
+        uint64_t hi_shifted_lo = hi_out[i] << 28;       // low 64 bits of (hi << 28)
+        uint64_t hi_shifted_hi = hi_out[i] >> 36;       // high bits of (hi << 28)
 
-        // Goldilocks reduction with overflow check
-        uint64_t res = s_lo + s_hi * 0xFFFFFFFFULL;
-        bool overflow = (res < s_lo);
-        state_out[i] = overflow ? (res + 0xFFFFFFFFULL) : res;
+        // s_lo = lo_shifted + hi_shifted_lo (with carry out)
+        // s_hi = hi_shifted_hi + carry
+        uint64_t s_lo, s_hi;
+        asm("{\n\t"
+            ".reg .pred c;\n\t"
+            "add.cc.u64 %0, %2, %3;\n\t"      // s_lo = lo_shifted + hi_shifted_lo, set carry
+            "addc.u64 %1, %4, 0;\n\t"         // s_hi = hi_shifted_hi + carry
+            "}" : "=l"(s_lo), "=l"(s_hi) : "l"(lo_shifted), "l"(hi_shifted_lo), "l"(hi_shifted_hi));
+
+        // Goldilocks reduction: res = s_lo + s_hi * 0xFFFFFFFF
+        // Using PTX mad.lo for multiply-add with branchless overflow
+        uint64_t res;
+        asm("{\n\t"
+            ".reg .u64 prod;\n\t"
+            ".reg .pred p;\n\t"
+            "mul.lo.u64 prod, %2, 4294967295;\n\t"  // prod = s_hi * 0xFFFFFFFF
+            "add.cc.u64 %0, %1, prod;\n\t"          // res = s_lo + prod, set carry
+            // Branchless: if overflow, add 0xFFFFFFFF
+            "setp.lt.u64 p, %0, %1;\n\t"            // p = (res < s_lo)
+            "selp.u64 prod, 4294967295, 0, p;\n\t"  // correction = p ? 0xFFFFFFFF : 0
+            "add.u64 %0, %0, prod;\n\t"             // res += correction
+            "}" : "=l"(res) : "l"(s_lo), "l"(s_hi));
+
+        state_out[i] = res;
     }
 }
 
@@ -578,12 +552,57 @@ __host__ void round_constants_layer_host(int round_index, const uint64_t* state_
 __device__ __noinline__ void tip5_permutation(uint64_t* state) {
     uint64_t temp_state[STATE_SIZE];
 
-    // OPTIMIZATION: Fused round constants - no separate function call
     for (int round = 0; round < NUM_ROUNDS; ++round) {
         sbox_layer(state, temp_state);
         mds_layer(temp_state, state);
 
         // Fused round constants addition
+        for (int i = 0; i < STATE_SIZE; ++i) {
+            state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
+        }
+    }
+}
+
+// Specialized permutation for Pow_indices hot loop (62 iterations).
+// PRECONDITION: state[5..9]=0, state[10..15]=FIXED_LEN_VAL (=1).
+// First round skips x^7 for 11 elements (saves 44 field_mul_ptx per call).
+__device__ __noinline__ void tip5_permutation_fixed_right_zero(uint64_t* state, uint64_t x7_one) {
+    uint64_t temp_state[STATE_SIZE];
+
+    // === ROUND 0: exploit known right side ===
+    // Elements 0-3: normal S-box lookup (data-dependent)
+    temp_state[0] = split_lookup_shared(state[0], s_lookup_table);
+    temp_state[1] = split_lookup_shared(state[1], s_lookup_table);
+    temp_state[2] = split_lookup_shared(state[2], s_lookup_table);
+    temp_state[3] = split_lookup_shared(state[3], s_lookup_table);
+
+    // Element 4: x^7 of unknown value (must compute)
+    temp_state[4] = x7_computer_pipelined(state[4]);
+
+    // Elements 5-9: x^7(0) = 0 (trivially)
+    temp_state[5]  = 0;
+    temp_state[6]  = 0;
+    temp_state[7]  = 0;
+    temp_state[8]  = 0;
+    temp_state[9]  = 0;
+
+    // Elements 10-15: x^7(1) = precomputed constant (passed as arg)
+    temp_state[10] = x7_one;
+    temp_state[11] = x7_one;
+    temp_state[12] = x7_one;
+    temp_state[13] = x7_one;
+    temp_state[14] = x7_one;
+    temp_state[15] = x7_one;
+
+    mds_layer(temp_state, state);
+    for (int i = 0; i < STATE_SIZE; ++i) {
+        state[i] = fast_field_add(state[i], ROUND_CONSTANTS[0][i]);
+    }
+
+    // === ROUNDS 1-4: normal ===
+    for (int round = 1; round < NUM_ROUNDS; ++round) {
+        sbox_layer(state, temp_state);
+        mds_layer(temp_state, state);
         for (int i = 0; i < STATE_SIZE; ++i) {
             state[i] = fast_field_add(state[i], ROUND_CONSTANTS[round][i]);
         }

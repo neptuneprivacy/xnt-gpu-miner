@@ -66,36 +66,71 @@ __device__ __forceinline__ uint64_t fast_bitreverse_64(uint64_t val, uint32_t bi
 
 // Optimized Montgomery reduction for Goldilocks prime p = 2^64 - 2^32 + 1
 // Input: 128-bit value (xh, xl) where result = (xh * 2^64 + xl) * R^(-1) mod p
-// Uses PTX setp/selp for truly branchless execution
+// Uses 32-bit arithmetic with carry chain for better GPU efficiency
 __device__ __forceinline__ uint64_t montyred_from_parts(uint64_t xh, uint64_t xl) {
-    // Step 1: t = xl + (xl << 32), detect carry
-    uint64_t xl_lo = xl << 32;
-    uint64_t t = xl + xl_lo;
-
-    // Branchless carry detection: carry = (t < xl) ? 1 : 0
-    uint64_t carry;
+    uint64_t result;
     asm("{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.lt.u64 p, %1, %2;\n\t"
-        "selp.u64 %0, 1, 0, p;\n\t"
-        "}" : "=l"(carry) : "l"(t), "l"(xl));
-
-    // Step 2: u = t - (t >> 32) - carry
-    uint64_t t_hi = t >> 32;
-    uint64_t u = t - t_hi - carry;
-
-    // Step 3: result = xh - u, with conditional correction
-    uint64_t result = xh - u;
-
-    // Branchless underflow correction: if xh < u, subtract 0xFFFFFFFF
-    uint64_t correction;
-    asm("{\n\t"
+        ".reg .u64 neg_m, u;\n\t"
+        ".reg .u32 xl_lo, xl_hi, neg_m_lo, neg_m_hi, c;\n\t"
         ".reg .pred q;\n\t"
-        "setp.lt.u64 q, %1, %2;\n\t"
-        "selp.u64 %0, 4294967295, 0, q;\n\t"
-        "}" : "=l"(correction) : "l"(xh), "l"(u));
-    result -= correction;
+        // Split xl into 32-bit parts
+        "mov.b64 {xl_lo, xl_hi}, %1;\n\t"
+        // neg_m = xl + (xl << 32) using 32-bit arithmetic with carry
+        "add.cc.u32 neg_m_lo, xl_lo, 0;\n\t"
+        "addc.cc.u32 neg_m_hi, xl_hi, xl_lo;\n\t"
+        "addc.u32 c, 0, 0;\n\t"
+        // Reconstruct neg_m
+        "mov.b64 neg_m, {neg_m_lo, neg_m_hi};\n\t"
+        // u = neg_m - neg_m_hi - c
+        "cvt.u64.u32 u, neg_m_hi;\n\t"
+        "sub.u64 u, neg_m, u;\n\t"
+        "cvt.u64.u32 neg_m, c;\n\t"
+        "sub.u64 u, u, neg_m;\n\t"
+        // result = xh - u
+        "sub.u64 %0, %2, u;\n\t"
+        // Branchless underflow correction
+        "setp.lt.u64 q, %2, u;\n\t"
+        "selp.u64 u, 4294967295, 0, q;\n\t"
+        "sub.u64 %0, %0, u;\n\t"
+        "}" : "=l"(result) : "l"(xl), "l"(xh));
+    return result;
+}
 
+// PTX-optimized field multiplication: computes (a * b) mod p in Montgomery form
+// Fuses 64x64->128 multiplication with Montgomery reduction for better register usage
+// Uses funnel shift (shf) for efficient 32-bit extraction from 64-bit values
+__device__ __forceinline__ uint64_t field_mul_ptx(uint64_t a, uint64_t b) {
+    uint64_t result;
+    asm("{\n\t"
+        ".reg .u64 lo, hi, neg_m, u;\n\t"
+        ".reg .u32 lo_lo, lo_hi, neg_m_lo, neg_m_hi, t32, c;\n\t"
+        ".reg .pred p, q;\n\t"
+        // 64x64 -> 128-bit multiplication
+        "mul.lo.u64 lo, %1, %2;\n\t"
+        "mul.hi.u64 hi, %1, %2;\n\t"
+        // Split lo into 32-bit parts for efficient computation
+        "mov.b64 {lo_lo, lo_hi}, lo;\n\t"
+        // neg_m = lo + (lo << 32) using 32-bit arithmetic with carry
+        // neg_m_lo = lo_lo + 0 = lo_lo (low 32 bits of lo << 32 is 0)
+        // neg_m_hi = lo_hi + lo_lo + carry
+        "add.cc.u32 neg_m_lo, lo_lo, 0;\n\t"        // neg_m_lo = lo_lo, no carry in
+        "addc.cc.u32 neg_m_hi, lo_hi, lo_lo;\n\t"   // neg_m_hi = lo_hi + lo_lo + 0
+        "addc.u32 c, 0, 0;\n\t"                      // c = carry out
+        // Reconstruct neg_m
+        "mov.b64 neg_m, {neg_m_lo, neg_m_hi};\n\t"
+        // u = neg_m - (neg_m >> 32) - carry = neg_m - neg_m_hi - c
+        // Using 64-bit: u = neg_m - (uint64_t)neg_m_hi - c
+        "cvt.u64.u32 u, neg_m_hi;\n\t"
+        "sub.u64 u, neg_m, u;\n\t"
+        "cvt.u64.u32 neg_m, c;\n\t"                  // reuse neg_m for carry
+        "sub.u64 u, u, neg_m;\n\t"
+        // result = hi - u
+        "sub.u64 %0, hi, u;\n\t"
+        // Branchless underflow correction
+        "setp.lt.u64 q, hi, u;\n\t"
+        "selp.u64 u, 4294967295, 0, q;\n\t"
+        "sub.u64 %0, %0, u;\n\t"
+        "}" : "=l"(result) : "l"(a), "l"(b));
     return result;
 }
 
@@ -128,11 +163,20 @@ __host__ inline uint64_t montyred_host(__uint128_t x) {
 }
 
 __device__ __forceinline__ uint64_t fast_field_add(uint64_t a, uint64_t b) {
-    // OPTIMIZATION #11: Simplified logic - only one condition needed
-    uint64_t sum = a + b;
-    bool overflow = (sum < a);
-    bool needs_reduction = overflow || (sum >= GOLDILOCKS_MODULUS);
-    return sum - (needs_reduction ? GOLDILOCKS_MODULUS : 0);
+    // PTX-optimized branchless field addition for Goldilocks prime p = 2^64 - 2^32 + 1
+    // Uses add.cc to detect overflow via carry flag
+    uint64_t result;
+    asm("{\n\t"
+        ".reg .u64 sum, correction;\n\t"
+        ".reg .pred p, q, r;\n\t"
+        "add.cc.u64 sum, %1, %2;\n\t"          // sum = a + b, set carry on overflow
+        "setp.lt.u64 p, sum, %1;\n\t"          // p = overflow (sum < a)
+        "setp.hs.u64 q, sum, %3;\n\t"          // q = (sum >= GOLDILOCKS_MODULUS)
+        "or.pred r, p, q;\n\t"                  // r = needs_reduction
+        "selp.u64 correction, %3, 0, r;\n\t"   // correction = r ? p : 0
+        "sub.u64 %0, sum, correction;\n\t"     // result = sum - correction
+        "}" : "=l"(result) : "l"(a), "l"(b), "l"(GOLDILOCKS_MODULUS));
+    return result;
 }
 
 __host__ inline uint64_t fast_field_add_host(uint64_t a, uint64_t b) {
@@ -159,21 +203,11 @@ __host__ inline uint64_t field_mul_host(uint64_t a, uint64_t b) {
 }
 
 __device__ __forceinline__ uint64_t x7_computer_pipelined(uint64_t x) {
-    uint64_t lo2 = x * x;
-    uint64_t hi2 = __umul64hi(x, x);
-    uint64_t x2 = montyred_from_parts(hi2, lo2);
-
-    uint64_t lo4 = x2 * x2;
-    uint64_t hi4 = __umul64hi(x2, x2);
-    uint64_t x4 = montyred_from_parts(hi4, lo4);
-
-    uint64_t lo6 = x4 * x2;
-    uint64_t hi6 = __umul64hi(x4, x2);
-    uint64_t x6 = montyred_from_parts(hi6, lo6);
-
-    uint64_t lo7 = x6 * x;
-    uint64_t hi7 = __umul64hi(x6, x);
-    return montyred_from_parts(hi7, lo7);
+    // Use fused PTX multiply-reduce for better register efficiency
+    uint64_t x2 = field_mul_ptx(x, x);
+    uint64_t x4 = field_mul_ptx(x2, x2);
+    uint64_t x6 = field_mul_ptx(x4, x2);
+    return field_mul_ptx(x6, x);
 }
 
 __device__ __forceinline__ uint64_t x7_computer(uint64_t x) {
@@ -188,19 +222,25 @@ __host__ inline uint64_t x7_computer_host(uint64_t x) {
 }
 
 __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, const uint8_t* __restrict__ shared_lut) {
-    uint64_t lo1 = element_in * R2;
-    uint64_t hi1 = __umul64hi(element_in, R2);
-    uint64_t reduced_in = montyred_from_parts(hi1, lo1);
+    // Use fused PTX multiply-reduce for R2 multiplication
+    uint64_t reduced_in = field_mul_ptx(element_in, R2);
 
-    uint8_t addr0 = (uint8_t)(reduced_in >> 0);
-    uint8_t addr1 = (uint8_t)(reduced_in >> 8);
-    uint8_t addr2 = (uint8_t)(reduced_in >> 16);
-    uint8_t addr3 = (uint8_t)(reduced_in >> 24);
-    uint8_t addr4 = (uint8_t)(reduced_in >> 32);
-    uint8_t addr5 = (uint8_t)(reduced_in >> 40);
-    uint8_t addr6 = (uint8_t)(reduced_in >> 48);
-    uint8_t addr7 = (uint8_t)(reduced_in >> 56);
+    // PTX-optimized byte extraction using bfe (bit field extract)
+    // Extract each byte directly into uint32_t for efficient LUT indexing
+    uint32_t addr0, addr1, addr2, addr3, addr4, addr5, addr6, addr7;
+    asm("bfe.u32 %0, %8, 0, 8;\n\t"
+        "bfe.u32 %1, %8, 8, 8;\n\t"
+        "bfe.u32 %2, %8, 16, 8;\n\t"
+        "bfe.u32 %3, %8, 24, 8;\n\t"
+        "bfe.u32 %4, %9, 0, 8;\n\t"
+        "bfe.u32 %5, %9, 8, 8;\n\t"
+        "bfe.u32 %6, %9, 16, 8;\n\t"
+        "bfe.u32 %7, %9, 24, 8;"
+        : "=r"(addr0), "=r"(addr1), "=r"(addr2), "=r"(addr3),
+          "=r"(addr4), "=r"(addr5), "=r"(addr6), "=r"(addr7)
+        : "r"((uint32_t)reduced_in), "r"((uint32_t)(reduced_in >> 32)));
 
+    // LUT lookups
     uint64_t b0 = shared_lut[addr0];
     uint64_t b1 = shared_lut[addr1];
     uint64_t b2 = shared_lut[addr2];
@@ -210,9 +250,24 @@ __device__ __forceinline__ uint64_t split_lookup_shared(uint64_t element_in, con
     uint64_t b6 = shared_lut[addr6];
     uint64_t b7 = shared_lut[addr7];
 
-    uint64_t sbox_out = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) |
-                        (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
+    // PTX-optimized byte packing using bfi (bit field insert)
+    uint32_t lo_result, hi_result;
+    asm("{\n\t"
+        ".reg .u32 t0, t1;\n\t"
+        // Pack low 4 bytes: b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        "bfi.b32 t0, %3, %2, 8, 8;\n\t"   // t0 = b0 | (b1 << 8)
+        "bfi.b32 t1, %5, %4, 8, 8;\n\t"   // t1 = b2 | (b3 << 8)
+        "bfi.b32 %0, t1, t0, 16, 16;\n\t" // lo = t0 | (t1 << 16)
+        // Pack high 4 bytes: b4 | (b5 << 8) | (b6 << 16) | (b7 << 24)
+        "bfi.b32 t0, %7, %6, 8, 8;\n\t"   // t0 = b4 | (b5 << 8)
+        "bfi.b32 t1, %9, %8, 8, 8;\n\t"   // t1 = b6 | (b7 << 8)
+        "bfi.b32 %1, t1, t0, 16, 16;\n\t" // hi = t0 | (t1 << 16)
+        "}"
+        : "=r"(lo_result), "=r"(hi_result)
+        : "r"((uint32_t)b0), "r"((uint32_t)b1), "r"((uint32_t)b2), "r"((uint32_t)b3),
+          "r"((uint32_t)b4), "r"((uint32_t)b5), "r"((uint32_t)b6), "r"((uint32_t)b7));
 
+    uint64_t sbox_out = ((uint64_t)hi_result << 32) | lo_result;
     return montyred_from_parts(0, sbox_out);
 }
 
@@ -269,15 +324,25 @@ __host__ void mds_layer_host(const uint64_t* state_in, uint64_t* state_out);
 __host__ void round_constants_layer_host(int round_index, const uint64_t* state_in, uint64_t* state_out);
 
 __device__ __noinline__ void tip5_permutation(uint64_t* state);
+__device__ __noinline__ void tip5_permutation_fixed_right_zero(uint64_t* state, uint64_t x7_one);
 __host__ void tip5_permutation_host(uint64_t* state);
 
 __device__ __forceinline__ void tip5_sponge_init(uint64_t* __restrict__ state, Domain domain) {
-    // OPTIMIZATION #16: Combined initialization in single loop
+    // PTX-optimized state initialization using vectorized stores
     uint64_t capacity_val = (domain == Domain::FixedLength) ? static_cast<uint64_t>(domain) : BFE_ZERO;
-
-    for (int i = 0; i < STATE_SIZE; ++i) {
-        state[i] = (i < RATE) ? BFE_ZERO : capacity_val;
-    }
+    
+    // Vectorized zero initialization for RATE elements (0-9)
+    // Using ulonglong2 for 128-bit stores
+    *reinterpret_cast<ulonglong2*>(&state[0]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[2]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[4]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[6]) = make_ulonglong2(0ULL, 0ULL);
+    *reinterpret_cast<ulonglong2*>(&state[8]) = make_ulonglong2(0ULL, 0ULL);
+    
+    // Capacity elements (10-15) - set to domain value
+    *reinterpret_cast<ulonglong2*>(&state[10]) = make_ulonglong2(capacity_val, capacity_val);
+    *reinterpret_cast<ulonglong2*>(&state[12]) = make_ulonglong2(capacity_val, capacity_val);
+    *reinterpret_cast<ulonglong2*>(&state[14]) = make_ulonglong2(capacity_val, capacity_val);
 }
 
 __device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ state,
@@ -291,9 +356,11 @@ __device__ __forceinline__ void tip5_sponge_absorb_chunk(uint64_t* __restrict__ 
 
 __device__ __forceinline__ void tip5_sponge_squeeze(uint64_t* __restrict__ state,
                                                      uint64_t* __restrict__ digest) {
-    for (int i = 0; i < DIGEST_LEN; ++i) {
-        digest[i] = state[i];
-    }
+    // Vectorized copy for DIGEST_LEN (5) elements
+    // Copy first 4 as two ulonglong2, then the 5th separately
+    *reinterpret_cast<ulonglong2*>(&digest[0]) = *reinterpret_cast<ulonglong2*>(&state[0]);
+    *reinterpret_cast<ulonglong2*>(&digest[2]) = *reinterpret_cast<ulonglong2*>(&state[2]);
+    digest[4] = state[4];
 }
 
 __host__ void tip5_sponge_init_host(uint64_t* state, Domain domain);

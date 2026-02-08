@@ -70,6 +70,64 @@ Digest parse_digest_string(const std::string& str);
 bool digest_less_than_or_equal(const Digest& a, const Digest& b);
 Digest make_target_easier(const Digest& target, uint64_t factor);
 
+__host__ __forceinline__ int digest_compare_host(const Digest& a, const Digest& b) {
+    for (int i = DIGEST_LEN - 1; i >= 0; --i) {
+        if (a.values[i] < b.values[i]) return -1;
+        if (a.values[i] > b.values[i]) return 1;
+    }
+    return 0;
+}
+
+// PTX-optimized digest comparison for GPU - returns true if a <= b
+// Uses early-exit on most significant limb which fails most often
+__device__ __forceinline__ bool digest_less_equal_ptx(const Digest& a, const Digest& b) {
+    // Most hashes fail on highest limb - check it first with PTX
+    uint64_t a4 = a.values[4], b4 = b.values[4];
+    uint64_t a3 = a.values[3], b3 = b.values[3];
+    uint64_t a2 = a.values[2], b2 = b.values[2];
+    uint64_t a1 = a.values[1], b1 = b.values[1];
+    uint64_t a0 = a.values[0], b0 = b.values[0];
+    
+    int result;
+    asm("{\n\t"
+        ".reg .pred lt4, gt4, eq4, lt3, gt3, eq3, lt2, gt2, eq2, lt1, gt1, eq1, lt0;\n\t"
+        // Compare limb 4 (most significant)
+        "setp.lt.u64 lt4, %1, %2;\n\t"
+        "setp.gt.u64 gt4, %1, %2;\n\t"
+        "setp.eq.u64 eq4, %1, %2;\n\t"
+        // Compare limb 3
+        "setp.lt.u64 lt3, %3, %4;\n\t"
+        "setp.gt.u64 gt3, %3, %4;\n\t"
+        "setp.eq.u64 eq3, %3, %4;\n\t"
+        // Compare limb 2
+        "setp.lt.u64 lt2, %5, %6;\n\t"
+        "setp.gt.u64 gt2, %5, %6;\n\t"
+        "setp.eq.u64 eq2, %5, %6;\n\t"
+        // Compare limb 1
+        "setp.lt.u64 lt1, %7, %8;\n\t"
+        "setp.gt.u64 gt1, %7, %8;\n\t"
+        "setp.eq.u64 eq1, %7, %8;\n\t"
+        // Compare limb 0
+        "setp.le.u64 lt0, %9, %10;\n\t"  // lt0 is actually le for limb 0
+        // Build result: a <= b if:
+        //   lt4 OR (eq4 AND (lt3 OR (eq3 AND (lt2 OR (eq2 AND (lt1 OR (eq1 AND lt0)))))))
+        // Simplify with selp chain
+        "selp.s32 %0, 1, 0, lt0;\n\t"      // result = (a0 <= b0) ? 1 : 0
+        "selp.s32 %0, 1, %0, lt1;\n\t"     // if a1 < b1, result = 1
+        "selp.s32 %0, 0, %0, gt1;\n\t"     // if a1 > b1, result = 0
+        "selp.s32 %0, 1, %0, lt2;\n\t"     // if a2 < b2, result = 1
+        "selp.s32 %0, 0, %0, gt2;\n\t"     // if a2 > b2, result = 0
+        "selp.s32 %0, 1, %0, lt3;\n\t"     // if a3 < b3, result = 1
+        "selp.s32 %0, 0, %0, gt3;\n\t"     // if a3 > b3, result = 0
+        "selp.s32 %0, 1, %0, lt4;\n\t"     // if a4 < b4, result = 1
+        "selp.s32 %0, 0, %0, gt4;\n\t"     // if a4 > b4, result = 0
+        "}"
+        : "=r"(result)
+        : "l"(a4), "l"(b4), "l"(a3), "l"(b3), "l"(a2), "l"(b2), 
+          "l"(a1), "l"(b1), "l"(a0), "l"(b0));
+    return result != 0;
+}
+
 __device__ __host__ __forceinline__ int digest_compare(const Digest& a, const Digest& b) {
     for (int i = DIGEST_LEN - 1; i >= 0; --i) {
         if (a.values[i] < b.values[i]) return -1;

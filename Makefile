@@ -25,7 +25,6 @@ endif
 #   --ptxas-options=-O3: Aggressive PTX optimization
 # Note: Lower maxrregcount = better occupancy but may cause register spilling
 #       Start with 64, increase if you see performance degradation
-# MAX_REG_COUNT removed - forcing limits causes register spilling
 NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
              --ptxas-options=-v \
              --ptxas-options=-O3 \
@@ -34,6 +33,19 @@ NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
                 --ptxas-options=-v \
                 --ptxas-options=-O3 \
                 -dc
+# Device link-time optimization (enables cross-TU inlining, better reg allocation)
+# Disable with DLTO=0 if build is too slow
+DLTO ?= 1
+ifeq ($(DLTO),1)
+    NVCC_FLAGS += -dlto
+    NVCC_DC_FLAGS += -dlto
+endif
+# Register limit: 255 gives best perf on Blackwell (override with MAX_REG_COUNT=<n>)
+MAX_REG_COUNT ?= 255
+ifdef MAX_REG_COUNT
+    NVCC_FLAGS += -maxrregcount=$(MAX_REG_COUNT)
+    NVCC_DC_FLAGS += -maxrregcount=$(MAX_REG_COUNT)
+endif
 CXX_FLAGS = -O3 -march=native -std=c++17
 
 # Include paths
@@ -75,10 +87,15 @@ OBJS = $(MODULAR_SRCS:.cu=.o)
 DEVICE_LINK_OBJ = device_link.o
 
 $(TARGET): $(OBJS)
+ifdef DLTO
+	# With device LTO, let nvcc perform device linking internally to avoid duplicate registration stubs
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(LIBS)
+else
 	# First, create device link object
 	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS)
 	# Then link everything together into final executable
 	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(DEVICE_LINK_OBJ) $(LIBS)
+endif
 
 # Compile each .cu file to .o with device code
 %.o: %.cu

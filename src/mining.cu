@@ -3,6 +3,7 @@
 #include "connection_multiplexer.cuh"
 #include "stratum_client.cuh"
 #include "common.cuh"
+#include "kernels.cuh"
 
 // ============================================================================
 // GpuWorker Implementation
@@ -430,8 +431,19 @@ void startUnifiedMining(
 }
 
 // ============================================================================
-// Continuous Mining Loop
+// Continuous Mining Loop - Double-Buffered Async Version
 // ============================================================================
+// TRUE PIPELINING: We use 2 independent CUDA streams. Each stream has its own
+// output buffers. The pipeline works as follows:
+//
+// Time:    |----Batch 0----|----Batch 2----|----Batch 4----|
+// Stream A: [==KERNEL 0===][==KERNEL 2===][==KERNEL 4===]
+// Stream B:      [==KERNEL 1===][==KERNEL 3===][==KERNEL 5===]
+// CPU:      [Launch0][Chk-1][Launch2][Chk0][Launch4][Chk2]...
+//
+// Key: We NEVER block. After launching batch N, we check if batch N-2 (same
+// stream, previous kernel) is done. If not done, we continue - the kernel
+// will complete eventually and we'll catch it next time around.
 
 bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     if (!gpu_res || !worker) return false;
@@ -439,10 +451,42 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     auto last_status_time = std::chrono::steady_clock::now();
     const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
     
+    // Initialize double-buffered miner
+    if (!gpu_res->async_miner) {
+        gpu_res->async_miner = std::make_unique<DoubleBufferedMiner>();
+    }
+    
+    DoubleBufferedMiner& miner = *gpu_res->async_miner;
+    if (!miner.initialize()) {
+        std::cerr << "[GPU " << gpu_res->gpu_id << "] Failed to initialize async miner, falling back to sync" << std::endl;
+        return continuousMiningLoopSync(gpu_res, worker);
+    }
+    
+    // Track batch info for each slot
+    struct BatchInfo {
+        std::string proposal_id;
+        json template_obj;
+        uint64_t start_nonce;
+        uint64_t batch_size;
+        std::chrono::high_resolution_clock::time_point start_time;
+        bool pending_result;  // True if kernel launched and result not yet processed
+    };
+    BatchInfo batch_info[2] = {};
+    
+    // Pipeline state
+    int active_slot = 0;  // Which slot to use for NEXT launch
+    int batches_in_flight = 0;
+    
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
-        // Check for new events (new puzzle) - even when paused
+        // Check for new events
         if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
-            break; // Break to let handleNewPuzzle process the new job
+            // Drain pipeline before breaking
+            for (int i = 0; i < 2; i++) {
+                if (batch_info[i].pending_result) {
+                    cudaStreamSynchronize(miner.slots[i].stream);
+                }
+            }
+            break;
         }
         
         if (gpu_res->gpu_pause_flag) {
@@ -460,7 +504,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         {
             std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
             proposal_id = gpu_res->current_proposal_id;
-            template_for_this_batch = gpu_res->current_template;  // Capture template with proposal_id
+            template_for_this_batch = gpu_res->current_template;
         }
         
         if (proposal_id.empty()) {
@@ -468,75 +512,305 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             continue;
         }
         
-        // Check if template is stale - if so, pause mining and wait for new job
+        // Check template staleness
         if (!template_for_this_batch.is_null() && !template_for_this_batch.empty()) {
             auto& multiplexer = ConnectionMultiplexer::getInstance();
             if (multiplexer.isTemplateStale(template_for_this_batch)) {
-                // Template is stale, pause mining to save GPU power
-                std::string prev_block = "unknown";
-                if (template_for_this_batch.contains("metadata") && !template_for_this_batch["metadata"].is_null()) {
-                    json metadata = template_for_this_batch["metadata"];
-                    if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
-                        prev_block = metadata.value("prevBlock", "");
-                    } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
-                        prev_block = metadata.value("prev_block", "");
+                // Wait for in-flight batches then pause
+                for (int i = 0; i < 2; i++) {
+                    if (batch_info[i].pending_result) {
+                        cudaStreamSynchronize(miner.slots[i].stream);
+                        batch_info[i].pending_result = false;
                     }
                 }
-                std::string short_prev = prev_block.length() > 20 
-                    ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) 
-                    : prev_block;
+                batches_in_flight = 0;
                 
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW
-                          << "Template stale (prev_block=" << short_prev 
-                          << " != current tip), pausing mining to save power..." << Color::RESET << std::endl;
-                
+                          << "Template stale, pausing..." << Color::RESET << std::endl;
                 gpu_res->set_paused(true);
                 
-                // Wait for new job or template update
-                while (!stop_mining && !gpu_res->gpu_stop_flag) {
-                    // Check if pause flag was cleared (new job received)
-                    if (!gpu_res->gpu_pause_flag) {
-                        break;
-                    }
+                while (!stop_mining && !gpu_res->gpu_stop_flag && gpu_res->gpu_pause_flag) {
+                    if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                
+                if (!stop_mining && !gpu_res->gpu_stop_flag) {
+                    gpu_res->set_paused(false);
+                }
+                continue;
+            }
+        }
+        
+        // =====================================================================
+        // STEP 1: Check if CURRENT slot's previous batch is complete (non-blocking)
+        // =====================================================================
+        AsyncMiningSlot& current_slot = miner.slots[active_slot];
+        BatchInfo& current_batch_info = batch_info[active_slot];
+        
+        if (current_batch_info.pending_result) {
+            // Check if this slot's kernel is done (NON-BLOCKING)
+            cudaError_t status = cudaEventQuery(current_slot.completion_event);
+            
+            if (status == cudaSuccess) {
+                // Kernel completed! Process result
+                auto now = std::chrono::high_resolution_clock::now();
+                auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - current_batch_info.start_time).count();
+                
+                gpu_res->total_nonces_tested.fetch_add(current_batch_info.batch_size);
+                batches_in_flight--;
+                
+                if (duration_ms > 0) {
+                    double hashrate_ms = static_cast<double>(current_batch_info.batch_size) / duration_ms;
+                    gpu_res->hash_tracker.add(hashrate_ms);
+                }
+                
+                // Check for solution (pinned memory was async copied)
+                int solution_found = *current_slot.h_solution_found_pinned;
+                
+                if (solution_found) {
+                    gpu_res->solutions_found++;
                     
-                    // Check for new events (new puzzle/job)
-                    if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
-                        break;
-                    }
+                    // Retrieve solution data
+                    MiningSolution solution;
+                    cudaMemcpy(&solution.pow.nonce, current_slot.d_solution_nonce_digest, 
+                               sizeof(Digest), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(solution.pow.path_a, current_slot.d_solution_path_a,
+                               MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(solution.pow.path_b, current_slot.d_solution_path_b,
+                               MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(&solution.kernel_final_hash, current_slot.d_solution_final_hash,
+                               sizeof(Digest), cudaMemcpyDeviceToHost);
+                    solution.pow.root = gpu_res->buffer->merkle_root;
                     
-                    // Check if proposal ID changed (new template)
+                    // Check if proposal still current
                     std::string current_proposal_id;
                     {
                         std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
                         current_proposal_id = gpu_res->current_proposal_id;
                     }
-                    if (current_proposal_id != proposal_id) {
-                        break;
-                    }
                     
-                    // Check if template is no longer stale
-                    json current_template;
-                    {
-                        std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
-                        current_template = gpu_res->current_template;
-                    }
-                    if (!current_template.is_null() && !current_template.empty()) {
-                        if (!multiplexer.isTemplateStale(current_template)) {
-                            break;
+                    if (current_proposal_id != current_batch_info.proposal_id) {
+                        std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
+                                  << "Solution discarded - template changed" << Color::RESET << std::endl;
+                    } else {
+                        const char* target = gpu_res->is_stratum_mode() ? "pool" : "node";
+                        std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
+                                  << "*** SOLUTION FOUND! ***" << Color::RESET 
+                                  << " Submitting to " << target << "..." << std::endl;
+                        
+                        PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
+                        Digest solution_hash = mast_paths.fast_mast_hash(solution.pow);
+                        
+                        // Submit asynchronously
+                        auto future = worker->submitSolution(
+                            current_batch_info.proposal_id,
+                            solution.pow,
+                            solution_hash,
+                            current_batch_info.template_obj);
+                        
+                        // Non-blocking check with short timeout
+                        if (future.wait_for(std::chrono::seconds(30)) == std::future_status::ready) {
+                            bool accepted = future.get();
+                            if (accepted) {
+                                gpu_res->solutions_accepted++;
+                                const char* msg = gpu_res->is_stratum_mode() ? "SHARE ACCEPTED" : "BLOCK ACCEPTED";
+                                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
+                                          << "*** " << msg << "! ***" << Color::RESET << std::endl;
+                            } else {
+                                gpu_res->solutions_rejected++;
+                            }
+                        } else {
+                            gpu_res->solutions_rejected++;
                         }
                     }
-                    
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
                 
-                // Resume mining if we broke out of the wait loop
-                if (!stop_mining && !gpu_res->gpu_stop_flag) {
-                    gpu_res->set_paused(false);
-                    continue; // Start over to get fresh proposal_id and template_obj
-                }
+                current_batch_info.pending_result = false;
+                current_slot.kernel_launched = false;
                 
+            } else if (status == cudaErrorNotReady) {
+                // Kernel still running - switch to other slot and continue
+                // DON'T BLOCK! Just use the other slot
+                active_slot = 1 - active_slot;
+                
+                // If other slot also busy, we need to wait for one
+                if (batch_info[active_slot].pending_result) {
+                    cudaError_t other_status = cudaEventQuery(miner.slots[active_slot].completion_event);
+                    if (other_status == cudaErrorNotReady) {
+                        // Both slots busy - wait for current one (this is expected with 2 slots)
+                        cudaStreamSynchronize(current_slot.stream);
+                        // Will process on next iteration
+                        continue;
+                    }
+                }
                 continue;
             }
+        }
+        
+        // =====================================================================
+        // STEP 2: Launch new batch on current slot (non-blocking)
+        // =====================================================================
+        Digest target;
+        {
+            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+            target = gpu_res->current_target;
+        }
+        
+        uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
+        
+        // Reset slot for new batch
+        *current_slot.h_solution_found_pinned = 0;
+        cudaMemsetAsync(current_slot.d_solution_found, 0, sizeof(int), current_slot.stream);
+        
+        // Get launch config
+        int threads_per_block, blocks_per_grid;
+        int gpu_id;
+        cudaGetDevice(&gpu_id);
+        calculate_mining_launch_config(gpu_res->optimal_max_nonces, threads_per_block, blocks_per_grid, gpu_id);
+        
+        // Ensure GPU range initialized
+        if (!gpu_res->buffer->gpu_range_initialized) {
+            int actual_gpu_count = g_total_gpu_count.load();
+            GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+            cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+            cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+            initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
+            gpu_res->buffer->gpu_range_initialized = true;
+        }
+        
+        // Launch kernel
+        MiningKernelType kernel_type = select_mining_kernel(gpu_id);
+        
+        if (kernel_type == MiningKernelType::HIGH_VRAM) {
+            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, current_slot.stream>>>(
+                gpu_res->buffer->d_leafs,
+                gpu_res->buffer->d_merkle_tree,
+                gpu_res->buffer->index_picker_preimage,
+                target,
+                start_nonce,
+                gpu_res->optimal_max_nonces,
+                gpu_res->buffer->num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                gpu_res->buffer->mast_paths,
+                gpu_res->buffer->hash,
+                gpu_res->buffer->consensus_rule_set,
+                current_slot.d_solution_nonce,
+                current_slot.d_solution_found,
+                current_slot.d_solution_path_a,
+                current_slot.d_solution_path_b,
+                current_slot.d_solution_nonce_digest,
+                current_slot.d_solution_final_hash);
+        } else {
+            parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block, 0, current_slot.stream>>>(
+                nullptr,
+                gpu_res->buffer->d_merkle_tree,
+                gpu_res->buffer->index_picker_preimage,
+                target,
+                start_nonce,
+                gpu_res->optimal_max_nonces,
+                gpu_res->buffer->num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                gpu_res->buffer->tree_size,
+                gpu_res->buffer->mast_paths,
+                gpu_res->buffer->hash,
+                gpu_res->buffer->consensus_rule_set,
+                current_slot.d_solution_nonce,
+                current_slot.d_solution_found,
+                current_slot.d_solution_path_a,
+                current_slot.d_solution_path_b,
+                current_slot.d_solution_nonce_digest,
+                current_slot.d_solution_final_hash);
+        }
+        
+        // Queue async copy of solution flag to pinned memory
+        cudaMemcpyAsync(current_slot.h_solution_found_pinned, current_slot.d_solution_found,
+                        sizeof(int), cudaMemcpyDeviceToHost, current_slot.stream);
+        
+        // Record completion event
+        cudaEventRecord(current_slot.completion_event, current_slot.stream);
+        
+        // Store batch info
+        current_batch_info.proposal_id = proposal_id;
+        current_batch_info.template_obj = template_for_this_batch;
+        current_batch_info.start_nonce = start_nonce;
+        current_batch_info.batch_size = gpu_res->optimal_max_nonces;
+        current_batch_info.start_time = std::chrono::high_resolution_clock::now();
+        current_batch_info.pending_result = true;
+        current_slot.kernel_launched = true;
+        batches_in_flight++;
+        
+        // Switch to other slot for next iteration
+        active_slot = 1 - active_slot;
+        
+        // =====================================================================
+        // STEP 3: Status update (non-blocking)
+        // =====================================================================
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_status_time >= STATUS_UPDATE_INTERVAL) {
+            double avg_hashrate = gpu_res->hash_tracker.get_average();
+            double hashrate_hps = avg_hashrate * 1000.0;
+            std::string hashrate_str = format_hashrate(hashrate_hps);
+            
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
+                      << "Mining (async x2)..." << Color::RESET 
+                      << " | Rate: " << Color::YELLOW << hashrate_str << Color::RESET
+                      << " | Nonces: " << gpu_res->total_nonces_tested.load()
+                      << " | " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET 
+                      << "/" << Color::RED << gpu_res->solutions_rejected.load() << Color::RESET 
+                      << std::endl;
+            
+            last_status_time = now;
+        }
+    }
+    
+    // Cleanup: drain pipeline
+    for (int i = 0; i < 2; i++) {
+        if (batch_info[i].pending_result) {
+            cudaStreamSynchronize(miner.slots[i].stream);
+        }
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// Synchronous Mining Loop (Fallback)
+// ============================================================================
+// Original synchronous implementation used as fallback if async init fails
+
+bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
+    if (!gpu_res || !worker) return false;
+    
+    auto last_status_time = std::chrono::steady_clock::now();
+    const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
+    
+    while (!stop_mining && !gpu_res->gpu_stop_flag) {
+        if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
+            break;
+        }
+        
+        if (gpu_res->gpu_pause_flag) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
+        if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
+            gpu_res->set_paused(true);
+            continue;
+        }
+        
+        std::string proposal_id;
+        json template_for_this_batch;
+        {
+            std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+            proposal_id = gpu_res->current_proposal_id;
+            template_for_this_batch = gpu_res->current_template;
+        }
+        
+        if (proposal_id.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
         
         auto start_time = std::chrono::high_resolution_clock::now();
@@ -567,7 +841,6 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             gpu_res->hash_tracker.add(hashrate_ms);
         }
         
-        // Periodic status update
         auto now = std::chrono::steady_clock::now();
         if (now - last_status_time >= STATUS_UPDATE_INTERVAL) {
             double avg_hashrate = gpu_res->hash_tracker.get_average();
@@ -579,7 +852,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             uint64_t rejected = gpu_res->solutions_rejected.load();
             
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
-                      << "Mining..." << Color::RESET 
+                      << "Mining (sync)..." << Color::RESET 
                       << " | Hash Rate: " << Color::YELLOW << hashrate_str << Color::RESET
                       << " | Nonces: " << total_nonces
                       << " | " << Color::GREEN << accepted << Color::RESET 
@@ -592,7 +865,6 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         if (result.has_value()) {
             gpu_res->solutions_found++;
             
-            // Check if proposal has changed - if so, this solution is for a stale template
             std::string current_proposal_id;
             {
                 std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
@@ -601,8 +873,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             
             if (current_proposal_id != proposal_id) {
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
-                          << "Solution discarded - template changed during mining" << Color::RESET << std::endl;
-                // Don't count as rejected since we caught it ourselves
+                          << "Solution discarded - template changed" << Color::RESET << std::endl;
                 continue;
             }
             
@@ -611,34 +882,31 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                       << "*** SOLUTION FOUND! ***" << Color::RESET 
                       << " Submitting to " << submit_target << "..." << std::endl;
             
-                PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
-                Digest solution_hash = mast_paths.fast_mast_hash(result.value().pow);
-                
-            // Use the template captured at the start of this mining batch
-            // This ensures we submit with the same template we were mining for
+            PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
+            Digest solution_hash = mast_paths.fast_mast_hash(result.value().pow);
+            
             auto future = worker->submitSolution(
-                    proposal_id,
-                    result.value().pow,
-                    solution_hash,
-                    template_for_this_batch
-                );
-                
-            // Wait for result (with timeout)
+                proposal_id,
+                result.value().pow,
+                solution_hash,
+                template_for_this_batch);
+            
             if (future.wait_for(std::chrono::seconds(30)) == std::future_status::ready) {
                 bool accepted = future.get();
                 if (accepted) {
                     gpu_res->solutions_accepted++;
-                    const char* accepted_msg = gpu_res->is_stratum_mode() ? "SHARE ACCEPTED" : "BLOCK ACCEPTED";
+                    const char* msg = gpu_res->is_stratum_mode() ? "SHARE ACCEPTED" : "BLOCK ACCEPTED";
                     std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
-                              << "*** " << accepted_msg << "! ***" << Color::RESET 
-                      << " | Total: " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET << std::endl;
+                              << "*** " << msg << "! ***" << Color::RESET 
+                              << " | Total: " << Color::GREEN << gpu_res->solutions_accepted.load() 
+                              << Color::RESET << std::endl;
                 } else {
                     gpu_res->solutions_rejected++;
                 }
             } else {
                 gpu_res->solutions_rejected++;
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
-                          << "Solution submission timed out" << Color::RESET << std::endl;
+                          << "Submission timed out" << Color::RESET << std::endl;
             }
         }
     }
