@@ -121,7 +121,7 @@ const uint64_t ROUND_CONSTANTS_HOST[5][16] = {
     }
 };
 
-__device__ void generated_function(const uint64_t* __restrict__ input, uint64_t* __restrict__ output) {
+__device__ __forceinline__ void generated_function(const uint64_t* __restrict__ input, uint64_t* __restrict__ output) {
     uint64_t node_34 = input[0] + input[8];
     uint64_t node_38 = input[4] + input[12];
     uint64_t node_36 = input[2] + input[10];
@@ -400,12 +400,13 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
 __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     uint64_t lo[STATE_SIZE], hi[STATE_SIZE];
 
-    // Split each element into lo and hi 32-bit limbs
+    // Split each element into lo and hi 32-bit limbs using PTX
     #pragma unroll
     for (int i = 0; i < STATE_SIZE; i++) {
-        uint64_t b = state_in[i];
-        lo[i] = b & 0xFFFFFFFFUL;
-        hi[i] = b >> 32;
+        uint32_t lo32, hi32;
+        asm("mov.b64 {%0, %1}, %2;" : "=r"(lo32), "=r"(hi32) : "l"(state_in[i]));
+        lo[i] = lo32;
+        hi[i] = hi32;
     }
 
     // Process each limb with FFT-based generated_function
