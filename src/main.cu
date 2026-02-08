@@ -213,7 +213,14 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     std::cout << "Press Ctrl+C to stop\n" << std::endl;
     
     // Benchmark configuration
-    const int BENCHMARK_DURATION_SEC = 10;        // Total benchmark duration
+    int BENCHMARK_DURATION_SEC = 10;        // Total benchmark duration
+    if (const char* bench_env = std::getenv("XNT_BENCHMARK_SEC"); bench_env && bench_env[0] != '\0') {
+        int v = std::atoi(bench_env);
+        // Keep bounds sane so a typo doesn't run forever
+        if (v > 0 && v <= 600) {
+            BENCHMARK_DURATION_SEC = v;
+        }
+    }
     // Use GPU's optimal batch size for maximum performance
     // For RTX 5090 (256 SMs), this will be ~20M nonces, reducing kernel launch overhead
     uint64_t NONCES_PER_BATCH = gpu_res->optimal_max_nonces;

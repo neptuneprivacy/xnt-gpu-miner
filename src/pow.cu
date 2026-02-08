@@ -456,6 +456,84 @@ __device__ __forceinline__ void tip5_hash_varlen5_inplace(uint64_t* state, const
     tip5_permutation(state);
 }
 
+// ===== In-place helpers to avoid temporary Digest copies in the MAST chain =====
+
+// Fixed-length hash where LEFT input is already in state[0..4]:
+// state = Tip5::hash_pair(left=state[0..4], right)
+__device__ __forceinline__ void tip5_hash_fixed_left_state(uint64_t* state, const Digest& right) {
+    state[5] = right.values[0];
+    state[6] = right.values[1];
+    state[7] = right.values[2];
+    state[8] = right.values[3];
+    state[9] = right.values[4];
+
+    constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
+    state[10] = FIXED_LEN_VAL;
+    state[11] = FIXED_LEN_VAL;
+    state[12] = FIXED_LEN_VAL;
+    state[13] = FIXED_LEN_VAL;
+    state[14] = FIXED_LEN_VAL;
+    state[15] = FIXED_LEN_VAL;
+
+    tip5_permutation(state);
+}
+
+// Fixed-length hash where RIGHT input is already in state[0..4]:
+// state = Tip5::hash_pair(left, right=prev_state_digest)
+__device__ __forceinline__ void tip5_hash_fixed_right_state(uint64_t* state, const Digest& left) {
+    // Save current digest (right input)
+    uint64_t r0 = state[0];
+    uint64_t r1 = state[1];
+    uint64_t r2 = state[2];
+    uint64_t r3 = state[3];
+    uint64_t r4 = state[4];
+
+    // Load left digest into state[0..4]
+    state[0] = left.values[0];
+    state[1] = left.values[1];
+    state[2] = left.values[2];
+    state[3] = left.values[3];
+    state[4] = left.values[4];
+
+    // Move saved right digest into state[5..9]
+    state[5] = r0;
+    state[6] = r1;
+    state[7] = r2;
+    state[8] = r3;
+    state[9] = r4;
+
+    constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
+    state[10] = FIXED_LEN_VAL;
+    state[11] = FIXED_LEN_VAL;
+    state[12] = FIXED_LEN_VAL;
+    state[13] = FIXED_LEN_VAL;
+    state[14] = FIXED_LEN_VAL;
+    state[15] = FIXED_LEN_VAL;
+
+    tip5_permutation(state);
+}
+
+// Variable-length hash for 5 words where input is already in state[0..4]:
+// state = Tip5::hash_varlen([state[0..4]]) in VariableLength domain
+__device__ __forceinline__ void tip5_hash_varlen5_state(uint64_t* state) {
+    // Padding: state[5] = 1, state[6..9] = 0
+    state[5] = BFE_ONE;
+    state[6] = 0ULL;
+    state[7] = 0ULL;
+    state[8] = 0ULL;
+    state[9] = 0ULL;
+
+    // Capacity region (state[10..15]) = VariableLength domain (0)
+    state[10] = 0ULL;
+    state[11] = 0ULL;
+    state[12] = 0ULL;
+    state[13] = 0ULL;
+    state[14] = 0ULL;
+    state[15] = 0ULL;
+
+    tip5_permutation(state);
+}
+
 // Direct version - reads paths from global memory without building Pow struct
 // OPTIMIZED: Reuses single state array for all hash operations
 __device__ __noinline__ Digest fast_mast_hash_direct(
@@ -477,42 +555,30 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
     // OPTIMIZED MAST hash chain - reuse single state array
     uint64_t state[STATE_SIZE];
     
-    // Step 1: header_mast_hash = hash(pow_encoding_digest, pow[0])
+    // Keep the rolling digest in state[0..4] to avoid temporary Digest copies.
+    // Step 1: state = hash(pow_encoding_digest, pow[0])
     tip5_hash_fixed_inplace(state, pow_encoding_digest, mast_paths.pow[0]);
-    Digest header_mast_hash;
-    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
-    
-    // Step 2: header_mast_hash = hash(header_mast_hash, pow[1])
-    tip5_hash_fixed_inplace(state, header_mast_hash, mast_paths.pow[1]);
-    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
-    
-    // Step 3: header_mast_hash = hash(pow[2], header_mast_hash)
-    tip5_hash_fixed_inplace(state, mast_paths.pow[2], header_mast_hash);
-    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
-    
-    // Step 4: varlen_hash = tip5_hash_varlen_len5(header_mast_hash)
-    tip5_hash_varlen5_inplace(state, header_mast_hash);
-    Digest varlen_hash;
-    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
-    
-    // Step 5: kernel_mast_hash = hash(varlen_hash, header[0])
-    tip5_hash_fixed_inplace(state, varlen_hash, mast_paths.header[0]);
-    Digest kernel_mast_hash;
-    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
-    
-    // Step 6: kernel_mast_hash = hash(kernel_mast_hash, header[1])
-    tip5_hash_fixed_inplace(state, kernel_mast_hash, mast_paths.header[1]);
-    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
-    
-    // Step 7: varlen_hash = tip5_hash_varlen_len5(kernel_mast_hash)
-    tip5_hash_varlen5_inplace(state, kernel_mast_hash);
-    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
-    
-    // Step 8: final = hash(varlen_hash, kernel[0])
-    tip5_hash_fixed_inplace(state, varlen_hash, mast_paths.kernel[0]);
+    // Step 2: state = hash(state, pow[1])
+    tip5_hash_fixed_left_state(state, mast_paths.pow[1]);
+    // Step 3: state = hash(pow[2], state)
+    tip5_hash_fixed_right_state(state, mast_paths.pow[2]);
+    // Step 4: state = varlen_hash_len5(state)
+    tip5_hash_varlen5_state(state);
+    // Step 5: state = hash(state, header[0])
+    tip5_hash_fixed_left_state(state, mast_paths.header[0]);
+    // Step 6: state = hash(state, header[1])
+    tip5_hash_fixed_left_state(state, mast_paths.header[1]);
+    // Step 7: state = varlen_hash_len5(state)
+    tip5_hash_varlen5_state(state);
+    // Step 8: state = hash(state, kernel[0])
+    tip5_hash_fixed_left_state(state, mast_paths.kernel[0]);
     
     Digest result;
-    for (int i = 0; i < DIGEST_LEN; ++i) result.values[i] = state[i];
+    result.values[0] = state[0];
+    result.values[1] = state[1];
+    result.values[2] = state[2];
+    result.values[3] = state[3];
+    result.values[4] = state[4];
     return result;
 }
 
@@ -540,42 +606,30 @@ __device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
     // OPTIMIZED MAST hash chain - reuse single state array
     uint64_t state[STATE_SIZE];
     
-    // Step 1: header_mast_hash = hash(pow_encoding_digest, pow[0])
+    // Keep the rolling digest in state[0..4] to avoid temporary Digest copies.
+    // Step 1: state = hash(pow_encoding_digest, pow[0])
     tip5_hash_fixed_inplace(state, pow_encoding_digest, mast_paths.pow[0]);
-    Digest header_mast_hash;
-    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
-    
-    // Step 2: header_mast_hash = hash(header_mast_hash, pow[1])
-    tip5_hash_fixed_inplace(state, header_mast_hash, mast_paths.pow[1]);
-    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
-    
-    // Step 3: header_mast_hash = hash(pow[2], header_mast_hash)
-    tip5_hash_fixed_inplace(state, mast_paths.pow[2], header_mast_hash);
-    for (int i = 0; i < DIGEST_LEN; ++i) header_mast_hash.values[i] = state[i];
-    
-    // Step 4: varlen_hash = tip5_hash_varlen_len5(header_mast_hash)
-    tip5_hash_varlen5_inplace(state, header_mast_hash);
-    Digest varlen_hash;
-    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
-    
-    // Step 5: kernel_mast_hash = hash(varlen_hash, header[0])
-    tip5_hash_fixed_inplace(state, varlen_hash, mast_paths.header[0]);
-    Digest kernel_mast_hash;
-    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
-    
-    // Step 6: kernel_mast_hash = hash(kernel_mast_hash, header[1])
-    tip5_hash_fixed_inplace(state, kernel_mast_hash, mast_paths.header[1]);
-    for (int i = 0; i < DIGEST_LEN; ++i) kernel_mast_hash.values[i] = state[i];
-    
-    // Step 7: varlen_hash = tip5_hash_varlen_len5(kernel_mast_hash)
-    tip5_hash_varlen5_inplace(state, kernel_mast_hash);
-    for (int i = 0; i < DIGEST_LEN; ++i) varlen_hash.values[i] = state[i];
-    
-    // Step 8: final = hash(varlen_hash, kernel[0])
-    tip5_hash_fixed_inplace(state, varlen_hash, mast_paths.kernel[0]);
+    // Step 2: state = hash(state, pow[1])
+    tip5_hash_fixed_left_state(state, mast_paths.pow[1]);
+    // Step 3: state = hash(pow[2], state)
+    tip5_hash_fixed_right_state(state, mast_paths.pow[2]);
+    // Step 4: state = varlen_hash_len5(state)
+    tip5_hash_varlen5_state(state);
+    // Step 5: state = hash(state, header[0])
+    tip5_hash_fixed_left_state(state, mast_paths.header[0]);
+    // Step 6: state = hash(state, header[1])
+    tip5_hash_fixed_left_state(state, mast_paths.header[1]);
+    // Step 7: state = varlen_hash_len5(state)
+    tip5_hash_varlen5_state(state);
+    // Step 8: state = hash(state, kernel[0])
+    tip5_hash_fixed_left_state(state, mast_paths.kernel[0]);
     
     Digest result;
-    for (int i = 0; i < DIGEST_LEN; ++i) result.values[i] = state[i];
+    result.values[0] = state[0];
+    result.values[1] = state[1];
+    result.values[2] = state[2];
+    result.values[3] = state[3];
+    result.values[4] = state[4];
     return result;
 }
 
