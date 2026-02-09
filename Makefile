@@ -4,17 +4,19 @@
 NVCC = nvcc
 CXX = g++
 
-# CUDA architecture flags
-# RTX 5090 has compute capability 12.0 (Blackwell) = sm_100
-# Options: 
-#   -arch=sm_100 (Blackwell/RTX 5090 - optimal)
-#   -arch=sm_90  (Ada/Hopper - fallback compatibility)
-#   -arch=native (auto-detect)
-# Usage: make ARCH=sm_90 or make ARCH=sm_100
+# CUDA architecture: default = both RTX 4090 (sm_89) and RTX 5090 (sm_120).
+# Set ARCH for a single-GPU build (faster compile, smaller binary).
+#   sm_89  - Ada Lovelace (RTX 4090, 4080, 4070)
+#   sm_120 - Blackwell (RTX 5090)
+#   sm_90  - Hopper (H100, H200)
+#   sm_86  - Ampere (RTX 3080, 3090)  |  sm_80  - Ampere (RTX 3070)
+#   native - auto-detect from current GPU
+# Usage: make              # 4090 + 5090  |  make ARCH=sm_89  # 4090 only
 ifdef ARCH
     CUDA_ARCH = -arch=$(ARCH)
 else
-    CUDA_ARCH = -arch=sm_120  # Blackwell RTX 5090 (compute 12.0)
+    # One binary for both RTX 4090 and RTX 5090
+    CUDA_ARCH = -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120
 endif
 
 # Compiler flags
@@ -33,12 +35,15 @@ NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
                 --ptxas-options=-v \
                 --ptxas-options=-O3 \
                 -dc
-# Device link-time optimization (enables cross-TU inlining, better reg allocation)
-# Disable with DLTO=0 if build is too slow
+# Device link-time optimization (enables cross-TU inlining, better reg allocation).
+# Only valid with single -arch=... ; nvcc does not allow -dlto with -gencode (multi-arch).
+# Disable with DLTO=0 if build is too slow.
 DLTO ?= 1
+ifdef ARCH
 ifeq ($(DLTO),1)
     NVCC_FLAGS += -dlto
     NVCC_DC_FLAGS += -dlto
+endif
 endif
 # Register limit: 255 gives best perf on Blackwell (override with MAX_REG_COUNT=<n>)
 MAX_REG_COUNT ?= 255
@@ -83,18 +88,22 @@ modular: $(TARGET)
 
 # Object files for separable compilation
 OBJS = $(MODULAR_SRCS:.cu=.o)
+# Copy of .o files for link step so a parallel "make clean" cannot remove them during nvlink
+LINKOBJ_DIR = .linkobjs
+OBJS_FOR_LINK = $(addprefix $(CURDIR)/$(LINKOBJ_DIR)/, $(notdir $(OBJS)))
 # Device link object file
 DEVICE_LINK_OBJ = device_link.o
 
 $(TARGET): $(OBJS)
+	@mkdir -p $(LINKOBJ_DIR) && cp $(OBJS) $(LINKOBJ_DIR)/
 ifdef DLTO
 	# With device LTO, let nvcc perform device linking internally to avoid duplicate registration stubs
-	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(LIBS)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS_FOR_LINK) $(LIBS)
 else
 	# First, create device link object
-	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS)
+	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS_FOR_LINK)
 	# Then link everything together into final executable
-	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(DEVICE_LINK_OBJ) $(LIBS)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS_FOR_LINK) $(DEVICE_LINK_OBJ) $(LIBS)
 endif
 
 # Compile each .cu file to .o with device code
@@ -110,7 +119,8 @@ test_rpc_simple: test_rpc_simple.cpp
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET) test_rpc test_rpc_simple *.o src/*.o
+	rm -rf $(LINKOBJ_DIR)
+	rm -f $(TARGET) test_rpc test_rpc_simple *.o src/*.o $(DEVICE_LINK_OBJ)
 
 # Help
 help:
@@ -129,3 +139,9 @@ help:
 	@echo "  make clean && make    # Clean rebuild"
 	@echo "  make MAX_REG_COUNT=48 # Build with max 48 registers (higher occupancy)"
 	@echo "  make MAX_REG_COUNT=80 # Build with max 80 registers (if 64 causes spilling)"
+	@echo ""
+	@echo "CUDA architecture (default: 4090 + 5090; use ARCH= for single GPU):"
+	@echo "  make              # RTX 4090 and RTX 5090 (default)"
+	@echo "  make ARCH=sm_89   # RTX 4090 only"
+	@echo "  make ARCH=sm_120  # RTX 5090 only"
+	@echo "  make ARCH=sm_90   # Hopper  |  make ARCH=native  # Auto-detect"

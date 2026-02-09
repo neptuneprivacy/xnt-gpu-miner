@@ -1,13 +1,14 @@
 cmake_minimum_required(VERSION 3.18)
 
-# Must set CUDA architectures before project() to avoid CMake using default sm_52
-# Support modern GPUs (CUDA 13.0+):
-# Ampere (80, 86), Ada Lovelace (89), Hopper (90), Blackwell (120)
-set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120")
+# CUDA architectures: fat binary supports 4090 (89) and 5090 (120) by default.
+# Override: -DCMAKE_CUDA_ARCHITECTURES=89 (4090 only) or =89;120 (4090+5090 only).
+#  80,86 = Ampere | 89 = RTX 4090 | 90 = Hopper | 120 = RTX 5090
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120")
+endif()
 
-# For CUDA 13.0+, tell CMake to use a supported architecture for compiler identification
-# Also use gcc-12 as host compiler for better compatibility with glibc
-set(CMAKE_CUDA_FLAGS_INIT "-arch=sm_80 -ccbin=/usr/bin/g++-12")
+# Compiler identification arch (sm_89 = RTX 4090); gcc-12 for glibc compatibility
+set(CMAKE_CUDA_FLAGS_INIT "-arch=sm_89 -ccbin=/usr/bin/g++-12")
 set(CMAKE_CUDA_HOST_COMPILER "/usr/bin/g++-12")
 # Use matching C++ compiler to avoid ABI issues
 set(CMAKE_CXX_COMPILER "/usr/bin/g++-12")
@@ -36,11 +37,8 @@ if(NOT nlohmann_json_FOUND)
     endif()
 endif()
 
-# CUDA architecture detection
+# Default arch list (only if not set via -DCMAKE_CUDA_ARCHITECTURES=...)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Support modern GPUs (CUDA 13.0+):
-    # Ampere (80, 86), Ada Lovelace (89), Hopper (90), Blackwell (120)
-    # Note: Pascal (60), Volta (70), Turing (75) dropped in CUDA 13.0
     set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90 120)
 endif()
 
