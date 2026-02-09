@@ -228,10 +228,11 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     // Extract the original difficulty threshold from the puzzle
     Digest original_threshold = hex_to_digest(puzzle.threshold);
     
-    // Use a significantly easier target (100000x) for benchmark mode to ensure
-    // we find solutions quickly for validation testing. This allows us to verify
-    // that our validation logic matches the Rust node's behavior.
-    Digest test_target = make_target_easier(original_threshold, 100000ULL);
+    // Use a significantly easier target for benchmark mode to ensure we always
+    // find solutions for validation testing. 1M× gives ~20-30 solutions per
+    // 10-second run while keeping enough full batches for accurate sustained rate.
+    constexpr uint64_t BENCHMARK_EASY_FACTOR = 1000000ULL;  // 1 million
+    Digest test_target = make_target_easier(original_threshold, BENCHMARK_EASY_FACTOR);
     std::string test_target_hex = digest_to_hex(test_target);
     std::string original_threshold_hex = digest_to_hex(original_threshold);
     
@@ -257,8 +258,8 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     
     std::cout << "\n" << Color::BOLD << "Validation:" << Color::RESET << std::endl;
     std::cout << "  Original Threshold: " << original_threshold_hex << std::endl;
-    std::cout << "  Test Threshold:     " << test_target_hex << " (100000x easier for testing)" << std::endl;
-    std::cout << "  Validating against:  " << Color::YELLOW << "Test Threshold (100000x easier)" << Color::RESET << std::endl;
+    std::cout << "  Test Threshold:     " << test_target_hex << " (" << BENCHMARK_EASY_FACTOR << "x easier)" << std::endl;
+    std::cout << "  Validating against:  " << Color::YELLOW << "Test Threshold (" << BENCHMARK_EASY_FACTOR << "x easier)" << Color::RESET << std::endl;
     std::cout << "  Checking trailing zeros and threshold comparison" << std::endl;
     std::cout << std::endl;
     

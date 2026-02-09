@@ -124,40 +124,28 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
         template_obj = template_response["template"];
     }
     
-    {
-        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-        // For stratum mode, always process job notifications even if same ID
-        // (pool may resend same job, and we should restart mining)
-        // For solo mode, skip duplicates to avoid unnecessary restarts
-        bool is_duplicate = (puzzle.id == gpu_resources->current_proposal_id);
-        if (is_duplicate && mining_mode == MiningMode::Solo) {
-            return;  // Same puzzle in solo mode, skip
-        }
-        // In stratum mode, always update to restart mining (even if same ID)
-        gpu_resources->current_proposal_id = puzzle.id;
-        gpu_resources->current_template = template_obj;
-        Digest original_target = hex_to_digest(puzzle.threshold);
-        gpu_resources->current_real_target = original_target;
-        if (g_test_mode) {
-            gpu_resources->current_target = make_target_easier(original_target, 100000);
-            std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
-                      << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
-        } else {
-            gpu_resources->current_target = original_target;
-        }
-    }
-    
-    resetNonceCounter(gpu_resources, puzzle.id);
-    
     Digest prev_block = hex_to_digest(puzzle.prev_block);
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     Digest commitment = mast_paths.commit();
+    Digest original_target = hex_to_digest(puzzle.threshold);
+    Digest effective_target = g_test_mode ? make_target_easier(original_target, 100000) : original_target;
+    
+    // Check for duplicate (solo mode only)
+    {
+        std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+        bool is_duplicate = (puzzle.id == gpu_resources->current_proposal_id);
+        if (is_duplicate && mining_mode == MiningMode::Solo) {
+            return;
+        }
+    }
     
     // Check if we can reuse existing buffer (XNT uses commitment only)
     bool need_preprocess = true;
+    bool have_existing_buffer = false;
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
         if (gpu_resources->buffer && gpu_resources->buffer->is_valid()) {
+            have_existing_buffer = true;
             bool commitment_match = true;
             for (int i = 0; i < DIGEST_LEN; ++i) {
                 if (gpu_resources->cached_commitment.values[i] != commitment.values[i]) {
@@ -189,26 +177,115 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
     }
     
     if (need_preprocess) {
-        auto preprocess_start = std::chrono::steady_clock::now();
-        
-        if (!preprocessPuzzle(puzzle, gpu_resources)) {
-            std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
-            return;
+        if (have_existing_buffer) {
+            // ---- P2.7: Async preprocessing ----
+            // We have a valid old buffer — launch preprocessing in background and
+            // continue mining the OLD puzzle. The mining loop will swap buffers when done.
+            
+            // Wait for any prior async preprocessing to finish first
+            if (gpu_resources->async_preprocess_thread.joinable()) {
+                gpu_resources->async_preprocess_thread.join();
+            }
+            gpu_resources->async_preprocess_done = false;
+            gpu_resources->async_preprocess_running = true;
+            
+            // Store new puzzle metadata (will be applied on buffer swap)
+            {
+                std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+                gpu_resources->pending_proposal_id = puzzle.id;
+                gpu_resources->pending_template = template_obj;
+                gpu_resources->pending_target = effective_target;
+                gpu_resources->pending_real_target = original_target;
+                gpu_resources->pending_prev_block = prev_block;
+                gpu_resources->pending_mast_paths = mast_paths;
+                gpu_resources->pending_commitment = commitment;
+            }
+            
+            // Launch background preprocessing thread
+            int bg_gpu_id = gpu_id;
+            int bg_consensus = puzzle.consensus_rule_set;
+            gpu_resources->async_preprocess_thread = std::thread(
+                [this, bg_gpu_id, mast_paths, prev_block, bg_consensus]() {
+                    cudaError_t err = cudaSetDevice(bg_gpu_id);
+                    if (err != cudaSuccess) {
+                        LOG_ERROR("cudaSetDevice in async preprocess", err);
+                        gpu_resources->async_preprocess_running = false;
+                        return;
+                    }
+                    
+                    auto start = std::chrono::steady_clock::now();
+                    auto new_buffer = Pow::preprocess(mast_paths, prev_block, bg_consensus, nullptr);
+                    auto end = std::chrono::steady_clock::now();
+                    double elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() / 1000.0;
+                    
+                    if (new_buffer.is_valid()) {
+                        gpu_resources->pending_buffer = std::make_unique<GuesserBuffer>(std::move(new_buffer));
+                        gpu_resources->async_preprocess_done = true;
+                        std::cout << "[GPU " << bg_gpu_id << "] " << Color::GREEN 
+                                  << "Async preprocessing complete" << Color::RESET 
+                                  << " (" << std::fixed << std::setprecision(2) << elapsed_s << "s, mining continued)" << std::endl;
+                    } else {
+                        std::cout << "[GPU " << bg_gpu_id << "] " << Color::RED 
+                                  << "Async preprocessing failed" << Color::RESET << std::endl;
+                    }
+                    gpu_resources->async_preprocess_running = false;
+                }
+            );
+            
+            std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+                      << "Async preprocessing started (mining continues with old buffer)" << Color::RESET << std::endl;
+            
+            // DON'T update current_* metadata yet — keep mining old puzzle.
+            // The mining loop will apply pending metadata on buffer swap.
+            // But we DO need to resume the mining loop, so fall through to it.
+        } else {
+            // No existing buffer (first puzzle) — must block on preprocessing
+            {
+                std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+                gpu_resources->current_proposal_id = puzzle.id;
+                gpu_resources->current_template = template_obj;
+                gpu_resources->current_target = effective_target;
+                gpu_resources->current_real_target = original_target;
+            }
+            
+            if (g_test_mode) {
+                std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+                          << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
+            }
+            
+            resetNonceCounter(gpu_resources, puzzle.id);
+            
+            auto preprocess_start = std::chrono::steady_clock::now();
+            
+            if (!preprocessPuzzle(puzzle, gpu_resources)) {
+                std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
+                return;
+            }
+            
+            auto preprocess_end = std::chrono::steady_clock::now();
+            auto preprocess_duration = std::chrono::duration_cast<std::chrono::milliseconds>(preprocess_end - preprocess_start).count();
+            double preprocess_seconds = preprocess_duration / 1000.0;
+            
+            std::cout << "[GPU " << gpu_id << "] " << Color::GREEN << "Finished preprocessing" << Color::RESET 
+                      << " (" << std::fixed << std::setprecision(2) << preprocess_seconds << "s)" << std::endl;
+            
+            {
+                std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
+                gpu_resources->cached_prev_block = prev_block;
+                gpu_resources->cached_mast_paths = mast_paths;
+                gpu_resources->cached_commitment = commitment;
+            }
         }
-        
-        auto preprocess_end = std::chrono::steady_clock::now();
-        auto preprocess_duration = std::chrono::duration_cast<std::chrono::milliseconds>(preprocess_end - preprocess_start).count();
-        double preprocess_seconds = preprocess_duration / 1000.0;
-        
-        std::cout << "[GPU " << gpu_id << "] " << Color::GREEN << "Finished preprocessing" << Color::RESET 
-                  << " (" << std::fixed << std::setprecision(2) << preprocess_seconds << "s)" << std::endl;
-        
+    } else {
+        // Buffer reused — update current metadata to new puzzle
         {
             std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
-            gpu_resources->cached_prev_block = prev_block;
-            gpu_resources->cached_mast_paths = mast_paths;
-            gpu_resources->cached_commitment = commitment;
+            gpu_resources->current_proposal_id = puzzle.id;
+            gpu_resources->current_template = template_obj;
+            gpu_resources->current_target = effective_target;
+            gpu_resources->current_real_target = original_target;
         }
+        resetNonceCounter(gpu_resources, puzzle.id);
     }
     
     gpu_resources->update_job_received();
@@ -381,6 +458,14 @@ void MultiGpuManager::stopAll() {
     ConnectionMultiplexer::destroyInstance();
     
     for (auto& res : gpu_resources) {
+        // Join async preprocessing thread before cleaning up buffers
+        if (res->async_preprocess_thread.joinable()) {
+            res->async_preprocess_thread.join();
+        }
+        if (res->pending_buffer) {
+            res->pending_buffer->cleanup();
+            res->pending_buffer.reset();
+        }
         if (res->buffer) {
             res->buffer->cleanup();
             res->buffer.reset();
@@ -487,6 +572,43 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 }
             }
             break;
+        }
+        
+        // ---- P2.7: Check if async preprocessing completed → swap buffers ----
+        if (gpu_res->async_preprocess_done.load(std::memory_order_acquire)) {
+            // Drain in-flight mining batches before swapping (they reference old buffer)
+            for (int i = 0; i < 2; i++) {
+                if (batch_info[i].pending_result) {
+                    cudaStreamSynchronize(miner.slots[i].stream);
+                    // Count nonces from the batch we're draining
+                    gpu_res->total_nonces_tested.fetch_add(batch_info[i].batch_size);
+                    batch_info[i].pending_result = false;
+                    miner.slots[i].kernel_launched = false;
+                }
+            }
+            batches_in_flight = 0;
+            
+            // Swap buffer and apply pending puzzle metadata
+            gpu_res->buffer = std::move(gpu_res->pending_buffer);
+            {
+                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                gpu_res->current_proposal_id = gpu_res->pending_proposal_id;
+                gpu_res->current_template = gpu_res->pending_template;
+                gpu_res->current_target = gpu_res->pending_target;
+                gpu_res->current_real_target = gpu_res->pending_real_target;
+                gpu_res->cached_prev_block = gpu_res->pending_prev_block;
+                gpu_res->cached_mast_paths = gpu_res->pending_mast_paths;
+                gpu_res->cached_commitment = gpu_res->pending_commitment;
+            }
+            
+            // Reset nonce counter for new puzzle and force re-init of GPU constants
+            resetNonceCounter(gpu_res, gpu_res->pending_proposal_id);
+            gpu_res->buffer->gpu_range_initialized = false;
+            
+            gpu_res->async_preprocess_done.store(false, std::memory_order_release);
+            
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD
+                      << "Buffer swapped — now mining new template" << Color::RESET << std::endl;
         }
         
         if (gpu_res->gpu_pause_flag) {
@@ -788,6 +910,27 @@ bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
         if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
             break;
+        }
+        
+        // ---- P2.7: Check if async preprocessing completed → swap buffers (sync loop) ----
+        if (gpu_res->async_preprocess_done.load(std::memory_order_acquire)) {
+            gpu_res->buffer = std::move(gpu_res->pending_buffer);
+            {
+                std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
+                gpu_res->current_proposal_id = gpu_res->pending_proposal_id;
+                gpu_res->current_template = gpu_res->pending_template;
+                gpu_res->current_target = gpu_res->pending_target;
+                gpu_res->current_real_target = gpu_res->pending_real_target;
+                gpu_res->cached_prev_block = gpu_res->pending_prev_block;
+                gpu_res->cached_mast_paths = gpu_res->pending_mast_paths;
+                gpu_res->cached_commitment = gpu_res->pending_commitment;
+            }
+            resetNonceCounter(gpu_res, gpu_res->pending_proposal_id);
+            gpu_res->buffer->gpu_range_initialized = false;
+            gpu_res->async_preprocess_done.store(false, std::memory_order_release);
+            
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD
+                      << "Buffer swapped — now mining new template" << Color::RESET << std::endl;
         }
         
         if (gpu_res->gpu_pause_flag) {

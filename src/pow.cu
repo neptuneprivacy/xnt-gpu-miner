@@ -849,19 +849,25 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     
     LOG_DEBUG("preprocess_high_vram: allocated " << (leafs_size / (1024*1024)) << " MB for leafs");
     
-    size_t internal_size = (MERKLE_NUM_LEAFS - 1) * sizeof(Digest);
-    alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
-    if (alloc_err != cudaSuccess) {
-        LOG_ERROR("cudaMalloc internal_nodes", alloc_err);
-        cudaFree(buffer.d_leafs);
-        buffer.d_leafs = nullptr;
-        return GuesserBuffer();
-    }
-    buffer.tree_size = MERKLE_NUM_LEAFS - 1;
-    
-    LOG_DEBUG("preprocess_high_vram: allocated " << (internal_size / (1024*1024)) << " MB for internal nodes");
+    // NOTE: d_merkle_tree allocation is deferred until after the temp buffer is freed.
+    // This reduces peak GPU memory by ~5 GB, allowing async preprocessing (P2.7) to
+    // run concurrently with mining on the same 24 GB GPU:
+    //   Peak with deferred alloc: old_buffer(10.7GB) + new_leafs(5.4GB) + temp(5.4GB) = 21.5 GB
+    //   Peak without deferral:    old_buffer(10.7GB) + new_leafs(5.4GB) + temp(5.4GB) + new_tree(5.4GB) = 26.9 GB
     
     if (cancel_flag && *cancel_flag) {
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    // Use a dedicated stream for all preprocessing kernels.
+    // Kernels on the same stream execute in-order, so we only need one sync at the end.
+    // This eliminates ~33 cudaDeviceSynchronize() calls (full-device barriers) and lets
+    // the driver pipeline kernel launches more efficiently.
+    cudaStream_t pp_stream;
+    cudaError_t stream_err = cudaStreamCreate(&pp_stream);
+    if (stream_err != cudaSuccess) {
+        LOG_ERROR("cudaStreamCreate (preprocess)", stream_err);
         buffer.cleanup();
         return GuesserBuffer();
     }
@@ -869,31 +875,17 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     int threadsPerBlock = 256;
     int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
     
-    compute_buds_kernel<<<numBlocks, threadsPerBlock>>>(
+    // Step 1: Compute buds
+    compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         buffer.d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
     
-    cudaError_t sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        LOG_ERROR("compute_buds_kernel sync", sync_err);
-        buffer.cleanup();
-        return GuesserBuffer();
-    }
-    
-    LOG_DEBUG("preprocess_high_vram: buds computed");
-    
-    // Check for cancellation
-    if (cancel_flag && *cancel_flag) {
-        buffer.cleanup();
-        return GuesserBuffer();
-    }
-    
-    // Convert buds to leafs through NUM_BUD_LAYERS iterations
-    // Match Rust: output size stays NUM_LEAFS every layer
+    // Step 2: Convert buds → leafs through NUM_BUD_LAYERS iterations
     size_t temp_buffer_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
     cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, temp_buffer_size);
     if (temp_alloc_err != cudaSuccess) {
         LOG_ERROR("cudaMalloc temp_leafs", temp_alloc_err);
+        cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
@@ -902,81 +894,89 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     Digest* current_leafs = d_temp_leafs;
     
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
-        if (cancel_flag && *cancel_flag) {
-            cudaFree(d_temp_leafs);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
-        // Each layer outputs MERKLE_NUM_LEAFS elements
         int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
-        
-        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
+        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
-        
-        sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess) {
-            LOG_ERROR("compute_leafs_from_buds_kernel sync", sync_err);
-            cudaFree(d_temp_leafs);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
-        // Swap for next iteration
         std::swap(current_buds, current_leafs);
     }
     
-    // After NUM_BUD_LAYERS iterations, final leafs are in current_buds
-    // Copy them to buffer.d_leafs if needed
+    // Copy final leafs to buffer.d_leafs if needed (async on same stream)
     if (current_buds != buffer.d_leafs) {
-        cudaMemcpy(buffer.d_leafs, current_buds, temp_buffer_size,
-                   cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(buffer.d_leafs, current_buds, temp_buffer_size,
+                        cudaMemcpyDeviceToDevice, pp_stream);
     }
     
+    // Sync bud+leaf phase, then free temp buffer BEFORE allocating merkle tree.
+    // This keeps peak memory within ~21.5 GB (fits 24 GB alongside old mining buffer).
+    cudaError_t leaf_sync = cudaStreamSynchronize(pp_stream);
     cudaFree(d_temp_leafs);
-    LOG_DEBUG("preprocess_high_vram: buds converted to leafs");
+    d_temp_leafs = nullptr;
     
-    // Check for cancellation
-    if (cancel_flag && *cancel_flag) {
+    if (leaf_sync != cudaSuccess) {
+        LOG_ERROR("preprocessing leaf sync", leaf_sync);
+        cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
     
-    // For CONSENSUS_XNT (mainnet blocks >= 15256), no bit-reverse swap is needed
-    // Bit-reverse swap is only for HardforkAlpha, which we no longer use
-    LOG_DEBUG("preprocess_high_vram: using XNT consensus (no bit-reverse swap)");
+    if (cancel_flag && *cancel_flag) {
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
     
+    LOG_DEBUG("preprocess_high_vram: bud+leaf phase complete, allocating merkle tree");
+    
+    // Now allocate d_merkle_tree (temp buffer is freed, so we have room)
+    size_t internal_size = (MERKLE_NUM_LEAFS - 1) * sizeof(Digest);
+    alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc internal_nodes", alloc_err);
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    buffer.tree_size = MERKLE_NUM_LEAFS - 1;
+    
+    LOG_DEBUG("preprocess_high_vram: allocated " << (internal_size / (1024*1024)) << " MB for internal nodes");
+    
+    // Step 3: Build Merkle tree layer-by-layer (all on same stream)
     size_t current_count = MERKLE_NUM_LEAFS;
     const Digest* current_layer = buffer.d_leafs;
     size_t write_offset = 0;
     
     for (size_t layer = 0; layer < MERKLE_TREE_HEIGHT_; ++layer) {
-        if (cancel_flag && *cancel_flag) {
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
         size_t parent_count = current_count / 2;
         Digest* parent_layer = buffer.d_merkle_tree + write_offset;
         
         int layerBlocks = (parent_count + threadsPerBlock - 1) / threadsPerBlock;
-        merkle_zip_kernel<<<layerBlocks, threadsPerBlock>>>(
+        merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             parent_layer, current_layer, parent_count);
-        
-        sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess) {
-            LOG_ERROR("merkle_zip_kernel sync", sync_err);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
         
         current_layer = parent_layer;
         write_offset += parent_count;
         current_count = parent_count;
     }
     
+    // Single sync: wait for Merkle tree build to complete
+    cudaError_t sync_err = cudaStreamSynchronize(pp_stream);
+    cudaStreamDestroy(pp_stream);
+    
+    if (sync_err != cudaSuccess) {
+        LOG_ERROR("preprocessing stream sync", sync_err);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    // Check for cancellation after sync
+    if (cancel_flag && *cancel_flag) {
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
     LOG_DEBUG("preprocess_high_vram: Merkle tree built");
     
+    // Copy root to host (tree is complete now)
     cudaMemcpy(&buffer.merkle_root, buffer.d_merkle_tree + buffer.tree_size - 1,
                sizeof(Digest), cudaMemcpyDeviceToHost);
     

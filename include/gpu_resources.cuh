@@ -187,6 +187,24 @@ struct GpuResources {
     Digest cached_commitment;  // Track last preprocessed commitment (XNT)
     PowMastPaths cached_mast_paths;  // Track MAST paths used for preprocessing
     
+    // ---- P2.7: Async preprocessing (overlap with mining) ----
+    // When a new puzzle arrives with different commitment, preprocessing runs
+    // on a background thread while mining continues with the old buffer.
+    // When preprocessing completes, the mining loop swaps buffers atomically.
+    std::unique_ptr<GuesserBuffer> pending_buffer;     // New buffer being preprocessed
+    std::atomic<bool> async_preprocess_running{false};  // Background thread active
+    std::atomic<bool> async_preprocess_done{false};     // Buffer ready to swap
+    std::thread async_preprocess_thread;
+    
+    // Pending puzzle metadata (applied when async preprocessing completes)
+    std::string pending_proposal_id;
+    json pending_template;
+    Digest pending_target;
+    Digest pending_real_target;
+    Digest pending_prev_block;
+    PowMastPaths pending_mast_paths;
+    Digest pending_commitment;
+    
     std::atomic<uint64_t> gpu_puzzle_random_start{0};
     std::atomic<uint64_t> gpu_puzzle_nonce_counter{0};
     
@@ -217,7 +235,13 @@ struct GpuResources {
         return mining_mode == MiningMode::Stratum;
     }
     
-    ~GpuResources() = default;
+    ~GpuResources() {
+        // Join async preprocessing thread if running
+        if (async_preprocess_thread.joinable()) {
+            async_preprocess_thread.join();
+        }
+        pending_buffer.reset();
+    }
     
     GpuResources(const GpuResources&) = delete;
     GpuResources& operator=(const GpuResources&) = delete;
