@@ -11,10 +11,9 @@ __constant__ uint64_t d_gpu_range_start;
 __constant__ uint64_t d_gpu_range_size;
 
 // ===== TOP MERKLE TREE CACHE =====
-// Cache top 8 levels of Merkle tree in constant memory for fast access
-// Top 8 levels = 2^8 - 1 = 255 nodes = 255 * 40 bytes = 10,200 bytes
-// These nodes are accessed by ALL threads, so caching eliminates global memory reads
-// Constants TOP_TREE_CACHE_LEVELS and TOP_TREE_CACHE_SIZE defined in kernels.cuh
+// Cache top internal nodes of Merkle tree in constant memory for fast access.
+// These nodes are accessed by ALL threads, so caching eliminates global memory reads.
+// TOP_TREE_CACHE_SIZE (defined in kernels.cuh) is sized to fill available constant memory.
 // Store as raw uint64_t since Digest has constructor (not allowed in __constant__)
 __constant__ uint64_t d_top_tree_cache[TOP_TREE_CACHE_SIZE * DIGEST_LEN];
 
@@ -225,29 +224,17 @@ bool GuesserBuffer::reset_output_buffers() {
 bool initialize_top_tree_cache(const Digest* d_merkle_tree, size_t num_leafs) {
     if (g_top_tree_cache_initialized) return true;
     
-    // Top tree cache stores the highest (smallest index) internal nodes
-    // In our tree layout, the root is at index (num_leafs - 2)
-    // We want to cache the top 8 levels = 255 nodes near the root
-    // 
-    // Tree indices (for num_leafs = 2^27):
-    // Root is at index num_leafs - 2 = 134217726
-    // Its children are at indices that hash to it
-    //
-    // Actually, we need to understand the tree layout:
-    // The tree is stored with internal nodes indexed 0 to num_leafs-2
-    // Index 0 is the first internal node (parent of leaves 0 and 1)
-    // Root is at index num_leafs - 2
-    //
-    // For path computation, sibling_index starts large and gets smaller
-    // At top levels (near root), sibling_index < 256 (for top 8 levels)
-    //
-    // So we cache indices 0 to TOP_TREE_CACHE_SIZE-1
-    // Copy as raw uint64_t (same memory layout as Digest array)
+    // Cache the first TOP_TREE_CACHE_SIZE internal nodes (smallest indices)
+    // in constant memory. These correspond to the top levels of the tree
+    // and are accessed by all threads for upper Merkle path levels.
+    // The tree has num_leafs-1 internal nodes; we cache the first 1614.
+    size_t nodes_to_cache = (num_leafs - 1 < TOP_TREE_CACHE_SIZE) 
+        ? (num_leafs - 1) : TOP_TREE_CACHE_SIZE;
     
     cudaError_t err = cudaMemcpyToSymbol(
         d_top_tree_cache, 
-        d_merkle_tree,  // First TOP_TREE_CACHE_SIZE nodes (as raw bytes)
-        TOP_TREE_CACHE_SIZE * DIGEST_LEN * sizeof(uint64_t),
+        d_merkle_tree,
+        nodes_to_cache * DIGEST_LEN * sizeof(uint64_t),
         0,
         cudaMemcpyDeviceToDevice);
     
@@ -556,19 +543,23 @@ void calculate_mining_launch_config(
     //                                     parallel_mining_kernel_high_vram, 0, 0);
     
     // Use multiple of SM count for good occupancy
-    // Architecture-specific tuning based on compute capability
+    // Architecture-specific grid sizing based on compute capability
     // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
     int num_sms = prop.multiProcessorCount;
     int blocks_per_sm;
     if (prop.major >= 10) {
         // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
-        blocks_per_sm = 128;  // High value for maximum parallel blocks (capped by grid limits)
+        blocks_per_sm = 128;
     } else if (prop.major == 9) {
-        // Hopper architecture - use 6 blocks per SM
+        // Hopper architecture
         blocks_per_sm = 6;
+    } else if (prop.major == 8 && prop.minor == 9) {
+        // Ada Lovelace (RTX 4090) - 1 active block/SM due to register pressure,
+        // 4x multiplier for good wave distribution across 128 SMs
+        blocks_per_sm = 4;
     } else {
-        // Ampere/Ada - use default
-        blocks_per_sm = 8;  // Increased from 4 to 8 for better performance
+        // Ampere and others
+        blocks_per_sm = 4;
     }
     int max_blocks = num_sms * blocks_per_sm;
     
@@ -585,17 +576,20 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaGetDeviceProperties(&prop, gpu_id);
     
     // Base batch size scaled by SM count and architecture
-    // RTX 5090 (SM 120) has 192 SMs, ~21K CUDA cores
+    // Target ~800-900ms kernel duration for good responsiveness
     uint64_t optimal;
     
     if (prop.major >= 10) {
-        // Blackwell (RTX 5090) - larger batches for high SM count
-        optimal = 80000000ULL; // 80M nonces for maximum GPU utilization
+        // Blackwell (RTX 5090) - 192 SMs, larger batches
+        optimal = 80000000ULL;
     } else if (prop.major == 9) {
         // Hopper - medium batch
         optimal = 40000000ULL;
+    } else if (prop.major == 8 && prop.minor == 9) {
+        // Ada Lovelace (RTX 4090) - 128 SMs, ~800ms target
+        optimal = 16777216ULL; // 16M = 2^24
     } else {
-        // Ampere/Ada - default
+        // Ampere and others
         optimal = 30000000ULL;
     }
     
@@ -702,6 +696,16 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
+    
+    // One-time setup: maximize L1 cache for mining kernels (minimal shared memory used)
+    static bool cache_config_set = false;
+    if (!cache_config_set) {
+        cudaFuncSetAttribute(parallel_mining_kernel_high_vram,
+            cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+        cudaFuncSetAttribute(parallel_mining_kernel_low_vram,
+            cudaFuncAttributePreferredSharedMemoryCarveout, 0);
+        cache_config_set = true;
+    }
     
     switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:

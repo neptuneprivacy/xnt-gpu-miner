@@ -45,8 +45,8 @@ ifeq ($(DLTO),1)
     NVCC_DC_FLAGS += -dlto
 endif
 endif
-# Register limit: 255 gives best perf on Blackwell (override with MAX_REG_COUNT=<n>)
-MAX_REG_COUNT ?= 255
+# Register limit: let __launch_bounds__ control per-kernel register allocation.
+# Override globally with MAX_REG_COUNT=<n> on the command line if needed.
 ifdef MAX_REG_COUNT
     NVCC_FLAGS += -maxrregcount=$(MAX_REG_COUNT)
     NVCC_DC_FLAGS += -maxrregcount=$(MAX_REG_COUNT)

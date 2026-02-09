@@ -206,8 +206,8 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         return;
     }
     
-    // Set optimal batch size from global config (default 64M nonces)
-    gpu_res->optimal_max_nonces = g_batch_size;
+    // Batch size: use global override if set, otherwise auto-detect for this GPU
+    gpu_res->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(device_id);
     
     std::cout << "\n" << Color::BOLD << "Starting benchmark..." << Color::RESET << std::endl;
     std::cout << "Press Ctrl+C to stop\n" << std::endl;
