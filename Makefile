@@ -78,7 +78,7 @@ MODULAR_SRCS = src/common.cu \
                src/mining.cu \
                src/main.cu
 
-.PHONY: all clean modular test-rpc help
+.PHONY: all clean modular test-rpc help rebuild
 
 # Default: build from modular sources
 all: modular
@@ -86,24 +86,19 @@ all: modular
 # Build from modular sources
 modular: $(TARGET)
 
+# Clean rebuild (safe alternative to "make clean & make" which races)
+rebuild: clean all
+
 # Object files for separable compilation
 OBJS = $(MODULAR_SRCS:.cu=.o)
-# Copy of .o files for link step so a parallel "make clean" cannot remove them during nvlink
-LINKOBJ_DIR = .linkobjs
-OBJS_FOR_LINK = $(addprefix $(CURDIR)/$(LINKOBJ_DIR)/, $(notdir $(OBJS)))
-# Device link object file
 DEVICE_LINK_OBJ = device_link.o
 
 $(TARGET): $(OBJS)
-	@mkdir -p $(LINKOBJ_DIR) && cp $(OBJS) $(LINKOBJ_DIR)/
 ifdef DLTO
-	# With device LTO, let nvcc perform device linking internally to avoid duplicate registration stubs
-	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS_FOR_LINK) $(LIBS)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(LIBS)
 else
-	# First, create device link object
-	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS_FOR_LINK)
-	# Then link everything together into final executable
-	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS_FOR_LINK) $(DEVICE_LINK_OBJ) $(LIBS)
+	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(DEVICE_LINK_OBJ) $(LIBS)
 endif
 
 # Compile each .cu file to .o with device code
@@ -117,9 +112,8 @@ test-rpc: test_rpc_simple
 test_rpc_simple: test_rpc_simple.cpp
 	$(CXX) $(CXX_FLAGS) -I./include -o $@ $<
 
-# Clean build artifacts
+# Clean build artifacts. Use "make rebuild" or "make clean && make" — NEVER "make clean & make"
 clean:
-	rm -rf $(LINKOBJ_DIR)
 	rm -f $(TARGET) test_rpc test_rpc_simple *.o src/*.o $(DEVICE_LINK_OBJ)
 
 # Help
@@ -129,14 +123,15 @@ help:
 	@echo "Targets:"
 	@echo "  all        - Build from modular sources (default)"
 	@echo "  modular    - Build from modular src/ files"
+	@echo "  rebuild    - Clean + build (safe, sequential)"
 	@echo "  clean      - Remove build artifacts"
 	@echo "  help       - Show this help"
 	@echo ""
 	@echo ""
 	@echo "Examples:"
-	@echo "  make                  # Release build"
-	@echo "  make DEBUG=1          # Debug build"
-	@echo "  make clean && make    # Clean rebuild"
+	@echo "  make                          # Release build"
+	@echo "  make rebuild ARCH=sm_89       # Clean rebuild for 4090"
+	@echo "  make clean && make ARCH=sm_89 # Same (sequential)"
 	@echo "  make MAX_REG_COUNT=48 # Build with max 48 registers (higher occupancy)"
 	@echo "  make MAX_REG_COUNT=80 # Build with max 80 registers (if 64 causes spilling)"
 	@echo ""

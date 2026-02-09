@@ -707,6 +707,30 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         cache_config_set = true;
     }
     
+    // P0.3: L2 persistence hints — tell the GPU to keep d_leafs cache lines in L2
+    // longer. On RTX 4090 (72 MB L2), this covers ~1.8M digests and helps when
+    // multiple warps read nearby leaf indices.
+    if (!buffer.l2_persist_set && buffer.d_leafs != nullptr) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, gpu_id);
+        if (prop.persistingL2CacheMaxSize > 0) {
+            // Reserve up to half of L2 for persisting lines
+            size_t persist_size = prop.persistingL2CacheMaxSize;
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size);
+            
+            // Set access policy window on the mining stream for d_leafs
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.base_ptr = buffer.d_leafs;
+            attr.accessPolicyWindow.num_bytes = buffer.num_leafs * sizeof(Digest);
+            attr.accessPolicyWindow.hitRatio = 1.0f;  // try to persist all accessed lines
+            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(buffer.mining_stream,
+                cudaStreamAttributeAccessPolicyWindow, &attr);
+        }
+        buffer.l2_persist_set = true;
+    }
+    
     switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(

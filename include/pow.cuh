@@ -53,6 +53,8 @@ public:
     
     // GPU range initialization (only need to set once per GPU)
     bool gpu_range_initialized;
+    // L2 persistence hint set for d_leafs (P0.3 optimization)
+    bool l2_persist_set;
     
     GuesserBuffer() 
         : merkle_root()
@@ -74,7 +76,8 @@ public:
         , d_solution_nonce_digest(nullptr)
         , d_solution_final_hash(nullptr)
         , output_buffers_allocated(false)
-        , gpu_range_initialized(false) {}
+        , gpu_range_initialized(false)
+        , l2_persist_set(false) {}
     
     ~GuesserBuffer() { cleanup(); }
     
@@ -133,7 +136,9 @@ public:
         , d_solution_path_b(other.d_solution_path_b)
         , d_solution_nonce_digest(other.d_solution_nonce_digest)
         , d_solution_final_hash(other.d_solution_final_hash)
-        , output_buffers_allocated(other.output_buffers_allocated) {
+        , output_buffers_allocated(other.output_buffers_allocated)
+        , gpu_range_initialized(other.gpu_range_initialized)
+        , l2_persist_set(other.l2_persist_set) {
         other.d_merkle_tree = nullptr;
         other.tree_size = 0;
         other.d_leafs = nullptr;
@@ -147,6 +152,8 @@ public:
         other.d_solution_nonce_digest = nullptr;
         other.d_solution_final_hash = nullptr;
         other.output_buffers_allocated = false;
+        other.gpu_range_initialized = false;
+        other.l2_persist_set = false;
     }
     
     GuesserBuffer& operator=(GuesserBuffer&& other) noexcept {
@@ -171,6 +178,8 @@ public:
             d_solution_nonce_digest = other.d_solution_nonce_digest;
             d_solution_final_hash = other.d_solution_final_hash;
             output_buffers_allocated = other.output_buffers_allocated;
+            gpu_range_initialized = other.gpu_range_initialized;
+            l2_persist_set = other.l2_persist_set;
             other.d_merkle_tree = nullptr;
             other.tree_size = 0;
             other.d_leafs = nullptr;
