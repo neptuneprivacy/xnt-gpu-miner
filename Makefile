@@ -83,18 +83,18 @@ modular: $(TARGET)
 
 # Object files for separable compilation
 OBJS = $(MODULAR_SRCS:.cu=.o)
-# Device link object file
+# Copy .o into .linkobjs for link step so nvlink gets stable paths (and avoid race with "make clean & make")
+LINKOBJ_DIR = .linkobjs
+OBJS_FOR_LINK = $(addprefix $(CURDIR)/$(LINKOBJ_DIR)/, $(notdir $(OBJS)))
 DEVICE_LINK_OBJ = device_link.o
 
 $(TARGET): $(OBJS)
+	@mkdir -p $(LINKOBJ_DIR) && cp $(OBJS) $(LINKOBJ_DIR)/
 ifdef DLTO
-	# With device LTO, let nvcc perform device linking internally to avoid duplicate registration stubs
-	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(LIBS)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS_FOR_LINK) $(LIBS)
 else
-	# First, create device link object
-	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS)
-	# Then link everything together into final executable
-	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(DEVICE_LINK_OBJ) $(LIBS)
+	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS_FOR_LINK)
+	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS_FOR_LINK) $(DEVICE_LINK_OBJ) $(LIBS)
 endif
 
 # Compile each .cu file to .o with device code
@@ -108,9 +108,10 @@ test-rpc: test_rpc_simple
 test_rpc_simple: test_rpc_simple.cpp
 	$(CXX) $(CXX_FLAGS) -I./include -o $@ $<
 
-# Clean build artifacts
+# Clean build artifacts. Use "make clean && make" — do not run clean and make in parallel.
 clean:
-	rm -f $(TARGET) test_rpc test_rpc_simple *.o src/*.o
+	rm -rf $(LINKOBJ_DIR)
+	rm -f $(TARGET) test_rpc test_rpc_simple *.o src/*.o $(DEVICE_LINK_OBJ)
 
 # Help
 help:
@@ -126,6 +127,6 @@ help:
 	@echo "Examples:"
 	@echo "  make                  # Release build"
 	@echo "  make DEBUG=1          # Debug build"
-	@echo "  make clean && make    # Clean rebuild"
+	@echo "  make clean && make    # Clean rebuild (do not use: make clean & make)"
 	@echo "  make MAX_REG_COUNT=48 # Build with max 48 registers (higher occupancy)"
 	@echo "  make MAX_REG_COUNT=80 # Build with max 80 registers (if 64 causes spilling)"

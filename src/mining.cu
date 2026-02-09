@@ -75,8 +75,8 @@ bool GpuWorker::initializeCuda() {
     gpu_resources->gpu_vram_total = prop.totalGlobalMem;
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
     
-    // Use fixed batch size: 2^26 = 64M nonces per kernel
-    gpu_resources->optimal_max_nonces = g_batch_size;
+    // Batch size: 0 = auto (GPU-optimal), else g_batch_size
+    gpu_resources->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(gpu_id);
     
     return true;
 }
@@ -318,8 +318,8 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_vram_total = prop.totalGlobalMem;
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
     
-    // Use fixed batch size: 2^26 = 64M nonces per kernel
-    gpu_res->optimal_max_nonces = g_batch_size;
+    // Batch size: 0 = auto (GPU-optimal), else g_batch_size
+    gpu_res->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(device_id);
     gpu_res->mining_mode = mining_mode;
     
     // Create GpuWorker (uses shared connection through multiplexer)

@@ -31,6 +31,7 @@ void print_usage(const char* program_name) {
     std::cerr << "  --test-mode           Enable test mode (100,000x easier target)" << std::endl;
     std::cerr << "  --benchmark           Run mining benchmark (saves/loads test template)" << std::endl;
     std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
+    std::cerr << "  -b, --batch N         Nonces per kernel (0=auto; RTX 4090 auto=40M, default 5120000)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
@@ -206,8 +207,8 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
         return;
     }
     
-    // Set optimal batch size from global config (default 64M nonces)
-    gpu_res->optimal_max_nonces = g_batch_size;
+    // Batch size: 0 = auto (GPU-optimal; RTX 4090 uses 40M), else use g_batch_size
+    gpu_res->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(device_id);
     
     std::cout << "\n" << Color::BOLD << "Starting benchmark..." << Color::RESET << std::endl;
     std::cout << "Press Ctrl+C to stop\n" << std::endl;
@@ -669,6 +670,12 @@ int main(int argc, char* argv[]) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     
+    // Env override for batch size (0 = auto, GPU-optimal; e.g. RTX 4090 → 40M)
+    if (const char* batch_env = std::getenv("XNT_BATCH_SIZE"); batch_env && batch_env[0] != '\0') {
+        unsigned long long val = std::strtoull(batch_env, nullptr, 0);
+        g_batch_size = val;
+    }
+    
     std::string endpoint = "http://127.0.0.1:9897";
     std::string stratum_password = "x";
     std::string stratum_worker_name = "xnt-miner";
@@ -752,6 +759,10 @@ int main(int argc, char* argv[]) {
                 std::cerr << Color::RED << "Error: Invalid fetch interval: " << argv[i] << Color::RESET << std::endl;
                 return 1;
             }
+        } else if ((arg == "--batch" || arg == "-b") && i + 1 < argc) {
+            // Batch size in nonces; 0 = auto (GPU-optimal, e.g. 40M for RTX 4090)
+            unsigned long long val = std::strtoull(argv[++i], nullptr, 0);
+            g_batch_size = val;
         } else if (arg[0] == '-') {
             std::cerr << Color::RED << "Error: Unknown option: " << arg << Color::RESET << std::endl;
             std::cerr << "Use --help or -h for usage information" << std::endl;

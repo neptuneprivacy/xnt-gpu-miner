@@ -556,19 +556,21 @@ void calculate_mining_launch_config(
     //                                     parallel_mining_kernel_high_vram, 0, 0);
     
     // Use multiple of SM count for good occupancy
-    // Architecture-specific tuning based on compute capability
-    // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
+    // Architecture-specific tuning: Blackwell (12.x), Hopper (9.0), Ada (8.9 = RTX 4090), Ampere (8.0/8.6)
     int num_sms = prop.multiProcessorCount;
     int blocks_per_sm;
     if (prop.major >= 10) {
-        // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
-        blocks_per_sm = 128;  // High value for maximum parallel blocks (capped by grid limits)
+        // Blackwell (RTX 5090)
+        blocks_per_sm = 128;
     } else if (prop.major == 9) {
-        // Hopper architecture - use 6 blocks per SM
+        // Hopper (H100, H200)
         blocks_per_sm = 6;
+    } else if (prop.major == 8 && prop.minor == 9) {
+        // Ada Lovelace (RTX 4090, 4080, 4070) - 64 SMs, good latency hiding with more blocks
+        blocks_per_sm = 16;
     } else {
-        // Ampere/Ada - use default
-        blocks_per_sm = 8;  // Increased from 4 to 8 for better performance
+        // Ampere (RTX 3080, 3090, A100) and older
+        blocks_per_sm = 8;
     }
     int max_blocks = num_sms * blocks_per_sm;
     
@@ -585,18 +587,19 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaGetDeviceProperties(&prop, gpu_id);
     
     // Base batch size scaled by SM count and architecture
-    // RTX 5090 (SM 120) has 192 SMs, ~21K CUDA cores
     uint64_t optimal;
-    
     if (prop.major >= 10) {
-        // Blackwell (RTX 5090) - larger batches for high SM count
-        optimal = 80000000ULL; // 80M nonces for maximum GPU utilization
+        // Blackwell (RTX 5090)
+        optimal = 80000000ULL;  // 80M
     } else if (prop.major == 9) {
-        // Hopper - medium batch
-        optimal = 40000000ULL;
+        // Hopper (H100, H200)
+        optimal = 40000000ULL;  // 40M
+    } else if (prop.major == 8 && prop.minor == 9) {
+        // Ada Lovelace (RTX 4090) - 64 SMs, 24 GB; sweet spot for throughput
+        optimal = 40000000ULL;  // 40M nonces per batch
     } else {
-        // Ampere/Ada - default
-        optimal = 30000000ULL;
+        // Ampere and older
+        optimal = 30000000ULL;  // 30M
     }
     
     // Apply bounds
