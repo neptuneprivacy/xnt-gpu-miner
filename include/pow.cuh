@@ -273,7 +273,7 @@ public:
         bool* cancel_flag = nullptr);
 };
 
-__device__ void Pow_indices_device(
+__device__ __noinline__ void Pow_indices_device(
     const Digest& hash, const Digest& nonce, 
     uint64_t& index_a, uint64_t& index_b);
 

@@ -1261,7 +1261,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     return buffer;
 }
 
-__device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
+__device__ __noinline__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint64_t& index_a, uint64_t& index_b) {
     // OPTIMIZED: Reuse state array across all 63 iterations instead of recreating each time
     // This saves 62 state initializations and reduces register pressure
     uint64_t state[STATE_SIZE];
