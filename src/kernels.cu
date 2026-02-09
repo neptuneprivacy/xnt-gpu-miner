@@ -224,17 +224,14 @@ bool GuesserBuffer::reset_output_buffers() {
 bool initialize_top_tree_cache(const Digest* d_merkle_tree, size_t num_leafs) {
     if (g_top_tree_cache_initialized) return true;
     
-    // Cache the first TOP_TREE_CACHE_SIZE internal nodes (smallest indices)
-    // in constant memory. These correspond to the top levels of the tree
-    // and are accessed by all threads for upper Merkle path levels.
-    // The tree has num_leafs-1 internal nodes; we cache the first 1614.
-    size_t nodes_to_cache = (num_leafs - 1 < TOP_TREE_CACHE_SIZE) 
-        ? (num_leafs - 1) : TOP_TREE_CACHE_SIZE;
+    // Cache top TOP_TREE_CACHE_SIZE internal nodes in constant memory.
+    // These are the first nodes (lowest indices) which correspond to the top
+    // levels of the Merkle tree, accessed by all threads in the mining kernel.
     
     cudaError_t err = cudaMemcpyToSymbol(
         d_top_tree_cache, 
-        d_merkle_tree,
-        nodes_to_cache * DIGEST_LEN * sizeof(uint64_t),
+        d_merkle_tree,  // First TOP_TREE_CACHE_SIZE nodes (as raw bytes)
+        TOP_TREE_CACHE_SIZE * DIGEST_LEN * sizeof(uint64_t),
         0,
         cudaMemcpyDeviceToDevice);
     
@@ -554,12 +551,12 @@ void calculate_mining_launch_config(
         // Hopper architecture
         blocks_per_sm = 6;
     } else if (prop.major == 8 && prop.minor == 9) {
-        // Ada Lovelace (RTX 4090) - 1 active block/SM due to register pressure,
-        // 4x multiplier for good wave distribution across 128 SMs
-        blocks_per_sm = 4;
+        // Ada Lovelace (RTX 4090) - register pressure limits active blocks/SM,
+        // but extra grid blocks keep the scheduler fed with work
+        blocks_per_sm = 8;
     } else {
         // Ampere and others
-        blocks_per_sm = 4;
+        blocks_per_sm = 8;
     }
     int max_blocks = num_sms * blocks_per_sm;
     
@@ -586,8 +583,8 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
         // Hopper - medium batch
         optimal = 40000000ULL;
     } else if (prop.major == 8 && prop.minor == 9) {
-        // Ada Lovelace (RTX 4090) - 128 SMs, ~800ms target
-        optimal = 16777216ULL; // 16M = 2^24
+        // Ada Lovelace (RTX 4090) - 64 SMs; sweet spot for throughput
+        optimal = 40000000ULL;  // 40M nonces per batch
     } else {
         // Ampere and others
         optimal = 30000000ULL;
@@ -696,45 +693,6 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
-    
-    // One-time setup: maximize L1 cache for mining kernels (minimal shared memory used)
-    static bool cache_config_set = false;
-    if (!cache_config_set) {
-        cudaFuncSetAttribute(parallel_mining_kernel_high_vram,
-            cudaFuncAttributePreferredSharedMemoryCarveout, 0);
-        cudaFuncSetAttribute(parallel_mining_kernel_low_vram,
-            cudaFuncAttributePreferredSharedMemoryCarveout, 0);
-        cache_config_set = true;
-    }
-    
-    // P0.3: L2 persistence hints — tell the GPU to keep d_leafs cache lines in L2
-    // longer. On RTX 4090 (72 MB L2), this covers ~1.8M digests and helps when
-    // multiple warps read nearby leaf indices.
-    if (!buffer.l2_persist_set && buffer.d_leafs != nullptr) {
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, gpu_id);
-        if (prop.persistingL2CacheMaxSize > 0) {
-            size_t persist_size = prop.persistingL2CacheMaxSize;
-            // All L2 persistence calls are non-fatal; clear any errors they leave behind.
-            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size);
-            
-            // Cap window to persisting L2 size so driver doesn't reject it.
-            size_t leafs_bytes = buffer.num_leafs * sizeof(Digest);
-            size_t window_bytes = std::min(leafs_bytes, persist_size);
-            
-            cudaStreamAttrValue attr = {};
-            attr.accessPolicyWindow.base_ptr = buffer.d_leafs;
-            attr.accessPolicyWindow.num_bytes = window_bytes;
-            attr.accessPolicyWindow.hitRatio = 1.0f;
-            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-            cudaStreamSetAttribute(buffer.mining_stream,
-                cudaStreamAttributeAccessPolicyWindow, &attr);
-        }
-        // Clear any sticky CUDA error from L2 persistence setup (non-fatal)
-        cudaGetLastError();
-        buffer.l2_persist_set = true;
-    }
     
     switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:

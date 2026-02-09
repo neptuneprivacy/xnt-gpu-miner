@@ -86,8 +86,10 @@ all: modular
 # Build from modular sources
 modular: $(TARGET)
 
-# Clean rebuild (safe alternative to "make clean & make" which races)
-rebuild: clean all
+# Clean rebuild — runs clean first, then build. Safe with -j (uses recursive make).
+rebuild:
+	$(MAKE) clean
+	$(MAKE) all
 
 # Object files for separable compilation
 OBJS = $(MODULAR_SRCS:.cu=.o)

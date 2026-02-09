@@ -13,7 +13,7 @@ constexpr int MERKLE_THREADS_PER_BLOCK = 256;
 constexpr int MAX_GRID_DIM_X = 65535;
 constexpr size_t SHARED_LUT_SIZE = 256;
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_high_vram(
+__global__ void __launch_bounds__(256, 2) parallel_mining_kernel_high_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
@@ -155,12 +155,12 @@ inline const char* kernel_type_name(MiningKernelType type) {
 bool check_kernel_launch_errors(const char* kernel_name);
 bool sync_and_check_errors(const char* stage);
 
-// Top tree cache - cache internal Merkle nodes in constant memory for fast access.
-// Sized to fill remaining constant memory after ROUND_CONSTANTS, MDS_COEFF, LOOKUP_TABLE,
-// and d_gpu_range_* (~976 bytes). Each node = 5 x uint64_t = 40 bytes.
-// 64KB = 65536 bytes - 976 bytes other = 64560 bytes / 40 = 1614 nodes.
-// Reduced to 1612 to account for alignment padding in constant memory.
-constexpr size_t TOP_TREE_CACHE_SIZE = 1612;
+// Top tree cache - cache top levels of Merkle tree in constant memory for fast access.
+// These nodes are accessed by ALL threads for upper Merkle path levels.
+// Keep this small enough to not thrash the constant cache (8-10 KB per SM).
+// Top 10 levels = 2^10 - 1 = 1023 nodes = 1023 * 40 bytes = ~40 KB.
+constexpr size_t TOP_TREE_CACHE_LEVELS = 10;
+constexpr size_t TOP_TREE_CACHE_SIZE = (1 << TOP_TREE_CACHE_LEVELS) - 1;  // 1023 nodes
 
 // d_top_tree_cache is defined in kernels.cu only
 // Helper function is defined in kernels.cu where it can access the constant
