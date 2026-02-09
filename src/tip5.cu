@@ -451,6 +451,87 @@ __device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out) {
     }
 }
 
+// Specialized MDS for round 0 of tip5_permutation_fixed_right_zero.
+// Exploits that temp_state[5..9]=0 and temp_state[10..15]=x7_one.
+// Uses the same lo/hi 32-bit split as standard mds_layer, but with direct circulant
+// matrix multiply for 5 non-zero inputs + precomputed constant from 6 identical x7_one.
+// Key: u32×u32→u64 multiply-accumulate (mad.wide.u32) is a single hardware instruction,
+// much cheaper than the FFT's u64 multiplications by large constants.
+__device__ __forceinline__ void mds_layer_round0_sparse(
+    const uint64_t sbox_out_0,
+    const uint64_t sbox_out_1,
+    const uint64_t sbox_out_2,
+    const uint64_t sbox_out_3,
+    const uint64_t sbox_out_4,
+    uint64_t x7_one,
+    uint64_t* __restrict__ state_out
+) {
+    // Precomputed: S[i] = sum(k=10..15) MDS_COEFF[(i-k) mod 16]
+    // Combined MDS coefficients for the 6 identical x7_one inputs.
+    static constexpr uint32_t MDS_SUM_10_15[16] = {
+        168244, 179170, 207371, 201069, 234966, 232623, 190779, 238434,
+        208281, 198605, 218656, 178863, 195592, 169726, 150382, 175781
+    };
+
+    // Split 5 sbox outputs + x7_one into 32-bit lo/hi halves (same as mds_layer)
+    uint32_t s_lo[6], s_hi[6];
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(s_lo[0]), "=r"(s_hi[0]) : "l"(sbox_out_0));
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(s_lo[1]), "=r"(s_hi[1]) : "l"(sbox_out_1));
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(s_lo[2]), "=r"(s_hi[2]) : "l"(sbox_out_2));
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(s_lo[3]), "=r"(s_hi[3]) : "l"(sbox_out_3));
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(s_lo[4]), "=r"(s_hi[4]) : "l"(sbox_out_4));
+    asm("mov.b64 {%0, %1}, %2;" : "=r"(s_lo[5]), "=r"(s_hi[5]) : "l"(x7_one));
+
+    // Direct circulant matrix multiply for each output row.
+    // lo_out[i] = sum(j=0..4) s_lo[j] * MDS[(i-j)] + s_lo[5] * S[i]
+    // hi_out[i] = sum(j=0..4) s_hi[j] * MDS[(i-j)] + s_hi[5] * S[i]
+    // Then combine with same (lo>>4)+(hi<<28) + Goldilocks reduction as mds_layer.
+    #pragma unroll
+    for (int i = 0; i < STATE_SIZE; i++) {
+        // u32 × u32 → u64 multiply-accumulate: each is a single mad.wide.u32 instruction
+        uint32_t c0 = MDS_COEFF[i & 15];
+        uint32_t c1 = MDS_COEFF[(i - 1) & 15];
+        uint32_t c2 = MDS_COEFF[(i - 2) & 15];
+        uint32_t c3 = MDS_COEFF[(i - 3) & 15];
+        uint32_t c4 = MDS_COEFF[(i - 4) & 15];
+        uint32_t cs = MDS_SUM_10_15[i];
+
+        uint64_t lo_out = (uint64_t)s_lo[0] * c0 + (uint64_t)s_lo[1] * c1
+                        + (uint64_t)s_lo[2] * c2 + (uint64_t)s_lo[3] * c3
+                        + (uint64_t)s_lo[4] * c4 + (uint64_t)s_lo[5] * cs;
+
+        uint64_t hi_out = (uint64_t)s_hi[0] * c0 + (uint64_t)s_hi[1] * c1
+                        + (uint64_t)s_hi[2] * c2 + (uint64_t)s_hi[3] * c3
+                        + (uint64_t)s_hi[4] * c4 + (uint64_t)s_hi[5] * cs;
+
+        // Combine: (lo >> 4) + (hi << 28), then Goldilocks reduce
+        // Identical to standard mds_layer combine step
+        uint64_t lo_shifted = lo_out >> 4;
+        uint64_t hi_shifted_lo = hi_out << 28;
+        uint64_t hi_shifted_hi = hi_out >> 36;
+
+        uint64_t r_lo, r_hi;
+        asm("{\n\t"
+            ".reg .pred c;\n\t"
+            "add.cc.u64 %0, %2, %3;\n\t"
+            "addc.u64 %1, %4, 0;\n\t"
+            "}" : "=l"(r_lo), "=l"(r_hi) : "l"(lo_shifted), "l"(hi_shifted_lo), "l"(hi_shifted_hi));
+
+        uint64_t res;
+        asm("{\n\t"
+            ".reg .u64 prod;\n\t"
+            ".reg .pred p;\n\t"
+            "mul.lo.u64 prod, %2, 4294967295;\n\t"
+            "add.cc.u64 %0, %1, prod;\n\t"
+            "setp.lt.u64 p, %0, %1;\n\t"
+            "selp.u64 prod, 4294967295, 0, p;\n\t"
+            "add.u64 %0, %0, prod;\n\t"
+            "}" : "=l"(res) : "l"(r_lo), "l"(r_hi));
+
+        state_out[i] = res;
+    }
+}
+
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out) {
     for (int i = 0; i < STATE_SIZE; ++i) {
         state_out[i] = fast_field_add(state_in[i], ROUND_CONSTANTS[round_index][i]);
@@ -571,30 +652,21 @@ __device__ __noinline__ void tip5_permutation_fixed_right_zero(uint64_t* state, 
 
     // === ROUND 0: exploit known right side ===
     // Elements 0-3: normal S-box lookup (data-dependent)
-    temp_state[0] = split_lookup_shared(state[0], s_lookup_table);
-    temp_state[1] = split_lookup_shared(state[1], s_lookup_table);
-    temp_state[2] = split_lookup_shared(state[2], s_lookup_table);
-    temp_state[3] = split_lookup_shared(state[3], s_lookup_table);
+    // Element 4: x^7 of unknown value
+    // Elements 5-9: zero (x^7(0)=0), Elements 10-15: x7_one (constant)
+    //
+    // OPTIMIZATION: Use specialized direct MDS instead of full FFT-based generated_function.
+    // With only 5 non-zero inputs + 6 identical constants, direct circulant multiply
+    // saves ~290 instructions vs the full 16-element FFT approach.
+    {
+        uint64_t s0 = split_lookup_shared(state[0], s_lookup_table);
+        uint64_t s1 = split_lookup_shared(state[1], s_lookup_table);
+        uint64_t s2 = split_lookup_shared(state[2], s_lookup_table);
+        uint64_t s3 = split_lookup_shared(state[3], s_lookup_table);
+        uint64_t s4 = x7_computer_pipelined(state[4]);
 
-    // Element 4: x^7 of unknown value (must compute)
-    temp_state[4] = x7_computer_pipelined(state[4]);
-
-    // Elements 5-9: x^7(0) = 0 (trivially)
-    temp_state[5]  = 0;
-    temp_state[6]  = 0;
-    temp_state[7]  = 0;
-    temp_state[8]  = 0;
-    temp_state[9]  = 0;
-
-    // Elements 10-15: x^7(1) = precomputed constant (passed as arg)
-    temp_state[10] = x7_one;
-    temp_state[11] = x7_one;
-    temp_state[12] = x7_one;
-    temp_state[13] = x7_one;
-    temp_state[14] = x7_one;
-    temp_state[15] = x7_one;
-
-    mds_layer(temp_state, state);
+        mds_layer_round0_sparse(s0, s1, s2, s3, s4, x7_one, state);
+    }
     for (int i = 0; i < STATE_SIZE; ++i) {
         state[i] = fast_field_add(state[i], ROUND_CONSTANTS[0][i]);
     }
