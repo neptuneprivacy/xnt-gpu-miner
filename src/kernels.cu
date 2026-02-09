@@ -714,20 +714,25 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, gpu_id);
         if (prop.persistingL2CacheMaxSize > 0) {
-            // Reserve up to half of L2 for persisting lines
             size_t persist_size = prop.persistingL2CacheMaxSize;
+            // All L2 persistence calls are non-fatal; clear any errors they leave behind.
             cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, persist_size);
             
-            // Set access policy window on the mining stream for d_leafs
+            // Cap window to persisting L2 size so driver doesn't reject it.
+            size_t leafs_bytes = buffer.num_leafs * sizeof(Digest);
+            size_t window_bytes = std::min(leafs_bytes, persist_size);
+            
             cudaStreamAttrValue attr = {};
             attr.accessPolicyWindow.base_ptr = buffer.d_leafs;
-            attr.accessPolicyWindow.num_bytes = buffer.num_leafs * sizeof(Digest);
-            attr.accessPolicyWindow.hitRatio = 1.0f;  // try to persist all accessed lines
+            attr.accessPolicyWindow.num_bytes = window_bytes;
+            attr.accessPolicyWindow.hitRatio = 1.0f;
             attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
             attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
             cudaStreamSetAttribute(buffer.mining_stream,
                 cudaStreamAttributeAccessPolicyWindow, &attr);
         }
+        // Clear any sticky CUDA error from L2 persistence setup (non-fatal)
+        cudaGetLastError();
         buffer.l2_persist_set = true;
     }
     
