@@ -157,9 +157,10 @@ bool sync_and_check_errors(const char* stage);
 
 // Top tree cache - cache internal Merkle nodes in constant memory for fast access.
 // Sized to fill remaining constant memory after ROUND_CONSTANTS, MDS_COEFF, LOOKUP_TABLE,
-// and d_gpu_range_* (~42KB used). Each node = 5 x uint64_t = 40 bytes.
-// 1614 nodes x 40 bytes = 64,560 bytes, total constant usage ~65,520 bytes (< 64KB limit).
-constexpr size_t TOP_TREE_CACHE_SIZE = 1614;
+// and d_gpu_range_* (~976 bytes). Each node = 5 x uint64_t = 40 bytes.
+// 64KB = 65536 bytes - 976 bytes other = 64560 bytes / 40 = 1614 nodes.
+// Reduced to 1612 to account for alignment padding in constant memory.
+constexpr size_t TOP_TREE_CACHE_SIZE = 1612;
 
 // d_top_tree_cache is defined in kernels.cu only
 // Helper function is defined in kernels.cu where it can access the constant
