@@ -289,9 +289,14 @@ __device__ __forceinline__ void generated_function(const uint64_t* __restrict__ 
     output[15] = node_159 - node_1657;
 }
 
-// Extern declaration for the shared lookup table loaded by mining kernels
-// This is defined in kernels.cu and loaded ONCE at kernel start with __syncthreads
-extern __shared__ uint8_t s_lookup_table[257];  // 256 + 1 padding for bank conflict reduction
+// Shared memory S-box lookup table — loaded once per block in each mining kernel.
+// Critical for performance: constant memory serializes when threads access
+// different addresses; shared memory allows parallel access (32 banks).
+#ifdef MINING_CORE_UNITY
+__shared__ uint8_t s_lookup_table[256];
+#else
+extern __shared__ uint8_t s_lookup_table[];
+#endif
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out) {
     // Load all 16 elements into registers
@@ -312,7 +317,7 @@ __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __re
     uint64_t e14 = state_in[14];
     uint64_t e15 = state_in[15];
 
-    // S-box lookup for elements 0-3
+    // S-box lookup for elements 0-3 (reads from shared memory)
     e0 = split_lookup_shared(e0, s_lookup_table);
     e1 = split_lookup_shared(e1, s_lookup_table);
     e2 = split_lookup_shared(e2, s_lookup_table);

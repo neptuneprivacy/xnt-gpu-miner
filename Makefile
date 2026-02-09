@@ -20,13 +20,10 @@ else
 endif
 
 # Compiler flags
-# Enable separable compilation for device functions across multiple files
-# Register optimization flags:
-#   -maxrregcount=64: Limit registers to improve occupancy (can be adjusted)
-#   --ptxas-options=-v: Show register usage during compilation
-#   --ptxas-options=-O3: Aggressive PTX optimization
-# Note: Lower maxrregcount = better occupancy but may cause register spilling
-#       Start with 64, increase if you see performance degradation
+# Unity build: all device code is in mining_core.cu (single TU).
+# -dc is required because mining.cu and main.cu reference device symbols.
+# -dlto is required to propagate __launch_bounds__ register constraints
+# across __noinline__ device function calls (tip5_permutation etc.).
 NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
              --ptxas-options=-v \
              --ptxas-options=-O3 \
@@ -35,9 +32,8 @@ NVCC_DC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
                 --ptxas-options=-v \
                 --ptxas-options=-O3 \
                 -dc
-# Device link-time optimization (enables cross-TU inlining, better reg allocation).
-# Only valid with single -arch=... ; nvcc does not allow -dlto with -gencode (multi-arch).
-# Disable with DLTO=0 if build is too slow.
+# Device link-time optimization: propagates __launch_bounds__ register limits
+# across __noinline__ function calls. Only valid with single -arch (not -gencode).
 DLTO ?= 1
 ifdef ARCH
 ifeq ($(DLTO),1)
@@ -64,12 +60,11 @@ LIBS = -lcudart -lpthread -lssl -lcrypto
 TARGET = xnt-miner
 
 # Source files - modular build
+# mining_core.cu is a unity build combining tip5.cu, digest.cu, merkle.cu,
+# kernels.cu, pow.cu into a single translation unit for maximum compiler
+# optimization (cross-function inlining, global register allocation).
 MODULAR_SRCS = src/common.cu \
-               src/tip5.cu \
-               src/digest.cu \
-               src/merkle.cu \
-               src/pow.cu \
-               src/kernels.cu \
+               src/mining_core.cu \
                src/network.cu \
                src/rpc_client.cu \
                src/stratum_client.cu \
@@ -95,6 +90,7 @@ rebuild:
 OBJS = $(MODULAR_SRCS:.cu=.o)
 DEVICE_LINK_OBJ = device_link.o
 
+# Link: DLTO link-time optimization when available, else device-link
 $(TARGET): $(OBJS)
 ifdef DLTO
 	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(LIBS)
@@ -103,7 +99,7 @@ else
 	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(DEVICE_LINK_OBJ) $(LIBS)
 endif
 
-# Compile each .cu file to .o with device code
+# Compile each .cu file to .o with device code (separable compilation)
 %.o: %.cu
 	$(NVCC) $(NVCC_DC_FLAGS) $(INCLUDES) -c -o $@ $<
 

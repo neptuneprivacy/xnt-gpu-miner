@@ -32,12 +32,6 @@ __device__ Digest get_cached_node(size_t index) {
     return d;
 }
 
-// ===== SHARED MEMORY LOOKUP TABLE =====
-// Loaded once per block for S-box computation
-// OPTIMIZATION: Pad to 257 bytes to reduce bank conflicts (256 + 1 padding)
-// This ensures adjacent threads don't hit the same bank
-__shared__ uint8_t s_lookup_table[257];  // 256 + 1 padding for bank conflict reduction
-
 // ===== MINING OUTPUT BUFFERS =====
 
 bool MiningOutputBuffers::allocate() {
@@ -284,14 +278,9 @@ __global__ void parallel_mining_kernel_high_vram(
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
     
-    // Load lookup table into shared memory (first warp)
-    // OPTIMIZATION: Load with padding to reduce bank conflicts
+    // Load S-box lookup table into shared memory (one load per thread)
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
-    }
-    // Pad the last element to ensure proper alignment
-    if (threadIdx.x == 0) {
-        s_lookup_table[256] = 0;  // Padding byte
     }
     __syncthreads();
     
@@ -406,14 +395,9 @@ __global__ void parallel_mining_kernel_low_vram(
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
     
-    // Load lookup table into shared memory
-    // OPTIMIZATION: Load with padding to reduce bank conflicts
+    // Load S-box lookup table into shared memory
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
-    }
-    // Pad the last element to ensure proper alignment
-    if (threadIdx.x == 0) {
-        s_lookup_table[256] = 0;  // Padding byte
     }
     __syncthreads();
     
