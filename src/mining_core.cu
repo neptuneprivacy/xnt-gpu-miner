@@ -1641,9 +1641,18 @@ __global__ void parallel_mining_kernel_high_vram(
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
     
+    // Shared memory for S-box and mast_paths (loaded once per block)
+    __shared__ uint64_t s_mast_paths[6 * DIGEST_LEN];  // 240 bytes
+    
     // Load S-box lookup table into shared memory (one load per thread)
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    
+    // Load mast_paths from constant to shared memory (cooperative load)
+    // 30 uint64_t values, 256 threads -> each thread loads if tid < 30
+    if (threadIdx.x < 30) {
+        s_mast_paths[threadIdx.x] = d_const_mast_paths[threadIdx.x];
     }
     __syncthreads();
     
@@ -1654,35 +1663,34 @@ __global__ void parallel_mining_kernel_high_vram(
     uint64_t stride = gridDim.x * blockDim.x;
     
     // Cache constant values outside loop to prevent repeated memory accesses
-    // Merkle root is constant - read once and reuse to maintain 40 MH/s performance
+    // Merkle root is constant - read once and reuse
     const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
-    const Digest merkle_root = *root_ptr;  // Cache constant value
+    const Digest merkle_root = *root_ptr;
     
-    // Load mast_paths from constant memory (fast, cached access)
+    // Load mast_paths from shared memory (very fast)
     PowMastPaths mast_paths;
-    const uint64_t* src = d_const_mast_paths;
+    const uint64_t* src = s_mast_paths;
+    #pragma unroll
     for (int i = 0; i < 3; ++i) {
+        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
             mast_paths.pow[i].values[j] = *src++;
         }
     }
+    #pragma unroll
     for (int i = 0; i < 2; ++i) {
+        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
             mast_paths.header[i].values[j] = *src++;
         }
     }
+    #pragma unroll
     for (int j = 0; j < DIGEST_LEN; ++j) {
         mast_paths.kernel[0].values[j] = *src++;
     }
     
-    // Check solution flag periodically to exit early (one global read per 16K nonces)
-    const uint64_t CHECK_INTERVAL = 16384ULL;
-    
     // Process nonces
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found)
-            break;
-        
         // Sequential nonce within GPU's range
         uint64_t nonce_value = gpu_range_start + start_nonce + idx;
         
@@ -1781,9 +1789,17 @@ __global__ void parallel_mining_kernel_low_vram(
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
     
+    // Shared memory for S-box and mast_paths (loaded once per block)
+    __shared__ uint64_t s_mast_paths[6 * DIGEST_LEN];  // 240 bytes
+    
     // Load S-box lookup table into shared memory
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    
+    // Load mast_paths from constant to shared memory (cooperative load)
+    if (threadIdx.x < 30) {
+        s_mast_paths[threadIdx.x] = d_const_mast_paths[threadIdx.x];
     }
     __syncthreads();
     
@@ -1792,28 +1808,30 @@ __global__ void parallel_mining_kernel_low_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
-    // Load mast_paths from constant memory (fast, cached access)
+    // Load mast_paths from shared memory (very fast)
     PowMastPaths mast_paths;
-    const uint64_t* src = d_const_mast_paths;
+    const uint64_t* src = s_mast_paths;
+    #pragma unroll
     for (int i = 0; i < 3; ++i) {
+        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
             mast_paths.pow[i].values[j] = *src++;
         }
     }
+    #pragma unroll
     for (int i = 0; i < 2; ++i) {
+        #pragma unroll
         for (int j = 0; j < DIGEST_LEN; ++j) {
             mast_paths.header[i].values[j] = *src++;
         }
     }
+    #pragma unroll
     for (int j = 0; j < DIGEST_LEN; ++j) {
         mast_paths.kernel[0].values[j] = *src++;
     }
     
-    // Check solution flag less frequently to reduce global memory traffic and cache pollution
-    const uint64_t CHECK_INTERVAL = 8192ULL;
+    // Process nonces
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
-        
         uint64_t nonce_value = gpu_range_start + start_nonce + idx;
         
         // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
@@ -1930,9 +1948,10 @@ void calculate_mining_launch_config(
     int num_sms = prop.multiProcessorCount;
     int blocks_per_sm;
     if (prop.major >= 10) {
-        // Blackwell architecture (RTX 5090) - use moderate blocks for stability
-        // RTX 5090 has 170 SMs, so this gives 170*8 = 1360 blocks
-        blocks_per_sm = 8;
+        // Blackwell architecture (RTX 5090) - increase blocks for better occupancy
+        // RTX 5090 has 170 SMs, so this gives 170*16 = 2720 blocks
+        // With 128 registers per thread and __launch_bounds__(256, 2), we can fit 2 blocks per SM
+        blocks_per_sm = 16;
     } else if (prop.major == 9) {
         // Hopper architecture
         blocks_per_sm = 6;
@@ -1962,8 +1981,9 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     uint64_t optimal;
     
     if (prop.major >= 10) {
-        // Blackwell (RTX 5090) - 192 SMs, larger batches
-        optimal = 80000000ULL;
+        // Blackwell (RTX 5090) - 170 SMs, much larger batches for better GPU utilization
+        // Increase from 80M to 200M for longer kernel runs and better amortization
+        optimal = 200000000ULL;  // 200M nonces per batch
     } else if (prop.major == 9) {
         // Hopper - medium batch
         optimal = 40000000ULL;
@@ -1977,7 +1997,7 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     
     // Apply bounds
     const uint64_t min_batch = 500000;
-    const uint64_t max_batch = 100000000;  // Increased max for high-end GPUs
+    const uint64_t max_batch = 500000000ULL;  // Increased max to 500M for RTX 5090
     
     optimal = std::max(optimal, min_batch);
     optimal = std::min(optimal, max_batch);
