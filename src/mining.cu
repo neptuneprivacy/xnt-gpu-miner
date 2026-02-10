@@ -5,6 +5,9 @@
 #include "common.cuh"
 #include "kernels.cuh"
 
+// Forward declare constant memory (defined in mining_core.cu)
+extern __constant__ uint8_t d_mast_paths_const_raw[];
+
 // ========== Inlined from gpu_resources.cu (start) ==========
 // ===== GLOBAL VARIABLES =====
 std::vector<GpuResources*> g_all_gpu_resources;
@@ -912,6 +915,10 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             int actual_gpu_count = g_total_gpu_count.load();
             GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
             gpu_range_start_value = gpu_range.range_start;
+            
+            // Copy mast_paths to constant memory
+            cudaMemcpyToSymbol(d_mast_paths_const_raw, &gpu_res->buffer->mast_paths, sizeof(PowMastPaths));
+            
             initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
             gpu_res->buffer->gpu_range_initialized = true;
         } else {
@@ -933,7 +940,6 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 gpu_res->optimal_max_nonces,
                 gpu_res->buffer->num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                &gpu_res->buffer->mast_paths,
                 gpu_res->buffer->hash,
                 gpu_res->buffer->consensus_rule_set,
                 gpu_range_start_value,
@@ -954,7 +960,6 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 gpu_res->buffer->num_leafs,
                 MERKLE_TREE_HEIGHT_,
                 gpu_res->buffer->tree_size,
-                &gpu_res->buffer->mast_paths,
                 gpu_res->buffer->hash,
                 gpu_res->buffer->consensus_rule_set,
                 gpu_range_start_value,

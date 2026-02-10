@@ -8,6 +8,9 @@
 #include <chrono>
 #include <cstdlib>
 
+// Forward declare constant memory (defined in mining_core.cu)
+extern __constant__ uint8_t d_mast_paths_const_raw[];
+
 void print_usage(const char* program_name) {
     std::cerr << "\n" << Color::BOLD << "Usage:" << Color::RESET << std::endl;
     std::cerr << "  " << program_name << " [OPTIONS] -w, --wallet ADDRESS\n" << std::endl;
@@ -393,6 +396,10 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
             if (!gpu_res->buffer->gpu_range_initialized) {
                 GpuNonceRange gpu_range = calculate_gpu_range(device_id, 1);
                 gpu_range_start_value = gpu_range.range_start;
+                
+                // Copy mast_paths to constant memory
+                cudaMemcpyToSymbol(d_mast_paths_const_raw, &gpu_res->buffer->mast_paths, sizeof(PowMastPaths));
+                
                 initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
                 gpu_res->buffer->gpu_range_initialized = true;
             } else {
@@ -409,7 +416,6 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
                 NONCES_PER_BATCH,
                 gpu_res->buffer->num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                &gpu_res->buffer->mast_paths,
                 gpu_res->buffer->hash,
                 gpu_res->buffer->consensus_rule_set,
                 gpu_range_start_value,

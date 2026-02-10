@@ -1360,6 +1360,14 @@ __device__ void compute_merkle_paths(
 // __constant__ uint64_t d_gpu_range_start;
 // __constant__ uint64_t d_gpu_range_size;
 
+// ===== MAST PATHS CONSTANT MEMORY =====
+// Store PowMastPaths in constant memory for fast access (240 bytes)
+// Declared as raw memory since __constant__ doesn't support constructors
+__constant__ uint8_t d_mast_paths_const_raw[sizeof(PowMastPaths)];
+
+// Helper to access as PowMastPaths
+#define d_mast_paths_const (*reinterpret_cast<const PowMastPaths*>(d_mast_paths_const_raw))
+
 // ===== TOP MERKLE TREE CACHE =====
 // Cache top internal nodes of Merkle tree in constant memory for fast access.
 // These nodes are accessed by ALL threads, so caching eliminates global memory reads.
@@ -1618,7 +1626,6 @@ __global__ void parallel_mining_kernel_high_vram(
     const uint64_t num_nonces,
     const size_t num_leafs,
     const size_t merkle_height,
-    const PowMastPaths* mast_paths,
     const Digest leaf_prefix,
     const int consensus_rule_set,
     const uint64_t gpu_range_start,
@@ -1673,7 +1680,7 @@ __global__ void parallel_mining_kernel_high_vram(
         // This eliminates 2240 bytes of register pressure per thread
         // Uses top tree cache for fast access to upper Merkle levels
         Digest final_hash = fast_mast_hash_direct(
-            *mast_paths,
+            d_mast_paths_const,
             nonce_digest,
             merkle_root,
             d_leafs,
@@ -1741,7 +1748,6 @@ __global__ void parallel_mining_kernel_low_vram(
     const size_t num_leafs,
     const size_t merkle_height,
     const size_t stored_nodes_count,
-    const PowMastPaths* mast_paths,
     const Digest leaf_prefix,
     const int consensus_rule_set,
     const uint64_t gpu_range_start,
@@ -1789,7 +1795,7 @@ __global__ void parallel_mining_kernel_low_vram(
         uint64_t path_index_b = index_b;
         
         // Commitment is needed for get_internal_node_safe (for computing missing nodes)
-        Digest commitment = mast_paths->commit_device();
+        Digest commitment = d_mast_paths_const.commit_device();
         // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         
         // Compute final hash directly from global memory - no Pow struct or local arrays needed
@@ -1800,7 +1806,7 @@ __global__ void parallel_mining_kernel_low_vram(
         
         // Use optimized low VRAM version that computes nodes on-demand
         Digest final_hash = fast_mast_hash_direct_low_vram(
-            *mast_paths,
+            d_mast_paths_const,
             nonce_digest,
             merkle_root,
             d_internal_nodes,
@@ -2013,6 +2019,13 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         
         LOG_DEBUG("GPU " << gpu_id << " range_start: " << gpu_range_start_value << " range_size: " << gpu_range.range_size);
         
+        // Copy mast_paths to constant memory
+        cudaError_t mast_err = cudaMemcpyToSymbol(d_mast_paths_const_raw, &mast_paths, sizeof(PowMastPaths));
+        if (mast_err != cudaSuccess) {
+            LOG_ERROR("copy mast_paths to constant memory", mast_err);
+            return std::nullopt;
+        }
+        
         // Initialize top tree cache (top 8 levels in constant memory)
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             LOG_DEBUG("mine_pow_with_buffer: failed to initialize top tree cache");
@@ -2043,7 +2056,6 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 max_nonces,
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                &mast_paths,
                 buffer.hash, // leaf_prefix = commitment
                 consensus_rule_set,
                 gpu_range_start_value,
@@ -2066,7 +2078,6 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
                 buffer.tree_size, // stored_nodes_count
-                &mast_paths,
                 buffer.hash,
                 consensus_rule_set,
                 gpu_range_start_value,
@@ -2379,6 +2390,13 @@ bool launch_mining_kernel_async(
         GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
         uint64_t gpu_range_start_value = gpu_range.range_start;
         
+        // Copy mast_paths to constant memory
+        cudaError_t mast_err = cudaMemcpyToSymbol(d_mast_paths_const_raw, &mast_paths, sizeof(PowMastPaths));
+        if (mast_err != cudaSuccess) {
+            LOG_ERROR("async copy mast_paths", mast_err);
+            return false;
+        }
+        
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             // Non-fatal
         }
@@ -2420,7 +2438,6 @@ bool launch_mining_kernel_async(
                 num_nonces,
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                &mast_paths,
                 buffer.hash,
                 consensus_rule_set,
                 gpu_range_start_value,
@@ -2443,7 +2460,6 @@ bool launch_mining_kernel_async(
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
                 buffer.tree_size,
-                &mast_paths,
                 buffer.hash,
                 consensus_rule_set,
                 gpu_range_start_value,
