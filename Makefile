@@ -21,7 +21,7 @@ endif
 
 # Compiler flags
 # Unity build: all device code is in mining_core.cu (single TU).
-# -dc is required because mining.cu and main.cu reference device symbols.
+# -dc is required because main.cu references device symbols.
 # -dlto is required to propagate __launch_bounds__ register constraints
 # across __noinline__ device function calls (tip5_permutation etc.).
 NVCC_FLAGS = -O3 --use_fast_math -std=c++17 $(CUDA_ARCH) \
@@ -60,16 +60,14 @@ LIBS = -lcudart -lpthread -lssl -lcrypto
 TARGET = xnt-miner
 
 # Source files - modular build
-# mining_core.cu is a unity build combining tip5.cu, digest.cu, merkle.cu,
-# kernels.cu, pow.cu into a single translation unit for maximum compiler
-# optimization (cross-function inlining, global register allocation).
+# mining_core.cu is a unity build: tip5, digest, merkle, kernels, pow, and mining
+# (GpuWorker, MultiGpuManager, etc.) in one TU for maximum compiler optimization.
 MODULAR_SRCS = src/common.cu \
                src/mining_core.cu \
                src/network.cu \
                src/rpc_client.cu \
                src/stratum_client.cu \
                src/connection_multiplexer.cu \
-               src/mining.cu \
                src/main.cu
 
 .PHONY: all clean modular test-rpc help rebuild
