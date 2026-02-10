@@ -42,6 +42,10 @@ public:
     cudaStream_t mining_stream;
     bool stream_initialized;
     
+    // Device-side mast_paths (allocated once, reused for all batches)
+    PowMastPaths* d_mast_paths;
+    bool d_mast_paths_allocated;
+    
     // Persistent output buffers (allocated on first use)
     uint64_t* d_solution_nonce;
     int* d_solution_found;
@@ -70,6 +74,8 @@ public:
         , mast_paths()
         , mining_stream(nullptr)
         , stream_initialized(false)
+        , d_mast_paths(nullptr)
+        , d_mast_paths_allocated(false)
         , d_solution_nonce(nullptr)
         , d_solution_found(nullptr)
         , d_solution_path_a(nullptr)
@@ -106,6 +112,9 @@ public:
         if (d_solution_final_hash) { cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr; }
         output_buffers_allocated = false;
         
+        if (d_mast_paths) { cudaFree(d_mast_paths); d_mast_paths = nullptr; }
+        d_mast_paths_allocated = false;
+        
         if (stream_initialized && mining_stream) {
             cudaStreamDestroy(mining_stream);
             mining_stream = nullptr;
@@ -132,6 +141,8 @@ public:
         , mast_paths(other.mast_paths)
         , mining_stream(other.mining_stream)
         , stream_initialized(other.stream_initialized)
+        , d_mast_paths(other.d_mast_paths)
+        , d_mast_paths_allocated(other.d_mast_paths_allocated)
         , d_solution_nonce(other.d_solution_nonce)
         , d_solution_found(other.d_solution_found)
         , d_solution_path_a(other.d_solution_path_a)
@@ -147,6 +158,8 @@ public:
         other.num_leafs = 0;
         other.mining_stream = nullptr;
         other.stream_initialized = false;
+        other.d_mast_paths = nullptr;
+        other.d_mast_paths_allocated = false;
         other.d_solution_nonce = nullptr;
         other.d_solution_found = nullptr;
         other.d_solution_path_a = nullptr;
@@ -173,6 +186,8 @@ public:
             mast_paths = other.mast_paths;
             mining_stream = other.mining_stream;
             stream_initialized = other.stream_initialized;
+            d_mast_paths = other.d_mast_paths;
+            d_mast_paths_allocated = other.d_mast_paths_allocated;
             d_solution_nonce = other.d_solution_nonce;
             d_solution_found = other.d_solution_found;
             d_solution_path_a = other.d_solution_path_a;
@@ -188,6 +203,8 @@ public:
             other.num_leafs = 0;
             other.mining_stream = nullptr;
             other.stream_initialized = false;
+            other.d_mast_paths = nullptr;
+            other.d_mast_paths_allocated = false;
             other.d_solution_nonce = nullptr;
             other.d_solution_found = nullptr;
             other.d_solution_path_a = nullptr;

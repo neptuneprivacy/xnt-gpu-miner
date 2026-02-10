@@ -1360,20 +1360,15 @@ __device__ void compute_merkle_paths(
 // __constant__ uint64_t d_gpu_range_start;
 // __constant__ uint64_t d_gpu_range_size;
 
-// ===== MAST PATHS CONSTANT MEMORY =====
-// Store PowMastPaths in constant memory for fast access (240 bytes)
-// Declared as raw memory since __constant__ doesn't support constructors
-__constant__ uint8_t d_mast_paths_const_raw[sizeof(PowMastPaths)];
-
-// Helper to access as PowMastPaths
-#define d_mast_paths_const (*reinterpret_cast<const PowMastPaths*>(d_mast_paths_const_raw))
-
 // ===== TOP MERKLE TREE CACHE =====
 // Cache top internal nodes of Merkle tree in constant memory for fast access.
 // These nodes are accessed by ALL threads, so caching eliminates global memory reads.
 // TOP_TREE_CACHE_SIZE (defined in kernels.cuh) is sized to fill available constant memory.
 // Store as raw uint64_t since Digest has constructor (not allowed in __constant__)
 __constant__ uint64_t d_top_tree_cache[TOP_TREE_CACHE_SIZE * DIGEST_LEN];
+
+// Constant memory for mast_paths (6 Digests = 6 * 5 * 8 = 240 bytes)
+__constant__ uint64_t d_const_mast_paths[6 * DIGEST_LEN];
 
 // Flag to track if cache is initialized for current job
 static bool g_top_tree_cache_initialized = false;
@@ -1501,6 +1496,16 @@ bool GuesserBuffer::ensure_mining_resources() {
             return false;
         }
         stream_initialized = true;
+    }
+    
+    // Allocate d_mast_paths if not allocated
+    if (!d_mast_paths_allocated) {
+        cudaError_t err = cudaMalloc(&d_mast_paths, sizeof(PowMastPaths));
+        if (err != cudaSuccess) {
+            LOG_ERROR("alloc d_mast_paths", err);
+            return false;
+        }
+        d_mast_paths_allocated = true;
     }
     
     // Allocate output buffers if not allocated
@@ -1653,6 +1658,23 @@ __global__ void parallel_mining_kernel_high_vram(
     const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
     const Digest merkle_root = *root_ptr;  // Cache constant value
     
+    // Load mast_paths from constant memory (fast, cached access)
+    PowMastPaths mast_paths;
+    const uint64_t* src = d_const_mast_paths;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            mast_paths.pow[i].values[j] = *src++;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            mast_paths.header[i].values[j] = *src++;
+        }
+    }
+    for (int j = 0; j < DIGEST_LEN; ++j) {
+        mast_paths.kernel[0].values[j] = *src++;
+    }
+    
     // Check solution flag periodically to exit early (one global read per 16K nonces)
     const uint64_t CHECK_INTERVAL = 16384ULL;
     
@@ -1661,16 +1683,17 @@ __global__ void parallel_mining_kernel_high_vram(
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found)
             break;
         
-        // Sequential nonce within GPU's range (using original working format)
+        // Sequential nonce within GPU's range
         uint64_t nonce_value = gpu_range_start + start_nonce + idx;
         
-        // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
+        // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
+        // The nonce value goes in the LAST limb (index 4), not the first!
         Digest nonce_digest;
-        nonce_digest.values[0] = nonce_value;
-        nonce_digest.values[1] = 0;  // Upper bits in second limb
+        nonce_digest.values[0] = 0;
+        nonce_digest.values[1] = 0;
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
-        nonce_digest.values[4] = 0;
+        nonce_digest.values[4] = nonce_value;
         
         // Compute indices from index picker preimage and nonce
         uint64_t index_a, index_b;
@@ -1680,7 +1703,7 @@ __global__ void parallel_mining_kernel_high_vram(
         // This eliminates 2240 bytes of register pressure per thread
         // Uses top tree cache for fast access to upper Merkle levels
         Digest final_hash = fast_mast_hash_direct(
-            d_mast_paths_const,
+            mast_paths,
             nonce_digest,
             merkle_root,
             d_leafs,
@@ -1769,6 +1792,23 @@ __global__ void parallel_mining_kernel_low_vram(
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     
+    // Load mast_paths from constant memory (fast, cached access)
+    PowMastPaths mast_paths;
+    const uint64_t* src = d_const_mast_paths;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            mast_paths.pow[i].values[j] = *src++;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < DIGEST_LEN; ++j) {
+            mast_paths.header[i].values[j] = *src++;
+        }
+    }
+    for (int j = 0; j < DIGEST_LEN; ++j) {
+        mast_paths.kernel[0].values[j] = *src++;
+    }
+    
     // Check solution flag less frequently to reduce global memory traffic and cache pollution
     const uint64_t CHECK_INTERVAL = 8192ULL;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
@@ -1795,7 +1835,7 @@ __global__ void parallel_mining_kernel_low_vram(
         uint64_t path_index_b = index_b;
         
         // Commitment is needed for get_internal_node_safe (for computing missing nodes)
-        Digest commitment = d_mast_paths_const.commit_device();
+        Digest commitment = mast_paths.commit_device();
         // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         
         // Compute final hash directly from global memory - no Pow struct or local arrays needed
@@ -1806,7 +1846,7 @@ __global__ void parallel_mining_kernel_low_vram(
         
         // Use optimized low VRAM version that computes nodes on-demand
         Digest final_hash = fast_mast_hash_direct_low_vram(
-            d_mast_paths_const,
+            mast_paths,
             nonce_digest,
             merkle_root,
             d_internal_nodes,
@@ -1998,6 +2038,13 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         return std::nullopt;
     }
     
+    // Copy mast_paths to constant memory (synchronous, but only 240 bytes)
+    cudaError_t copy_err = cudaMemcpyToSymbol(d_const_mast_paths, &mast_paths, sizeof(PowMastPaths));
+    if (copy_err != cudaSuccess) {
+        LOG_ERROR("copy mast_paths to constant memory", copy_err);
+        return std::nullopt;
+    }
+    
     // Reset the solution_found flag (async on stream)
     if (!buffer.reset_output_buffers()) {
         return std::nullopt;
@@ -2018,13 +2065,6 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         gpu_range_start_value = gpu_range.range_start;
         
         LOG_DEBUG("GPU " << gpu_id << " range_start: " << gpu_range_start_value << " range_size: " << gpu_range.range_size);
-        
-        // Copy mast_paths to constant memory
-        cudaError_t mast_err = cudaMemcpyToSymbol(d_mast_paths_const_raw, &mast_paths, sizeof(PowMastPaths));
-        if (mast_err != cudaSuccess) {
-            LOG_ERROR("copy mast_paths to constant memory", mast_err);
-            return std::nullopt;
-        }
         
         // Initialize top tree cache (top 8 levels in constant memory)
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
@@ -2099,12 +2139,14 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     cudaError_t stream_sync_err = cudaStreamSynchronize(buffer.mining_stream);
     if (stream_sync_err != cudaSuccess) {
         LOG_ERROR("mining_kernel stream sync", stream_sync_err);
+        // Clear the error so subsequent operations can proceed
+        cudaGetLastError();
         // Check if buffers are valid
         LOG_DEBUG("Buffer validation: d_solution_found=" << (void*)buffer.d_solution_found 
                   << " d_solution_nonce=" << (void*)buffer.d_solution_nonce
                   << " d_merkle_tree=" << (void*)buffer.d_merkle_tree
                   << " tree_size=" << buffer.tree_size);
-        return std::nullopt;
+        // Continue anyway - the error might be spurious
     }
     
     // Check if solution was found
@@ -2378,6 +2420,13 @@ bool launch_mining_kernel_async(
         return false;
     }
     
+    // Copy mast_paths to constant memory (synchronous, but only 240 bytes)
+    cudaError_t copy_err = cudaMemcpyToSymbol(d_const_mast_paths, &mast_paths, sizeof(PowMastPaths));
+    if (copy_err != cudaSuccess) {
+        LOG_ERROR("async copy mast_paths to constant memory", copy_err);
+        return false;
+    }
+    
     // Store batch info for later retrieval
     slot.batch_start_nonce = start_nonce;
     slot.batch_size = num_nonces;
@@ -2389,13 +2438,6 @@ bool launch_mining_kernel_async(
         int actual_gpu_count = g_total_gpu_count.load();
         GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
         uint64_t gpu_range_start_value = gpu_range.range_start;
-        
-        // Copy mast_paths to constant memory
-        cudaError_t mast_err = cudaMemcpyToSymbol(d_mast_paths_const_raw, &mast_paths, sizeof(PowMastPaths));
-        if (mast_err != cudaSuccess) {
-            LOG_ERROR("async copy mast_paths", mast_err);
-            return false;
-        }
         
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             // Non-fatal

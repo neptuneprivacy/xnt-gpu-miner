@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(256, 2) parallel_mining_kernel_high_vram(
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash);
 
-__global__ void __launch_bounds__(256) parallel_mining_kernel_low_vram(
+__global__ void parallel_mining_kernel_low_vram(
     const Digest* __restrict__ d_leafs,
     const Digest* __restrict__ d_internal_nodes,
     const Digest hash,
