@@ -389,12 +389,15 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
             int threads_per_block, blocks_per_grid;
             calculate_mining_launch_config(NONCES_PER_BATCH, threads_per_block, blocks_per_grid, device_id);
             
+            uint64_t gpu_range_start_value = 0;
             if (!gpu_res->buffer->gpu_range_initialized) {
                 GpuNonceRange gpu_range = calculate_gpu_range(device_id, 1);
-                cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
-                cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+                gpu_range_start_value = gpu_range.range_start;
                 initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
                 gpu_res->buffer->gpu_range_initialized = true;
+            } else {
+                GpuNonceRange gpu_range = calculate_gpu_range(device_id, 1);
+                gpu_range_start_value = gpu_range.range_start;
             }
             
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
@@ -406,9 +409,10 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
                 NONCES_PER_BATCH,
                 gpu_res->buffer->num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                gpu_res->buffer->mast_paths,
+                &gpu_res->buffer->mast_paths,
                 gpu_res->buffer->hash,
                 gpu_res->buffer->consensus_rule_set,
+                gpu_range_start_value,
                 slot.d_solution_nonce,
                 slot.d_solution_found,
                 slot.d_solution_path_a,

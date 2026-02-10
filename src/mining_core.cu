@@ -1356,9 +1356,9 @@ __device__ void compute_merkle_paths(
 #include "common.cuh"
 
 // ===== GPU RANGE CONSTANTS =====
-// Define the __constant__ variables here (declared extern in tip5.cuh for other TUs)
-__constant__ uint64_t d_gpu_range_start;
-__constant__ uint64_t d_gpu_range_size;
+// NOTE: Disabled - passing as kernel parameters instead due to CUDA 13+ DLTO issues
+// __constant__ uint64_t d_gpu_range_start;
+// __constant__ uint64_t d_gpu_range_size;
 
 // ===== TOP MERKLE TREE CACHE =====
 // Cache top internal nodes of Merkle tree in constant memory for fast access.
@@ -1618,9 +1618,10 @@ __global__ void parallel_mining_kernel_high_vram(
     const uint64_t num_nonces,
     const size_t num_leafs,
     const size_t merkle_height,
-    const PowMastPaths mast_paths,
+    const PowMastPaths* mast_paths,
     const Digest leaf_prefix,
     const int consensus_rule_set,
+    const uint64_t gpu_range_start,
     uint64_t* __restrict__ d_solution_nonce,
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
@@ -1654,7 +1655,7 @@ __global__ void parallel_mining_kernel_high_vram(
             break;
         
         // Sequential nonce within GPU's range (using original working format)
-        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+        uint64_t nonce_value = gpu_range_start + start_nonce + idx;
         
         // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
         Digest nonce_digest;
@@ -1672,7 +1673,7 @@ __global__ void parallel_mining_kernel_high_vram(
         // This eliminates 2240 bytes of register pressure per thread
         // Uses top tree cache for fast access to upper Merkle levels
         Digest final_hash = fast_mast_hash_direct(
-            mast_paths,
+            *mast_paths,
             nonce_digest,
             merkle_root,
             d_leafs,
@@ -1740,9 +1741,10 @@ __global__ void parallel_mining_kernel_low_vram(
     const size_t num_leafs,
     const size_t merkle_height,
     const size_t stored_nodes_count,
-    const PowMastPaths mast_paths,
+    const PowMastPaths* mast_paths,
     const Digest leaf_prefix,
     const int consensus_rule_set,
+    const uint64_t gpu_range_start,
     uint64_t* __restrict__ d_solution_nonce,
     int* __restrict__ d_solution_found,
     Digest* __restrict__ d_solution_path_a,
@@ -1766,7 +1768,7 @@ __global__ void parallel_mining_kernel_low_vram(
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
         
-        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+        uint64_t nonce_value = gpu_range_start + start_nonce + idx;
         
         // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
         // The nonce value goes in the LAST limb (index 4), not the first!
@@ -1787,7 +1789,7 @@ __global__ void parallel_mining_kernel_low_vram(
         uint64_t path_index_b = index_b;
         
         // Commitment is needed for get_internal_node_safe (for computing missing nodes)
-        Digest commitment = mast_paths.commit_device();
+        Digest commitment = mast_paths->commit_device();
         // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         
         // Compute final hash directly from global memory - no Pow struct or local arrays needed
@@ -1798,7 +1800,7 @@ __global__ void parallel_mining_kernel_low_vram(
         
         // Use optimized low VRAM version that computes nodes on-demand
         Digest final_hash = fast_mast_hash_direct_low_vram(
-            mast_paths,
+            *mast_paths,
             nonce_digest,
             merkle_root,
             d_internal_nodes,
@@ -1882,8 +1884,9 @@ void calculate_mining_launch_config(
     int num_sms = prop.multiProcessorCount;
     int blocks_per_sm;
     if (prop.major >= 10) {
-        // Blackwell architecture (RTX 5090) - use more blocks for better occupancy
-        blocks_per_sm = 128;
+        // Blackwell architecture (RTX 5090) - use moderate blocks for stability
+        // RTX 5090 has 170 SMs, so this gives 170*8 = 1360 blocks
+        blocks_per_sm = 8;
     } else if (prop.major == 9) {
         // Hopper architecture
         blocks_per_sm = 6;
@@ -2002,21 +2005,13 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     
     // Calculate GPU's dedicated nonce range to avoid overlap with other GPUs
     // Only set once per buffer - the range doesn't change during mining
+    uint64_t gpu_range_start_value = 0;
     if (!buffer.gpu_range_initialized) {
         int actual_gpu_count = g_total_gpu_count.load();
         GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+        gpu_range_start_value = gpu_range.range_start;
         
-        // Copy range to constant memory (avoids register pressure from extra parameters)
-        cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
-        if (range_err != cudaSuccess) {
-            LOG_ERROR("copy range_start", range_err);
-            return std::nullopt;
-        }
-        range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
-        if (range_err != cudaSuccess) {
-            LOG_ERROR("copy range_size", range_err);
-            return std::nullopt;
-        }
+        LOG_DEBUG("GPU " << gpu_id << " range_start: " << gpu_range_start_value << " range_size: " << gpu_range.range_size);
         
         // Initialize top tree cache (top 8 levels in constant memory)
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
@@ -2025,7 +2020,14 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         }
         
         buffer.gpu_range_initialized = true;
+    } else {
+        // Recalculate range for already initialized buffer
+        int actual_gpu_count = g_total_gpu_count.load();
+        GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+        gpu_range_start_value = gpu_range.range_start;
     }
+    
+    LOG_DEBUG("Launching kernel with gpu_range_start=" << gpu_range_start_value << " start_nonce=" << start_nonce << " max_nonces=" << max_nonces);
     
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
@@ -2041,9 +2043,10 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 max_nonces,
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                mast_paths,
+                &mast_paths,
                 buffer.hash, // leaf_prefix = commitment
                 consensus_rule_set,
+                gpu_range_start_value,
                 buffer.d_solution_nonce,
                 buffer.d_solution_found,
                 buffer.d_solution_path_a,
@@ -2063,9 +2066,10 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
                 buffer.tree_size, // stored_nodes_count
-                mast_paths,
+                &mast_paths,
                 buffer.hash,
                 consensus_rule_set,
+                gpu_range_start_value,
                 buffer.d_solution_nonce,
                 buffer.d_solution_found,
                 buffer.d_solution_path_a,
@@ -2080,8 +2084,19 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         return std::nullopt;
     }
     
+    // Explicitly synchronize the stream before reading results
+    cudaError_t stream_sync_err = cudaStreamSynchronize(buffer.mining_stream);
+    if (stream_sync_err != cudaSuccess) {
+        LOG_ERROR("mining_kernel stream sync", stream_sync_err);
+        // Check if buffers are valid
+        LOG_DEBUG("Buffer validation: d_solution_found=" << (void*)buffer.d_solution_found 
+                  << " d_solution_nonce=" << (void*)buffer.d_solution_nonce
+                  << " d_merkle_tree=" << (void*)buffer.d_merkle_tree
+                  << " tree_size=" << buffer.tree_size);
+        return std::nullopt;
+    }
+    
     // Check if solution was found
-    // Note: cudaMemcpy implicitly synchronizes with the device, so no need for explicit sync
     int solution_found = 0;
     cudaError_t sync_err = cudaMemcpy(&solution_found, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
     if (sync_err != cudaSuccess) {
@@ -2362,23 +2377,27 @@ bool launch_mining_kernel_async(
         cudaGetDevice(&gpu_id);
         int actual_gpu_count = g_total_gpu_count.load();
         GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
-        
-        cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
-        if (range_err != cudaSuccess) {
-            LOG_ERROR("async copy range_start", range_err);
-            return false;
-        }
-        range_err = cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
-        if (range_err != cudaSuccess) {
-            LOG_ERROR("async copy range_size", range_err);
-            return false;
-        }
+        uint64_t gpu_range_start_value = gpu_range.range_start;
         
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             // Non-fatal
         }
         
         buffer.gpu_range_initialized = true;
+        // Store the range value for later use
+        buffer.gpu_range_start_cached = gpu_range_start_value;
+    }
+    
+    // Get the cached range value or recalculate
+    uint64_t gpu_range_start_value;
+    if (buffer.gpu_range_initialized) {
+        gpu_range_start_value = buffer.gpu_range_start_cached;
+    } else {
+        int gpu_id;
+        cudaGetDevice(&gpu_id);
+        int actual_gpu_count = g_total_gpu_count.load();
+        GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+        gpu_range_start_value = gpu_range.range_start;
     }
     
     // Get launch configuration
@@ -2401,9 +2420,10 @@ bool launch_mining_kernel_async(
                 num_nonces,
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                mast_paths,
+                &mast_paths,
                 buffer.hash,
                 consensus_rule_set,
+                gpu_range_start_value,
                 slot.d_solution_nonce,
                 slot.d_solution_found,
                 slot.d_solution_path_a,
@@ -2423,9 +2443,10 @@ bool launch_mining_kernel_async(
                 buffer.num_leafs,
                 MERKLE_TREE_HEIGHT_,
                 buffer.tree_size,
-                mast_paths,
+                &mast_paths,
                 buffer.hash,
                 consensus_rule_set,
+                gpu_range_start_value,
                 slot.d_solution_nonce,
                 slot.d_solution_found,
                 slot.d_solution_path_a,
@@ -3518,11 +3539,12 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         return GuesserBuffer();
     }
     
-    // For LOW_VRAM mode: Store top 8 layers (256 nodes including root)
-    // Tree height is 27, so we need layers 20-26 (top 8 layers)
+    // For LOW_VRAM mode: Store top 8 layers (255 nodes including root)
+    // Tree has 27 layers (0-26), plus root at layer 27 = 28 total layers
+    // Top 8 layers are layers 20-27 (computed in iterations 19-26 of the build loop)
     const size_t TOP_LAYERS = 8;
-    const size_t STORED_LAYER_START = MERKLE_TREE_HEIGHT_ - TOP_LAYERS;  // Layer 20
-    const size_t STORED_NODES_COUNT = (1ULL << TOP_LAYERS);  // 256 nodes
+    const size_t STORED_LAYER_START = MERKLE_TREE_HEIGHT_ - TOP_LAYERS + 1;  // Layer 20
+    const size_t STORED_NODES_COUNT = (1ULL << TOP_LAYERS) - 1;  // 255 nodes
     
     // Allocate buffer for top layers
     size_t internal_size = STORED_NODES_COUNT * sizeof(Digest);

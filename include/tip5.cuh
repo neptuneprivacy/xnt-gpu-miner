@@ -47,10 +47,11 @@ extern __constant__ uint8_t LOOKUP_TABLE[256];
 #endif
 
 // These are defined in kernels.cu
-#ifndef KERNELS_DEFINING_RANGE_CONSTANTS
-extern __constant__ uint64_t d_gpu_range_start;
-extern __constant__ uint64_t d_gpu_range_size;
-#endif
+// NOTE: Disabled - passing as kernel parameters instead due to CUDA 13+ DLTO issues
+// #ifndef KERNELS_DEFINING_RANGE_CONSTANTS
+// extern __constant__ uint64_t d_gpu_range_start;
+// extern __constant__ uint64_t d_gpu_range_size;
+// #endif
 
 extern const uint8_t LOOKUP_TABLE_HOST[256];
 extern const uint32_t MDS_COEFF_HOST[16];

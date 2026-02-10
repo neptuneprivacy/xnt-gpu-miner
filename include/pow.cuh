@@ -53,6 +53,7 @@ public:
     
     // GPU range initialization (only need to set once per GPU)
     bool gpu_range_initialized;
+    uint64_t gpu_range_start_cached;
     // L2 persistence hint set for d_leafs (P0.3 optimization)
     bool l2_persist_set;
     
@@ -77,6 +78,7 @@ public:
         , d_solution_final_hash(nullptr)
         , output_buffers_allocated(false)
         , gpu_range_initialized(false)
+        , gpu_range_start_cached(0)
         , l2_persist_set(false) {}
     
     ~GuesserBuffer() { cleanup(); }

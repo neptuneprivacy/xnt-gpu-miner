@@ -907,13 +907,17 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         calculate_mining_launch_config(gpu_res->optimal_max_nonces, threads_per_block, blocks_per_grid, gpu_id);
         
         // Ensure GPU range initialized
+        uint64_t gpu_range_start_value = 0;
         if (!gpu_res->buffer->gpu_range_initialized) {
             int actual_gpu_count = g_total_gpu_count.load();
             GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
-            cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
-            cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+            gpu_range_start_value = gpu_range.range_start;
             initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
             gpu_res->buffer->gpu_range_initialized = true;
+        } else {
+            int actual_gpu_count = g_total_gpu_count.load();
+            GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
+            gpu_range_start_value = gpu_range.range_start;
         }
         
         // Launch kernel
@@ -929,9 +933,10 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 gpu_res->optimal_max_nonces,
                 gpu_res->buffer->num_leafs,
                 MERKLE_TREE_HEIGHT_,
-                gpu_res->buffer->mast_paths,
+                &gpu_res->buffer->mast_paths,
                 gpu_res->buffer->hash,
                 gpu_res->buffer->consensus_rule_set,
+                gpu_range_start_value,
                 current_slot.d_solution_nonce,
                 current_slot.d_solution_found,
                 current_slot.d_solution_path_a,
@@ -949,9 +954,10 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 gpu_res->buffer->num_leafs,
                 MERKLE_TREE_HEIGHT_,
                 gpu_res->buffer->tree_size,
-                gpu_res->buffer->mast_paths,
+                &gpu_res->buffer->mast_paths,
                 gpu_res->buffer->hash,
                 gpu_res->buffer->consensus_rule_set,
+                gpu_range_start_value,
                 current_slot.d_solution_nonce,
                 current_slot.d_solution_found,
                 current_slot.d_solution_path_a,
