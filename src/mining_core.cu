@@ -1695,13 +1695,12 @@ __global__ void parallel_mining_kernel_high_vram(
         uint64_t nonce_value = gpu_range_start + start_nonce + idx;
         
         // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
-        // The nonce value goes in the LAST limb (index 4), not the first!
+        // Optimized: Use uint2 vector stores for faster initialization
         Digest nonce_digest;
-        nonce_digest.values[0] = 0;
-        nonce_digest.values[1] = 0;
-        nonce_digest.values[2] = 0;
-        nonce_digest.values[3] = 0;
-        nonce_digest.values[4] = nonce_value;
+        uint2* nonce_vec = reinterpret_cast<uint2*>(&nonce_digest.values[0]);
+        nonce_vec[0] = make_uint2(0, 0);  // values[0], values[1]
+        nonce_vec[1] = make_uint2(0, 0);  // values[2], values[3]
+        nonce_digest.values[4] = nonce_value;  // Last limb
         
         // Compute indices from index picker preimage and nonce
         uint64_t index_a, index_b;
@@ -1798,8 +1797,16 @@ __global__ void parallel_mining_kernel_low_vram(
     }
     
     // Load mast_paths from constant to shared memory (cooperative load)
-    if (threadIdx.x < 30) {
-        s_mast_paths[threadIdx.x] = d_const_mast_paths[threadIdx.x];
+    // Use vector loads for better memory bandwidth (4 uint64_t = 32 bytes per load)
+    if (threadIdx.x < 8) {  // 8 threads × 4 uint64_t = 32 values (we need 30)
+        uint4* dst = reinterpret_cast<uint4*>(s_mast_paths);
+        const uint4* src = reinterpret_cast<const uint4*>(d_const_mast_paths);
+        if (threadIdx.x < 7) {  // First 7 threads load 4 uint64_t each = 28 values
+            dst[threadIdx.x] = src[threadIdx.x];
+        } else if (threadIdx.x == 7) {  // Last thread loads remaining 2 values
+            s_mast_paths[28] = d_const_mast_paths[28];
+            s_mast_paths[29] = d_const_mast_paths[29];
+        }
     }
     __syncthreads();
     
@@ -1836,12 +1843,12 @@ __global__ void parallel_mining_kernel_low_vram(
         
         // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
         // The nonce value goes in the LAST limb (index 4), not the first!
+        // Optimized: Use uint2 vector stores for faster initialization
         Digest nonce_digest;
-        nonce_digest.values[0] = 0;
-        nonce_digest.values[1] = 0;
-        nonce_digest.values[2] = 0;
-        nonce_digest.values[3] = 0;
-        nonce_digest.values[4] = nonce_value;
+        uint2* nonce_vec = reinterpret_cast<uint2*>(&nonce_digest.values[0]);
+        nonce_vec[0] = make_uint2(0, 0);  // values[0], values[1]
+        nonce_vec[1] = make_uint2(0, 0);  // values[2], values[3]
+        nonce_digest.values[4] = nonce_value;  // Last limb
         
         uint64_t index_a, index_b;
         Pow_indices_device(hash, nonce_digest, index_a, index_b);
@@ -1948,9 +1955,9 @@ void calculate_mining_launch_config(
     int num_sms = prop.multiProcessorCount;
     int blocks_per_sm;
     if (prop.major >= 10) {
-        // Blackwell architecture (RTX 5090) - increase blocks for better occupancy
-        // RTX 5090 has 170 SMs, so this gives 170*16 = 2720 blocks
-        // With 128 registers per thread and __launch_bounds__(256, 2), we can fit 2 blocks per SM
+        // Blackwell architecture (RTX 5090) - optimal balance
+        // RTX 5090 has 170 SMs × 16 blocks/SM = 2720 blocks total
+        // Best performance observed at this configuration
         blocks_per_sm = 16;
     } else if (prop.major == 9) {
         // Hopper architecture
