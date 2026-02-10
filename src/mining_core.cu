@@ -1645,8 +1645,13 @@ __global__ void parallel_mining_kernel_high_vram(
     const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
     const Digest merkle_root = *root_ptr;  // Cache constant value
     
+    // Check solution flag periodically to exit early (one global read per 16K nonces)
+    const uint64_t CHECK_INTERVAL = 16384ULL;
+    
     // Process nonces
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
+        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found)
+            break;
         
         // Sequential nonce within GPU's range (using original working format)
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
@@ -1677,10 +1682,10 @@ __global__ void parallel_mining_kernel_high_vram(
             num_leafs,
             merkle_height);
         
-        // Check against target - PTX-optimized comparison
+        // Check against target - PTX-optimized comparison (solution is rare)
         bool is_solution = digest_less_equal_ptx(final_hash, target);
         
-        if (is_solution) {
+        if (__builtin_expect(is_solution, 0)) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
                 // Store first limb of nonce for basic tracking
@@ -1757,10 +1762,8 @@ __global__ void parallel_mining_kernel_low_vram(
     uint64_t stride = gridDim.x * blockDim.x;
     
     // Check solution flag less frequently to reduce global memory traffic and cache pollution
-    // Increased from 64 to 4096 to improve sustained performance
-    const uint64_t CHECK_INTERVAL = 4096;
+    const uint64_t CHECK_INTERVAL = 8192ULL;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        // Early exit if solution found (check every N iterations for performance)
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
         
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
@@ -1807,10 +1810,10 @@ __global__ void parallel_mining_kernel_low_vram(
             commitment,
             leaf_prefix);
         
-        // Check against target - PTX-optimized comparison
+        // Check against target - PTX-optimized comparison (solution is rare)
         bool is_solution = digest_less_equal_ptx(final_hash, target);
         
-        if (is_solution) {
+        if (__builtin_expect(is_solution, 0)) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_value);
@@ -1885,9 +1888,8 @@ void calculate_mining_launch_config(
         // Hopper architecture
         blocks_per_sm = 6;
     } else if (prop.major == 8 && prop.minor == 9) {
-        // Ada Lovelace (RTX 4090) - register pressure limits active blocks/SM,
-        // but extra grid blocks keep the scheduler fed with work
-        blocks_per_sm = 8;
+        // Ada Lovelace (RTX 4090) - more blocks in flight for latency hiding
+        blocks_per_sm = 16;
     } else {
         // Ampere and others
         blocks_per_sm = 8;
@@ -3808,7 +3810,7 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     // Precompute x^7(FIXED_LEN_VAL) once for all 62 iterations
     uint64_t x7_fixed = x7_computer_pipelined(FIXED_LEN_VAL);
     
-    #pragma unroll 1
+    #pragma unroll 2
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         // Specialized permutation handles the known right-side values internally
         // — no need to write state[5..15] here (saves 11 writes per iteration)
