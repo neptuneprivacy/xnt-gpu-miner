@@ -139,6 +139,7 @@ extern std::mutex g_log_mutex;
 
 // Tuning parameters (command-line configurable)
 extern int g_block_size;        // Threads per block (default: 256)
+extern int g_blocks_per_sm;     // Blocks per SM (default: 16 for RTX 5090)
 extern uint64_t g_batch_size;   // Nonces per kernel launch (0 = auto)
 
 // Helper function to shorten wallet address for display

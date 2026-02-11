@@ -1956,9 +1956,9 @@ void calculate_mining_launch_config(
     int blocks_per_sm;
     if (prop.major >= 10) {
         // Blackwell architecture (RTX 5090) - optimal balance
-        // RTX 5090 has 170 SMs × 16 blocks/SM = 2720 blocks total
-        // Best performance observed at this configuration
-        blocks_per_sm = 16;
+        // RTX 5090 has 170 SMs × blocks/SM
+        // Testing different values to find optimal
+        blocks_per_sm = (g_blocks_per_sm > 0) ? g_blocks_per_sm : 16;
     } else if (prop.major == 9) {
         // Hopper architecture
         blocks_per_sm = 6;
