@@ -14,4 +14,4 @@ std::mutex g_log_mutex;
 
 // Tuning parameters (optimized defaults)
 int g_block_size = 256;              // Threads per block (optimal for LUT loading)
-uint64_t g_batch_size = 5120000;     // 5.12M nonces per kernel (use --batch 0 for auto)
+uint64_t g_batch_size = DEFAULT_BATCH_SIZE;  // Mining + benchmark default (0 = auto)

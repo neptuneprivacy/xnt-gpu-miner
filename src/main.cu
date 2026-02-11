@@ -31,6 +31,8 @@ void print_usage(const char* program_name) {
     std::cerr << "  --test-mode           Enable test mode (100,000x easier target)" << std::endl;
     std::cerr << "  --benchmark           Run mining benchmark (saves/loads test template)" << std::endl;
     std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
+    std::cerr << "  --batch N             Nonces per kernel (0=auto, e.g. 20000000 for 20M)" << std::endl;
+    std::cerr << "                        Or set XNT_BATCH_SIZE env for quick tuning" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
@@ -207,9 +209,15 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     }
     
     // Batch size: use global override if set, otherwise auto-detect for this GPU
-    gpu_res->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(device_id);
+    const uint64_t min_batch = 1;
+    if (g_batch_size > 0) {
+        gpu_res->optimal_max_nonces = std::max(g_batch_size, min_batch);
+    } else {
+        gpu_res->optimal_max_nonces = get_optimal_batch_size(device_id);
+    }
     
     std::cout << "\n" << Color::BOLD << "Starting benchmark..." << Color::RESET << std::endl;
+    std::cout << "  Batch size: " << gpu_res->optimal_max_nonces << " (" << (gpu_res->optimal_max_nonces / 1000000.0) << "M)" << std::endl;
     std::cout << "Press Ctrl+C to stop\n" << std::endl;
     
     // Benchmark configuration
@@ -670,6 +678,11 @@ int main(int argc, char* argv[]) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     
+    // Batch size: env XNT_BATCH_SIZE as default (0=auto), --batch overrides
+    if (const char* env = std::getenv("XNT_BATCH_SIZE"); env && env[0] != '\0') {
+        try { g_batch_size = std::stoull(env); } catch (...) { /* keep default */ }
+    }
+    
     std::string endpoint = "http://127.0.0.1:9897";
     std::string stratum_password = "x";
     std::string stratum_worker_name = "xnt-miner";
@@ -753,6 +766,13 @@ int main(int argc, char* argv[]) {
                 std::cerr << Color::RED << "Error: Invalid fetch interval: " << argv[i] << Color::RESET << std::endl;
                 return 1;
             }
+        } else if ((arg == "--batch") && i + 1 < argc) {
+            try {
+                g_batch_size = std::stoull(argv[++i]);
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid batch size: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
         } else if (arg[0] == '-') {
             std::cerr << Color::RED << "Error: Unknown option: " << arg << Color::RESET << std::endl;
             std::cerr << "Use --help or -h for usage information" << std::endl;
@@ -826,6 +846,7 @@ int main(int argc, char* argv[]) {
     if (g_test_mode) {
         std::cout << "  Test Mode:     " << Color::YELLOW << "ENABLED" << Color::RESET << std::endl;
     }
+    std::cout << "  Batch size:    " << (g_batch_size == 0 ? "auto" : std::to_string(g_batch_size) + " nonces") << std::endl;
     std::cout << std::endl;
     
     cudaDeviceReset();

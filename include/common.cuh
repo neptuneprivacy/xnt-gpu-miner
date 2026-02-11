@@ -149,7 +149,7 @@ inline std::string shorten_address(const std::string& addr, size_t prefix_len = 
     return addr.substr(0, prefix_len) + "..." + addr.substr(addr.length() - suffix_len);
 }
 
-static constexpr uint64_t DEFAULT_BATCH_SIZE = 262144ULL;
+static constexpr uint64_t DEFAULT_BATCH_SIZE = 2359296ULL;  // ~2.36M nonces per kernel
 
 
 inline void enable_ansi_colors() {

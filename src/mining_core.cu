@@ -1902,6 +1902,7 @@ void calculate_mining_launch_config(
     // Cap at max blocks
     blocks_per_grid = std::min(needed_blocks, max_blocks);
     blocks_per_grid = std::min(blocks_per_grid, MAX_GRID_DIM_X);
+    blocks_per_grid = 24*num_sms;
 }
 
 uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
@@ -1927,7 +1928,7 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     }
     
     // Apply bounds
-    const uint64_t min_batch = 500000;
+    const uint64_t min_batch = 1;
     const uint64_t max_batch = 100000000;  // Increased max for high-end GPUs
     
     optimal = std::max(optimal, min_batch);
@@ -4209,7 +4210,10 @@ bool GpuWorker::initializeCuda() {
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
     
     // Batch size: use global override if set, otherwise auto-detect for this GPU
-    gpu_resources->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(gpu_id);
+    const uint64_t min_batch = 1;
+    gpu_resources->optimal_max_nonces = (g_batch_size > 0)
+        ? std::max(g_batch_size, min_batch)
+        : get_optimal_batch_size(gpu_id);
     
     return true;
 }
@@ -4529,7 +4533,10 @@ bool MultiGpuManager::initializeGpu(int device_id) {
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
     
     // Batch size: use global override if set, otherwise auto-detect for this GPU
-    gpu_res->optimal_max_nonces = (g_batch_size > 0) ? g_batch_size : get_optimal_batch_size(device_id);
+    const uint64_t min_batch = 1;
+    gpu_res->optimal_max_nonces = (g_batch_size > 0)
+        ? std::max(g_batch_size, min_batch)
+        : get_optimal_batch_size(device_id);
     gpu_res->mining_mode = mining_mode;
     
     // Create GpuWorker (uses shared connection through multiplexer)
@@ -4669,7 +4676,16 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     auto last_status_time = std::chrono::steady_clock::now();
     const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
     
-    // Initialize double-buffered miner
+    // Default: sync mode. Set XNT_ASYNC_MINING=1 to use async double-buffered mode.
+    bool use_async = false;
+    if (const char* env = std::getenv("XNT_ASYNC_MINING"); env && env[0] == '1') {
+        use_async = true;
+    }
+    if (!use_async) {
+        return continuousMiningLoopSync(gpu_res, worker);
+    }
+    
+    // Initialize double-buffered miner (async x2 mode)
     if (!gpu_res->async_miner) {
         gpu_res->async_miner = std::make_unique<DoubleBufferedMiner>();
     }
