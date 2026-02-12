@@ -1063,7 +1063,7 @@ std::vector<Digest> MTree::path(size_t index) const {
 
 // ===== GPU PREPROCESSING KERNELS =====
 
-__global__ void __launch_bounds__(768) bitreverse_swap_leafs_kernel(
+__global__ void __launch_bounds__(512) bitreverse_swap_leafs_kernel(
     Digest* __restrict__ leafs,
     size_t num_leafs,
     uint32_t log2_n
@@ -1138,7 +1138,7 @@ __global__ void __launch_bounds__(256) build_layer1_from_layer0_on_demand_kernel
     internal_nodes[write_idx] = tip5_hash_fixed_device(layer0_node_a, layer0_node_b);
 }
 
-__global__ void __launch_bounds__(768) build_layer0_from_commitment_kernel(
+__global__ void __launch_bounds__(512) build_layer0_from_commitment_kernel(
     Digest* __restrict__ internal_nodes,
     size_t height,
     size_t num_leafs,
@@ -1159,17 +1159,14 @@ __global__ void __launch_bounds__(768) build_layer0_from_commitment_kernel(
     internal_nodes[range_layer_0_start + idx] = tip5_hash_fixed_device(leaf_a, leaf_b);
 }
 
-__global__ void __launch_bounds__(768) compute_buds_kernel(
+__global__ void __launch_bounds__(512) compute_buds_kernel(
     Digest* __restrict__ buds,
     const Digest commitment,
     size_t segment_len,
     size_t base_index) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-    
-    // OPTIMIZATION: Use grid-stride loop for better scalability
-    for (size_t i = idx; i < segment_len; i += stride) {
-        size_t global_idx = base_index + i;
+    if (idx < segment_len) {
+        size_t global_idx = base_index + idx;
         // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
         // OPTIMIZATION: Reuse state array and reduce register pressure
         uint64_t state[STATE_SIZE];
@@ -1209,22 +1206,21 @@ __global__ void __launch_bounds__(768) compute_buds_kernel(
         hash.values[3] = state[3];
         hash.values[4] = state[4];
         
-        // OPTIMIZATION: Simple unrolling - avoid register spills from over-unrolling
-        // Unroll by 2 for good balance between ILP and register pressure
-        #pragma unroll 2
+        // Remaining 31 rounds - no pragma unroll to avoid register spills
         for (size_t round = 1; round < BUDDING_ROUNDS; ++round) {
-            // Setup state for next hash: hash(previous_result, [global_idx, 0, 0, 0, round])
             state[0] = hash.values[0];
             state[1] = hash.values[1];
             state[2] = hash.values[2];
             state[3] = hash.values[3];
             state[4] = hash.values[4];
-            // state[5-8] already set, only update round
+            state[5] = global_idx;
+            state[6] = 0;
+            state[7] = 0;
+            state[8] = 0;
             state[9] = round;
             
             tip5_permutation(state);
             
-            // Extract result
             hash.values[0] = state[0];
             hash.values[1] = state[1];
             hash.values[2] = state[2];
@@ -1236,72 +1232,43 @@ __global__ void __launch_bounds__(768) compute_buds_kernel(
     }
 }
 
-__global__ void __launch_bounds__(768) compute_leafs_from_buds_kernel(
+__global__ void __launch_bounds__(512) compute_leafs_from_buds_kernel(
     Digest* __restrict__ leafs, 
     const Digest* __restrict__ buds, 
     size_t num_leafs, size_t layer) {
-    // OPTIMIZATION: Use grid-stride loop with read-only cache for better memory access
     // Fast 32-bit path when safe
     if (num_leafs <= 0xFFFFFFFFu && layer < 32) {
         uint32_t idx32 = blockIdx.x * blockDim.x + threadIdx.x;
-        uint32_t stride_step = gridDim.x * blockDim.x;
         uint32_t n32 = static_cast<uint32_t>(num_leafs);
-        uint32_t layer_stride = (1u << static_cast<unsigned int>(layer));
-        uint32_t mask = n32 - 1u;
-        
-        #pragma unroll 1
-        for (uint32_t i = idx32; i < n32; i += stride_step) {
-            uint32_t buddy32 = (i + layer_stride) & mask;
-            // Load both buds before hashing for better memory access
-            Digest bud_a = buds[i];
-            Digest bud_b = buds[buddy32];
-            leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
+        if (idx32 < n32) {
+            uint32_t stride32 = (1u << static_cast<unsigned int>(layer));
+            uint32_t buddy32 = (idx32 + stride32) & (n32 - 1u);
+            leafs[idx32] = tip5_hash_fixed_device(buds[idx32], buds[buddy32]);
         }
     } else {
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        size_t stride_step = gridDim.x * blockDim.x;
-        size_t layer_stride = (1ULL << layer);
-        size_t mask = num_leafs - 1ULL; // num_leafs is power-of-two
-        
-        #pragma unroll 1
-        for (size_t i = idx; i < num_leafs; i += stride_step) {
-            size_t buddy_index = (i + layer_stride) & mask;
-            Digest bud_a = buds[i];
-            Digest bud_b = buds[buddy_index];
-            leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
+        if (idx < num_leafs) {
+            size_t stride = (1ULL << layer);
+            size_t mask = num_leafs - 1ULL;
+            size_t buddy_index = (idx + stride) & mask;
+            leafs[idx] = tip5_hash_fixed_device(buds[idx], buds[buddy_index]);
         }
     }
 }
 
-__global__ void __launch_bounds__(768) merkle_zip_kernel(
+__global__ void __launch_bounds__(512) merkle_zip_kernel(
     Digest* __restrict__ parents, 
     const Digest* __restrict__ children, 
     size_t count) {
-    // OPTIMIZATION: Use grid-stride loop with aggressive unrolling for better ILP
-    // Process multiple elements per iteration to maximize memory throughput
     if (count <= 0xFFFFFFFFu) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        uint32_t stride = gridDim.x * blockDim.x;
-        uint32_t count32 = static_cast<uint32_t>(count);
-        
-        #pragma unroll 1
-        for (uint32_t i = idx; i < count32; i += stride) {
-            uint32_t child_idx = 2 * i;
-            // Load children with coalesced memory access
-            Digest left = children[child_idx];
-            Digest right = children[child_idx + 1];
-            parents[i] = tip5_hash_fixed_device(left, right);
+        if (idx < static_cast<uint32_t>(count)) {
+            parents[idx] = tip5_hash_fixed_device(children[2*idx], children[2*idx+1]);
         }
     } else {
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        size_t stride = gridDim.x * blockDim.x;
-        
-        #pragma unroll 1
-        for (size_t i = idx; i < count; i += stride) {
-            size_t child_idx = 2 * i;
-            Digest left = children[child_idx];
-            Digest right = children[child_idx + 1];
-            parents[i] = tip5_hash_fixed_device(left, right);
+        if (idx < count) {
+            parents[idx] = tip5_hash_fixed_device(children[2*idx], children[2*idx+1]);
         }
     }
 }
@@ -3687,10 +3654,8 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         return GuesserBuffer();
     }
     
-    int threadsPerBlock = 768;
-    // OPTIMIZATION: Adaptive grid sizing for optimal SM utilization
-    // For large datasets, use MAX_GRID_DIM_X to maximize parallelism
-    int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+    int threadsPerBlock = 512;
+    int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
     
     // Step 1: Compute buds
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
@@ -3711,7 +3676,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     Digest* current_leafs = d_temp_leafs;
     
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
-        int layerBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
         std::swap(current_buds, current_leafs);
@@ -3778,7 +3743,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         size_t parent_count = current_count / 2;
         Digest* parent_layer = buffer.d_merkle_tree + write_offset;
         
-        int layerBlocks = std::min((int)((parent_count + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        int layerBlocks = (parent_count + threadsPerBlock - 1) / threadsPerBlock;
         
         merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             parent_layer, current_layer, parent_count);
@@ -3865,7 +3830,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         return GuesserBuffer();
     }
     
-    int threadsPerBlock = 768;
+    int threadsPerBlock = 512;
     
     // Step 1: Allocate leafs buffer using regular device memory (faster than managed memory)
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
@@ -3879,7 +3844,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     }
     
     // Compute buds (all kernels use the same stream for in-order execution)
-    int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+    int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
     
@@ -3900,7 +3865,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     
     // Convert buds to leafs (all on same stream, no sync needed between kernels)
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
-        int layerBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
         std::swap(current_buds, current_leafs);
@@ -3958,7 +3923,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         size_t next_layer_size = current_layer_size / 2;
         
         // Compute next layer (all kernels on same stream, no sync needed)
-        int layerBlocks = std::min((int)((next_layer_size + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        int layerBlocks = (next_layer_size + threadsPerBlock - 1) / threadsPerBlock;
         merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             next_layer, current_layer, next_layer_size);
         
