@@ -4170,6 +4170,10 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
 static int g_miner_id = 0;           // Unique miner ID in pool (0-65535)
 static int g_total_miners = 1024;    // Total miners in pool (configurable)
 
+// Mining pool configuration
+static int g_miner_id = 0;           // Unique miner ID in pool (0-65535)
+static int g_total_miners = 1024;    // Total miners in pool (configurable)
+
 // Generate cryptographically strong random start with multiple entropy sources
 // Uses GPU UUID for hardware-unique identification instead of worker_id
 uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, const std::string& worker_id, const std::string& gpu_uuid) {
