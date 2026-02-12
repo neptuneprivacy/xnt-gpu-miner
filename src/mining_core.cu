@@ -1273,30 +1273,28 @@ __device__ __noinline__ Digest compute_leaf_from_commitment_device_parallel(
 }
 
 // Texture memory fetch helper for optimized merkle tree access
+// NOTE: Currently disabled due to invalid argument errors
 // Uses hardware texture cache for better random access performance
 __device__ __forceinline__ Digest fetch_tree_node_tex(cudaTextureObject_t tex, size_t index) {
-    if (tex == 0) {
-        // Fallback: texture not bound
-        return Digest::default_digest();
-    }
+    // DISABLED: Always return default digest since texture binding is disabled
+    // TODO: Fix texture binding before enabling this optimization
+    return Digest::default_digest();
     
-    // Each Digest is 40 bytes (5 x uint64_t = 5 x 8 bytes)
-    // Fetch as uint4 (16 bytes each): need 3 uint4s to cover 40 bytes (48 bytes total)
-    size_t base_idx = index * 3;
-    
-    uint4 data0 = tex1Dfetch<uint4>(tex, base_idx);
-    uint4 data1 = tex1Dfetch<uint4>(tex, base_idx + 1);
-    uint4 data2 = tex1Dfetch<uint4>(tex, base_idx + 2);
-    
-    Digest d;
-    // Reconstruct 5 uint64_t values from uint4 chunks (little-endian)
-    d.values[0] = ((uint64_t)data0.y << 32) | data0.x;
-    d.values[1] = ((uint64_t)data0.w << 32) | data0.z;
-    d.values[2] = ((uint64_t)data1.y << 32) | data1.x;
-    d.values[3] = ((uint64_t)data1.w << 32) | data1.z;
-    d.values[4] = ((uint64_t)data2.y << 32) | data2.x;
-    
-    return d;
+    // Original implementation (disabled):
+    // if (tex == 0) {
+    //     return Digest::default_digest();
+    // }
+    // size_t base_idx = index * 3;
+    // uint4 data0 = tex1Dfetch<uint4>(tex, base_idx);
+    // uint4 data1 = tex1Dfetch<uint4>(tex, base_idx + 1);
+    // uint4 data2 = tex1Dfetch<uint4>(tex, base_idx + 2);
+    // Digest d;
+    // d.values[0] = ((uint64_t)data0.y << 32) | data0.x;
+    // d.values[1] = ((uint64_t)data0.w << 32) | data0.z;
+    // d.values[2] = ((uint64_t)data1.y << 32) | data1.x;
+    // d.values[3] = ((uint64_t)data1.w << 32) | data1.z;
+    // d.values[4] = ((uint64_t)data2.y << 32) | data2.x;
+    // return d;
 }
 
 __device__ __noinline__ Digest get_internal_node_safe(
@@ -1524,40 +1522,40 @@ bool GuesserBuffer::ensure_mining_resources() {
         stream_initialized = true;
     }
 
-    // Bind texture memory for merkle tree if not already bound
-    if (d_merkle_tree && tree_size > 0 && !texture_bound) {
-        cudaResourceDesc resDesc;
-        memset(&resDesc, 0, sizeof(resDesc));
-        resDesc.resType = cudaResourceTypeLinear;
-        resDesc.res.linear.devPtr = d_merkle_tree;
-        resDesc.res.linear.desc = cudaCreateChannelDesc<uint4>();
-        resDesc.res.linear.sizeInBytes = tree_size * sizeof(Digest);
+    // DISABLED: Texture memory binding causing "invalid argument" errors
+    // TODO: Fix texture binding implementation
+    // if (d_merkle_tree && tree_size > 0 && !texture_bound) {
+    //     cudaResourceDesc resDesc;
+    //     memset(&resDesc, 0, sizeof(resDesc));
+    //     resDesc.resType = cudaResourceTypeLinear;
+    //     resDesc.res.linear.devPtr = d_merkle_tree;
+    //     resDesc.res.linear.desc = cudaCreateChannelDesc<uint4>();
+    //     resDesc.res.linear.sizeInBytes = tree_size * sizeof(Digest);
+    //
+    //     cudaTextureDesc texDesc;
+    //     memset(&texDesc, 0, sizeof(texDesc));
+    //     texDesc.readMode = cudaReadModeElementType;
+    //
+    //     cudaError_t err = cudaCreateTextureObject(&tex_merkle_tree, &resDesc, &texDesc, NULL);
+    //     if (err == cudaSuccess) {
+    //         texture_bound = true;
+    //     } else {
+    //         std::cerr << "[WARNING] Failed to bind texture memory: " << cudaGetErrorString(err) << std::endl;
+    //         tex_merkle_tree = 0;
+    //     }
+    // }
 
-        cudaTextureDesc texDesc;
-        memset(&texDesc, 0, sizeof(texDesc));
-        texDesc.readMode = cudaReadModeElementType;
-
-        cudaError_t err = cudaCreateTextureObject(&tex_merkle_tree, &resDesc, &texDesc, NULL);
-        if (err == cudaSuccess) {
-            texture_bound = true;
-            LOG_DEBUG("Texture memory bound for merkle tree (" << (tree_size * sizeof(Digest) / (1024*1024)) << " MB)");
-        } else {
-            std::cerr << "[WARNING] Failed to bind texture memory: " << cudaGetErrorString(err) << " (continuing without)" << std::endl;
-            tex_merkle_tree = 0;
-        }
-    }
-
-    // Allocate expanded phase indices buffer (20M capacity for better batching)
-    if (!d_phase_indices || d_phase_indices_capacity == 0) {
-        const size_t EXPANDED_CAPACITY = 20 * 1024 * 1024;  // 20M index pairs
-        cudaError_t err = cudaMalloc(&d_phase_indices, EXPANDED_CAPACITY * 2 * sizeof(uint64_t));
-        if (err == cudaSuccess) {
-            d_phase_indices_capacity = EXPANDED_CAPACITY;
-            LOG_DEBUG("Allocated expanded phase indices buffer: " << (EXPANDED_CAPACITY * 16 / (1024*1024)) << " MB");
-        } else {
-            std::cerr << "[WARNING] Failed to allocate expanded phase buffer: " << cudaGetErrorString(err) << " (will use standard size)" << std::endl;
-        }
-    }
+    // DISABLED: Expanded phase buffer allocation may be causing kernel issues
+    // TODO: Re-enable after fixing texture memory issues
+    // if (!d_phase_indices || d_phase_indices_capacity == 0) {
+    //     const size_t EXPANDED_CAPACITY = 20 * 1024 * 1024;  // 20M index pairs
+    //     cudaError_t err = cudaMalloc(&d_phase_indices, EXPANDED_CAPACITY * 2 * sizeof(uint64_t));
+    //     if (err == cudaSuccess) {
+    //         d_phase_indices_capacity = EXPANDED_CAPACITY;
+    //     } else {
+    //         std::cerr << "[WARNING] Failed to allocate expanded phase buffer: " << cudaGetErrorString(err) << std::endl;
+    //     }
+    // }
 
     // Allocate output buffers if not allocated
     if (!output_buffers_allocated) {
