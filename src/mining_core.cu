@@ -1165,22 +1165,75 @@ __global__ void __launch_bounds__(256) compute_buds_kernel(
     size_t segment_len,
     size_t base_index) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < segment_len) {
-        size_t global_idx = base_index + idx;
+    size_t stride = gridDim.x * blockDim.x;
+    
+    // OPTIMIZATION: Use grid-stride loop for better scalability
+    for (size_t i = idx; i < segment_len; i += stride) {
+        size_t global_idx = base_index + i;
         // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
-        // hash = Tip5::hash_pair(hash, Digest::new([index, 0, 0, 0, round]))
-        Digest hash = commitment;
-        for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
-            // Create Digest with values [global_idx, 0, 0, 0, round]
-            // Minimize scope of round_digest to reduce register pressure
-            Digest round_digest;
-            round_digest.values[0] = global_idx;
-            round_digest.values[1] = 0;
-            round_digest.values[2] = 0;
-            round_digest.values[3] = 0;
-            round_digest.values[4] = round;
-            hash = tip5_hash_fixed_device(hash, round_digest);
+        // OPTIMIZATION: Reuse state array and reduce register pressure
+        uint64_t state[STATE_SIZE];
+        
+        // Initialize state once with commitment (left side)
+        state[0] = commitment.values[0];
+        state[1] = commitment.values[1];
+        state[2] = commitment.values[2];
+        state[3] = commitment.values[3];
+        state[4] = commitment.values[4];
+        
+        // Right side: [global_idx, 0, 0, 0, round] - varies only in round
+        state[5] = global_idx;
+        state[6] = 0;
+        state[7] = 0;
+        state[8] = 0;
+        // state[9] will be set to round in the loop
+        
+        // Capacity region for FixedLength domain
+        constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
+        state[10] = FIXED_LEN_VAL;
+        state[11] = FIXED_LEN_VAL;
+        state[12] = FIXED_LEN_VAL;
+        state[13] = FIXED_LEN_VAL;
+        state[14] = FIXED_LEN_VAL;
+        state[15] = FIXED_LEN_VAL;
+        
+        // First round (round=0)
+        state[9] = 0;
+        tip5_permutation(state);
+        
+        // Extract result as new left side for next round
+        Digest hash;
+        hash.values[0] = state[0];
+        hash.values[1] = state[1];
+        hash.values[2] = state[2];
+        hash.values[3] = state[3];
+        hash.values[4] = state[4];
+        
+        // Remaining 31 rounds
+        for (size_t round = 1; round < BUDDING_ROUNDS; ++round) {
+            // Setup state for next hash: hash(previous_result, [global_idx, 0, 0, 0, round])
+            state[0] = hash.values[0];
+            state[1] = hash.values[1];
+            state[2] = hash.values[2];
+            state[3] = hash.values[3];
+            state[4] = hash.values[4];
+            state[5] = global_idx;
+            state[6] = 0;
+            state[7] = 0;
+            state[8] = 0;
+            state[9] = round;
+            // Capacity stays the same (FIXED_LEN_VAL)
+            
+            tip5_permutation(state);
+            
+            // Extract result
+            hash.values[0] = state[0];
+            hash.values[1] = state[1];
+            hash.values[2] = state[2];
+            hash.values[3] = state[3];
+            hash.values[4] = state[4];
         }
+        
         buds[global_idx] = hash;
     }
 }
@@ -1189,22 +1242,33 @@ __global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
     Digest* __restrict__ leafs, 
     const Digest* __restrict__ buds, 
     size_t num_leafs, size_t layer) {
+    // OPTIMIZATION: Use grid-stride loop and improve memory access patterns
     // Fast 32-bit path when safe
     if (num_leafs <= 0xFFFFFFFFu && layer < 32) {
         uint32_t idx32 = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t stride_step = gridDim.x * blockDim.x;
         uint32_t n32 = static_cast<uint32_t>(num_leafs);
-        if (idx32 < n32) {
-            uint32_t stride32 = (1u << static_cast<unsigned int>(layer));
-            uint32_t buddy32 = (idx32 + stride32) & (n32 - 1u);
-            leafs[idx32] = tip5_hash_fixed_device(buds[idx32], buds[buddy32]);
+        uint32_t layer_stride = (1u << static_cast<unsigned int>(layer));
+        uint32_t mask = n32 - 1u;
+        
+        for (uint32_t i = idx32; i < n32; i += stride_step) {
+            uint32_t buddy32 = (i + layer_stride) & mask;
+            // Load both buds before hashing for better memory access
+            Digest bud_a = buds[i];
+            Digest bud_b = buds[buddy32];
+            leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
         }
     } else {
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < num_leafs) {
-            size_t stride = (1ULL << layer);
-            size_t mask = num_leafs - 1ULL; // num_leafs is power-of-two
-            size_t buddy_index = (idx + stride) & mask;
-            leafs[idx] = tip5_hash_fixed_device(buds[idx], buds[buddy_index]);
+        size_t stride_step = gridDim.x * blockDim.x;
+        size_t layer_stride = (1ULL << layer);
+        size_t mask = num_leafs - 1ULL; // num_leafs is power-of-two
+        
+        for (size_t i = idx; i < num_leafs; i += stride_step) {
+            size_t buddy_index = (i + layer_stride) & mask;
+            Digest bud_a = buds[i];
+            Digest bud_b = buds[buddy_index];
+            leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
         }
     }
 }
@@ -1213,15 +1277,30 @@ __global__ void __launch_bounds__(256) merkle_zip_kernel(
     Digest* __restrict__ parents, 
     const Digest* __restrict__ children, 
     size_t count) {
+    // OPTIMIZATION: Use grid-stride loop for better occupancy and coalescing
+    // This allows the kernel to handle any count without multiple launches
+    // and ensures coalesced memory access patterns
     if (count <= 0xFFFFFFFFu) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < static_cast<uint32_t>(count)) {
-            parents[idx] = tip5_hash_fixed_device(children[2*idx], children[2*idx+1]);
+        uint32_t stride = gridDim.x * blockDim.x;
+        uint32_t count32 = static_cast<uint32_t>(count);
+        
+        for (uint32_t i = idx; i < count32; i += stride) {
+            // Load two consecutive children (better cache locality)
+            uint32_t child_idx = 2 * i;
+            Digest left = children[child_idx];
+            Digest right = children[child_idx + 1];
+            parents[i] = tip5_hash_fixed_device(left, right);
         }
     } else {
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < count) {
-            parents[idx] = tip5_hash_fixed_device(children[2*idx], children[2*idx+1]);
+        size_t stride = gridDim.x * blockDim.x;
+        
+        for (size_t i = idx; i < count; i += stride) {
+            size_t child_idx = 2 * i;
+            Digest left = children[child_idx];
+            Digest right = children[child_idx + 1];
+            parents[i] = tip5_hash_fixed_device(left, right);
         }
     }
 }
@@ -3638,7 +3717,9 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     }
     
     int threadsPerBlock = 256;
-    int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
+    // OPTIMIZATION: Limit grid size for better occupancy and reduced launch overhead
+    // Use smaller grid with grid-stride loops in kernels
+    int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
     
     // Step 1: Compute buds
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
@@ -3659,7 +3740,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     Digest* current_leafs = d_temp_leafs;
     
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
-        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
+        int layerBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
         std::swap(current_buds, current_leafs);
@@ -3726,7 +3807,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         size_t parent_count = current_count / 2;
         Digest* parent_layer = buffer.d_merkle_tree + write_offset;
         
-        int layerBlocks = (parent_count + threadsPerBlock - 1) / threadsPerBlock;
+        int layerBlocks = std::min((int)((parent_count + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
         merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             parent_layer, current_layer, parent_count);
         
@@ -3803,233 +3884,169 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     LOG_DEBUG("preprocess_low_vram: allocated " << (internal_size / 1024) << " KB for top " << TOP_LAYERS << " layers");
     LOG_DEBUG("preprocess_low_vram: using chunked tree construction (layers 0-19 computed and discarded, layers 20-26 stored)");
     
-    // Chunked tree construction: build layer-by-layer, only keeping what we need
-    // Strategy: Use a sliding window of 2 layers at a time
-    // For layers 0-19: compute and discard immediately
-    // For layers 20-26: compute and store in our buffer
+    // Use a dedicated stream for all preprocessing kernels (like HIGH_VRAM mode)
+    cudaStream_t pp_stream;
+    cudaError_t stream_err = cudaStreamCreate(&pp_stream);
+    if (stream_err != cudaSuccess) {
+        LOG_ERROR("cudaStreamCreate (preprocess low_vram)", stream_err);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
     
     int threadsPerBlock = 256;
     
-    // Step 1: Compute leafs from commitment (needed for layer 0)
-    // We'll compute leafs on-demand in chunks to save memory
-    // Actually, we need all leafs to compute layer 0, so we need to store them temporarily
-    // But we can use a smaller buffer and compute in batches
-    
-    // For chunked approach: compute layer 0 in chunks, then build tree layer-by-layer
-    // Layer 0 needs all leafs, so we need temporary storage for leafs
-    // But we can compute them in smaller batches and build tree incrementally
-    
-    // Actually, the most memory-efficient approach:
-    // 1. Compute leafs in chunks (e.g., 1M at a time)
-    // 2. For each chunk, compute the corresponding layer 0 nodes
-    // 3. Build tree from layer 0 up, keeping only what we need
-    
-    // Simpler approach for now: Compute all leafs, but use managed memory
-    // Then build tree layer-by-layer, discarding lower layers as we go
+    // Step 1: Allocate leafs buffer using regular device memory (faster than managed memory)
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_leafs = nullptr;
-    alloc_err = cudaMallocManaged(&d_leafs, leafs_size);
+    alloc_err = cudaMalloc(&d_leafs, leafs_size);
     if (alloc_err != cudaSuccess) {
-        LOG_ERROR("cudaMallocManaged leafs (low_vram)", alloc_err);
+        LOG_ERROR("cudaMalloc leafs (low_vram)", alloc_err);
+        cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
     
-    int device_id = 0;
-    cudaError_t device_err = cudaGetDevice(&device_id);
-    if (device_err == cudaSuccess) {
-        maybe_prefetch_managed(d_leafs, leafs_size, device_id);
-    }
-    
-    // Compute leafs from commitment
-    int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
-    compute_buds_kernel<<<numBlocks, threadsPerBlock>>>(
+    // Compute buds (all kernels use the same stream for in-order execution)
+    int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+    compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
     
-    cudaError_t sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        LOG_ERROR("compute_buds_kernel sync", sync_err);
-        cudaFree(d_leafs);
-        buffer.cleanup();
-        return GuesserBuffer();
-    }
-    
-    // Convert buds to leafs (need temp buffer for this)
+    // Allocate temp buffer for bud->leaf conversion
     size_t temp_leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
-    alloc_err = cudaMallocManaged(&d_temp_leafs, temp_leafs_size);
+    alloc_err = cudaMalloc(&d_temp_leafs, temp_leafs_size);
     if (alloc_err != cudaSuccess) {
-        LOG_ERROR("cudaMallocManaged temp_leafs (low_vram)", alloc_err);
+        LOG_ERROR("cudaMalloc temp_leafs (low_vram)", alloc_err);
         cudaFree(d_leafs);
+        cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
-    }
-    
-    if (device_err == cudaSuccess) {
-        maybe_prefetch_managed(d_temp_leafs, temp_leafs_size, device_id);
     }
     
     Digest* current_buds = d_leafs;
     Digest* current_leafs = d_temp_leafs;
     
+    // Convert buds to leafs (all on same stream, no sync needed between kernels)
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
-        if (cancel_flag && *cancel_flag) {
-            cudaFree(d_leafs);
-            cudaFree(d_temp_leafs);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
-        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
-        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
+        int layerBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
-        
-        sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess) {
-            LOG_ERROR("compute_leafs_from_buds_kernel sync", sync_err);
-            cudaFree(d_leafs);
-            cudaFree(d_temp_leafs);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
         std::swap(current_buds, current_leafs);
     }
     
-    // Now current_buds contains the final leafs
-    // Ensure final leafs live in d_leafs (current_buds may be d_temp_leafs if NUM_BUD_LAYERS is odd)
+    // Ensure final leafs are in d_leafs (async copy on same stream)
     if (current_buds != d_leafs) {
-        cudaMemcpy(d_leafs, current_buds, leafs_size, cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(d_leafs, current_buds, leafs_size, cudaMemcpyDeviceToDevice, pp_stream);
         current_buds = d_leafs;
     }
-    // Free the temp buffer - we only need d_leafs now
-    cudaFree(d_temp_leafs);
-    d_temp_leafs = nullptr;
     
-    // Step 2: Build tree layer-by-layer using chunked approach
-    // We'll use a sliding window: keep current and next layer
-    // For layers 0-19: compute and discard
-    // For layers 20-26: compute and store
-    
-    // Allocate buffers for sliding window (2 layers max at a time)
-    // The largest layer we need to keep is layer 20 with 2^7 = 128 nodes
-    // But we need to compute from layer 0 (2^26 nodes) up
-    // So we need a buffer that can hold at least one full layer
-    
-    // Strategy: Use d_leafs as layer 0, then allocate buffers for subsequent layers
-    // We'll compute layer N from layer N-1, then discard layer N-1
-    
-    // For layers 0-19: we need buffers that can hold up to 2^25 nodes (layer 1 is largest)
-    // For layers 20-26: we store in our final buffer
-    // Layer 0 is in d_leafs (2^26 nodes), layer 1 needs 2^25 nodes
-    // After layer 1, we can free d_leafs and reuse buffers
-    
-    const size_t MAX_INTERMEDIATE_LAYER_SIZE = 1ULL << 26;  // 2^26 nodes (layer 1 size)
+    // Step 2: Build tree layer-by-layer using sliding window approach
+    // Allocate two buffers for ping-pong between layers
+    // Max size needed is for layer 1 (2^25 nodes = half of leafs)
+    const size_t MAX_INTERMEDIATE_LAYER_SIZE = MERKLE_NUM_LEAFS / 2;
     size_t intermediate_buffer_size = MAX_INTERMEDIATE_LAYER_SIZE * sizeof(Digest);
     Digest* d_layer_a = nullptr;
     Digest* d_layer_b = nullptr;
     
-    alloc_err = cudaMallocManaged(&d_layer_a, intermediate_buffer_size);
+    alloc_err = cudaMalloc(&d_layer_a, intermediate_buffer_size);
     if (alloc_err != cudaSuccess) {
-        LOG_ERROR("cudaMallocManaged layer_a (low_vram)", alloc_err);
+        LOG_ERROR("cudaMalloc layer_a (low_vram)", alloc_err);
+        cudaFree(d_temp_leafs);
         cudaFree(d_leafs);
+        cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
     
-    alloc_err = cudaMallocManaged(&d_layer_b, intermediate_buffer_size);
+    alloc_err = cudaMalloc(&d_layer_b, intermediate_buffer_size);
     if (alloc_err != cudaSuccess) {
-        LOG_ERROR("cudaMallocManaged layer_b (low_vram)", alloc_err);
+        LOG_ERROR("cudaMalloc layer_b (low_vram)", alloc_err);
         cudaFree(d_layer_a);
+        cudaFree(d_temp_leafs);
         cudaFree(d_leafs);
+        cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
     
-    if (device_err == cudaSuccess) {
-        maybe_prefetch_managed(d_layer_a, intermediate_buffer_size, device_id);
-        maybe_prefetch_managed(d_layer_b, intermediate_buffer_size, device_id);
-    }
     
-    // Build tree from layer 0 (leafs) up to layer 26 (root)
-    // Use sliding window: current_layer -> next_layer
-    const Digest* current_layer = current_buds;  // Start with leafs (layer 0)
+    // Free temp buffer now (we only need d_leafs and the two layer buffers)
+    cudaFree(d_temp_leafs);
+    d_temp_leafs = nullptr;
+    
+    // Build tree from layer 0 (leafs) up to layer 26 (root) using ping-pong buffers
+    const Digest* current_layer = d_leafs;
     size_t current_layer_size = MERKLE_NUM_LEAFS;
     Digest* next_layer = d_layer_a;
     bool use_layer_a = true;
     
-    size_t stored_offset = 0;  // Offset in our final buffer
+    size_t stored_offset = 0;
     
     for (size_t layer = 0; layer < MERKLE_TREE_HEIGHT_; ++layer) {
-        if (cancel_flag && *cancel_flag) {
-            cudaFree(d_leafs);
-            cudaFree(d_layer_a);
-            cudaFree(d_layer_b);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
         size_t next_layer_size = current_layer_size / 2;
         
-        // Compute next layer from current layer
-        int layerBlocks = (next_layer_size + threadsPerBlock - 1) / threadsPerBlock;
-        merkle_zip_kernel<<<layerBlocks, threadsPerBlock>>>(
+        // Compute next layer (all kernels on same stream, no sync needed)
+        int layerBlocks = std::min((int)((next_layer_size + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             next_layer, current_layer, next_layer_size);
         
-        sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess) {
-            LOG_ERROR("merkle_zip_kernel sync (layer " << layer << ")", sync_err);
-            cudaFree(d_leafs);
-            cudaFree(d_layer_a);
-            cudaFree(d_layer_b);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
-        
-        // If this is one of the layers we need to store (20-26), copy it
-        // Note: layer is the index of the PARENT layer we just computed
-        // So layer 0 computes layer 1, layer 1 computes layer 2, etc.
-        // We want to store layers 20-26, which are computed in iterations 19-25
+        // If this is one of the layers we need to store (20-26), copy it asynchronously
+        // Layer index here is the source layer (0-25), we're computing layer+1
+        // We want to store layers 20-26, computed in iterations 19-25
         if (layer >= STORED_LAYER_START - 1) {
             size_t copy_size = next_layer_size * sizeof(Digest);
             Digest* dest_ptr = buffer.d_merkle_tree + stored_offset;
-            cudaMemcpy(dest_ptr, next_layer, copy_size, cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(dest_ptr, next_layer, copy_size, cudaMemcpyDeviceToDevice, pp_stream);
             stored_offset += next_layer_size;
-            
-            // If this is the root (last layer), copy it separately
-            if (layer == MERKLE_TREE_HEIGHT_ - 1) {
-                cudaMemcpy(&buffer.merkle_root, next_layer, sizeof(Digest),
-                          cudaMemcpyDeviceToHost);
-            }
         }
         
-        // Prepare for next iteration
-        // Swap buffers for next iteration
-        if (layer < MERKLE_TREE_HEIGHT_ - 1) {
-            // After computing layer 1 (iteration 0), we can free d_leafs
-            if (layer == 0 && current_layer == current_buds) {
-                cudaFree(d_leafs);
-                d_leafs = nullptr;  // Mark as freed
-            }
-            
-            current_layer = next_layer;
-            current_layer_size = next_layer_size;
-            
-            // Swap buffers for next iteration
-            use_layer_a = !use_layer_a;
-            next_layer = use_layer_a ? d_layer_a : d_layer_b;
+        // Prepare for next iteration - ping-pong between buffers
+        current_layer = next_layer;
+        current_layer_size = next_layer_size;
+        
+        // After computing layer 1 (iteration 0), we can free d_leafs to save memory
+        if (layer == 0) {
+            cudaFree(d_leafs);
+            d_leafs = nullptr;
         }
+        
+        // Swap buffers for next iteration
+        use_layer_a = !use_layer_a;
+        next_layer = use_layer_a ? d_layer_a : d_layer_b;
     }
     
-    // Free d_leafs if not already freed
-    if (d_leafs != nullptr) {
-        cudaFree(d_leafs);
+    // Single sync at the end: wait for all tree construction and copies to complete
+    cudaError_t sync_err = cudaStreamSynchronize(pp_stream);
+    cudaStreamDestroy(pp_stream);
+    
+    if (sync_err != cudaSuccess) {
+        LOG_ERROR("preprocessing stream sync (low_vram)", sync_err);
+        if (d_leafs != nullptr) cudaFree(d_leafs);
+        cudaFree(d_layer_a);
+        cudaFree(d_layer_b);
+        buffer.cleanup();
+        return GuesserBuffer();
+    }
+    
+    // Check for cancellation after sync
+    if (cancel_flag && *cancel_flag) {
+        if (d_leafs != nullptr) cudaFree(d_leafs);
+        cudaFree(d_layer_a);
+        cudaFree(d_layer_b);
+        buffer.cleanup();
+        return GuesserBuffer();
     }
     
     // Free temporary buffers
-    cudaFree(d_leafs);
+    if (d_leafs != nullptr) {
+        cudaFree(d_leafs);
+    }
     cudaFree(d_layer_a);
     cudaFree(d_layer_b);
+    
+    // Copy root to host (tree is complete now)
+    cudaMemcpy(&buffer.merkle_root, buffer.d_merkle_tree + buffer.tree_size - 1,
+               sizeof(Digest), cudaMemcpyDeviceToHost);
     
     // Precompute index picker preimage
     buffer.index_picker_preimage = tip5_hash_fixed_host(buffer.merkle_root, commitment);
