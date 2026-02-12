@@ -1063,7 +1063,7 @@ std::vector<Digest> MTree::path(size_t index) const {
 
 // ===== GPU PREPROCESSING KERNELS =====
 
-__global__ void __launch_bounds__(256) bitreverse_swap_leafs_kernel(
+__global__ void __launch_bounds__(512) bitreverse_swap_leafs_kernel(
     Digest* __restrict__ leafs,
     size_t num_leafs,
     uint32_t log2_n
@@ -1094,7 +1094,7 @@ __global__ void __launch_bounds__(256) bitreverse_swap_leafs_kernel(
     }
 }
 
-__global__ void __launch_bounds__(128) build_layer1_from_layer0_on_demand_kernel(
+__global__ void __launch_bounds__(256) build_layer1_from_layer0_on_demand_kernel(
     Digest* __restrict__ internal_nodes,
     size_t height,
     size_t num_leafs,
@@ -1138,7 +1138,7 @@ __global__ void __launch_bounds__(128) build_layer1_from_layer0_on_demand_kernel
     internal_nodes[write_idx] = tip5_hash_fixed_device(layer0_node_a, layer0_node_b);
 }
 
-__global__ void __launch_bounds__(256) build_layer0_from_commitment_kernel(
+__global__ void __launch_bounds__(512) build_layer0_from_commitment_kernel(
     Digest* __restrict__ internal_nodes,
     size_t height,
     size_t num_leafs,
@@ -1159,7 +1159,7 @@ __global__ void __launch_bounds__(256) build_layer0_from_commitment_kernel(
     internal_nodes[range_layer_0_start + idx] = tip5_hash_fixed_device(leaf_a, leaf_b);
 }
 
-__global__ void __launch_bounds__(256) compute_buds_kernel(
+__global__ void __launch_bounds__(512) compute_buds_kernel(
     Digest* __restrict__ buds,
     const Digest commitment,
     size_t segment_len,
@@ -1238,7 +1238,7 @@ __global__ void __launch_bounds__(256) compute_buds_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
+__global__ void __launch_bounds__(512) compute_leafs_from_buds_kernel(
     Digest* __restrict__ leafs, 
     const Digest* __restrict__ buds, 
     size_t num_leafs, size_t layer) {
@@ -1273,7 +1273,7 @@ __global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256) merkle_zip_kernel(
+__global__ void __launch_bounds__(512) merkle_zip_kernel(
     Digest* __restrict__ parents, 
     const Digest* __restrict__ children, 
     size_t count) {
@@ -3716,7 +3716,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         return GuesserBuffer();
     }
     
-    int threadsPerBlock = 256;
+    int threadsPerBlock = 512;
     // OPTIMIZATION: Limit grid size for better occupancy and reduced launch overhead
     // Use smaller grid with grid-stride loops in kernels
     int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
@@ -3893,7 +3893,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         return GuesserBuffer();
     }
     
-    int threadsPerBlock = 256;
+    int threadsPerBlock = 512;
     
     // Step 1: Allocate leafs buffer using regular device memory (faster than managed memory)
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
