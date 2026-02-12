@@ -3657,31 +3657,6 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     int threadsPerBlock = 512;
     int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
     
-    // Use cudaMallocAsync for leafs if available to eliminate allocation overhead
-    bool used_async_alloc_leafs = false;
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    int mem_pools_supported = 0;
-    int device_id = 0;
-    cudaGetDevice(&device_id);
-    if (cudaDeviceGetAttribute(&mem_pools_supported, cudaDevAttrMemoryPoolsSupported, device_id) == cudaSuccess
-        && mem_pools_supported) {
-        cudaError_t async_err = cudaMallocAsync(&buffer.d_leafs, leafs_size, pp_stream);
-        if (async_err == cudaSuccess) {
-            used_async_alloc_leafs = true;
-        }
-    }
-#endif
-    if (!used_async_alloc_leafs) {
-        alloc_err = cudaMalloc(&buffer.d_leafs, leafs_size);
-        if (alloc_err != cudaSuccess) {
-            LOG_ERROR("cudaMalloc leafs", alloc_err);
-            cudaStreamDestroy(pp_stream);
-            return GuesserBuffer();
-        }
-    }
-    
-    LOG_DEBUG("preprocess_high_vram: allocated " << (leafs_size / (1024*1024)) << " MB for leafs");
-    
     // Step 1: Compute buds
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         buffer.d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
@@ -3689,25 +3664,12 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     // Step 2: Convert buds → leafs through NUM_BUD_LAYERS iterations
     size_t temp_buffer_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
-    
-    // Use async allocation for temp buffer as well
-    bool used_async_temp = false;
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    if (mem_pools_supported) {
-        cudaError_t async_err = cudaMallocAsync(&d_temp_leafs, temp_buffer_size, pp_stream);
-        if (async_err == cudaSuccess) {
-            used_async_temp = true;
-        }
-    }
-#endif
-    if (!used_async_temp) {
-        cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, temp_buffer_size);
-        if (temp_alloc_err != cudaSuccess) {
-            LOG_ERROR("cudaMalloc temp_leafs", temp_alloc_err);
-            cudaStreamDestroy(pp_stream);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
+    cudaError_t temp_alloc_err = cudaMalloc(&d_temp_leafs, temp_buffer_size);
+    if (temp_alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc temp_leafs", temp_alloc_err);
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
     }
     
     Digest* current_buds = buffer.d_leafs;
@@ -3731,12 +3693,12 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
     // Stream-ordered alloc: free temp and alloc merkle on same stream, no host sync.
     // Saves ~50-100 ms by eliminating cudaStreamSynchronize + cudaFree + cudaMalloc blocking.
-    if (mem_pools_supported) {
-        if (used_async_temp) {
-            cudaFreeAsync(d_temp_leafs, pp_stream);
-        } else {
-            cudaFree(d_temp_leafs);
-        }
+    int mem_pools_supported = 0;
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    if (cudaDeviceGetAttribute(&mem_pools_supported, cudaDevAttrMemoryPoolsSupported, device_id) == cudaSuccess
+        && mem_pools_supported) {
+        cudaFreeAsync(d_temp_leafs, pp_stream);
         d_temp_leafs = nullptr;
         alloc_err = cudaMallocAsync(&buffer.d_merkle_tree, internal_size, pp_stream);
         if (alloc_err == cudaSuccess) {
@@ -3870,31 +3832,15 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     
     int threadsPerBlock = 512;
     
-    // Step 1: Allocate leafs buffer - use async if available
+    // Step 1: Allocate leafs buffer using regular device memory (faster than managed memory)
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_leafs = nullptr;
-    
-    bool used_async_leafs = false;
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    int mem_pools_supported = 0;
-    int device_id = 0;
-    cudaGetDevice(&device_id);
-    if (cudaDeviceGetAttribute(&mem_pools_supported, cudaDevAttrMemoryPoolsSupported, device_id) == cudaSuccess
-        && mem_pools_supported) {
-        cudaError_t async_err = cudaMallocAsync(&d_leafs, leafs_size, pp_stream);
-        if (async_err == cudaSuccess) {
-            used_async_leafs = true;
-        }
-    }
-#endif
-    if (!used_async_leafs) {
-        alloc_err = cudaMalloc(&d_leafs, leafs_size);
-        if (alloc_err != cudaSuccess) {
-            LOG_ERROR("cudaMalloc leafs (low_vram)", alloc_err);
-            cudaStreamDestroy(pp_stream);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
+    alloc_err = cudaMalloc(&d_leafs, leafs_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc leafs (low_vram)", alloc_err);
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
     }
     
     // Compute buds (all kernels use the same stream for in-order execution)
@@ -3902,32 +3848,16 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
     
-    // Allocate temp buffer for bud->leaf conversion - use async if available
+    // Allocate temp buffer for bud->leaf conversion
     size_t temp_leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
-    
-    bool used_async_temp = false;
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    if (mem_pools_supported) {
-        cudaError_t async_err = cudaMallocAsync(&d_temp_leafs, temp_leafs_size, pp_stream);
-        if (async_err == cudaSuccess) {
-            used_async_temp = true;
-        }
-    }
-#endif
-    if (!used_async_temp) {
-        alloc_err = cudaMalloc(&d_temp_leafs, temp_leafs_size);
-        if (alloc_err != cudaSuccess) {
-            LOG_ERROR("cudaMalloc temp_leafs (low_vram)", alloc_err);
-            if (used_async_leafs) {
-                cudaFreeAsync(d_leafs, pp_stream);
-            } else {
-                cudaFree(d_leafs);
-            }
-            cudaStreamDestroy(pp_stream);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
+    alloc_err = cudaMalloc(&d_temp_leafs, temp_leafs_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc temp_leafs (low_vram)", alloc_err);
+        cudaFree(d_leafs);
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
     }
     
     Digest* current_buds = d_leafs;
@@ -3948,70 +3878,37 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     }
     
     // Step 2: Build tree layer-by-layer using sliding window approach
-    // Allocate two buffers for ping-pong between layers - use async if available
+    // Allocate two buffers for ping-pong between layers
     // Max size needed is for layer 1 (2^25 nodes = half of leafs)
     const size_t MAX_INTERMEDIATE_LAYER_SIZE = MERKLE_NUM_LEAFS / 2;
     size_t intermediate_buffer_size = MAX_INTERMEDIATE_LAYER_SIZE * sizeof(Digest);
     Digest* d_layer_a = nullptr;
     Digest* d_layer_b = nullptr;
     
-    bool used_async_layer_a = false;
-    bool used_async_layer_b = false;
-    
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    if (mem_pools_supported) {
-        cudaError_t async_err = cudaMallocAsync(&d_layer_a, intermediate_buffer_size, pp_stream);
-        if (async_err == cudaSuccess) {
-            used_async_layer_a = true;
-            async_err = cudaMallocAsync(&d_layer_b, intermediate_buffer_size, pp_stream);
-            if (async_err == cudaSuccess) {
-                used_async_layer_b = true;
-            }
-        }
-    }
-#endif
-    
-    if (!used_async_layer_a) {
-        alloc_err = cudaMalloc(&d_layer_a, intermediate_buffer_size);
-        if (alloc_err != cudaSuccess) {
-            LOG_ERROR("cudaMalloc layer_a (low_vram)", alloc_err);
-            if (used_async_temp) cudaFreeAsync(d_temp_leafs, pp_stream);
-            else cudaFree(d_temp_leafs);
-            if (used_async_leafs) cudaFreeAsync(d_leafs, pp_stream);
-            else cudaFree(d_leafs);
-            cudaStreamDestroy(pp_stream);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
+    alloc_err = cudaMalloc(&d_layer_a, intermediate_buffer_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc layer_a (low_vram)", alloc_err);
+        cudaFree(d_temp_leafs);
+        cudaFree(d_leafs);
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
     }
     
-    if (!used_async_layer_b) {
-        alloc_err = cudaMalloc(&d_layer_b, intermediate_buffer_size);
-        if (alloc_err != cudaSuccess) {
-            LOG_ERROR("cudaMalloc layer_b (low_vram)", alloc_err);
-            if (used_async_layer_a) cudaFreeAsync(d_layer_a, pp_stream);
-            else cudaFree(d_layer_a);
-            if (used_async_temp) cudaFreeAsync(d_temp_leafs, pp_stream);
-            else cudaFree(d_temp_leafs);
-            if (used_async_leafs) cudaFreeAsync(d_leafs, pp_stream);
-            else cudaFree(d_leafs);
-            cudaStreamDestroy(pp_stream);
-            buffer.cleanup();
-            return GuesserBuffer();
-        }
+    alloc_err = cudaMalloc(&d_layer_b, intermediate_buffer_size);
+    if (alloc_err != cudaSuccess) {
+        LOG_ERROR("cudaMalloc layer_b (low_vram)", alloc_err);
+        cudaFree(d_layer_a);
+        cudaFree(d_temp_leafs);
+        cudaFree(d_leafs);
+        cudaStreamDestroy(pp_stream);
+        buffer.cleanup();
+        return GuesserBuffer();
     }
     
     
     // Free temp buffer now (we only need d_leafs and the two layer buffers)
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    if (used_async_temp) {
-        cudaFreeAsync(d_temp_leafs, pp_stream);
-    } else {
-        cudaFree(d_temp_leafs);
-    }
-#else
     cudaFree(d_temp_leafs);
-#endif
     d_temp_leafs = nullptr;
     
     // Build tree from layer 0 (leafs) up to layer 26 (root) using ping-pong buffers
@@ -4046,15 +3943,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         
         // After computing layer 1 (iteration 0), we can free d_leafs to save memory
         if (layer == 0) {
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-            if (used_async_leafs) {
-                cudaFreeAsync(d_leafs, pp_stream);
-            } else {
-                cudaFree(d_leafs);
-            }
-#else
             cudaFree(d_leafs);
-#endif
             d_leafs = nullptr;
         }
         
@@ -4087,25 +3976,10 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     
     // Free temporary buffers
     if (d_leafs != nullptr) {
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-        if (used_async_leafs) {
-            cudaFreeAsync(d_leafs, pp_stream);
-        } else {
-            cudaFree(d_leafs);
-        }
-#else
         cudaFree(d_leafs);
-#endif
     }
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
-    if (used_async_layer_a) cudaFreeAsync(d_layer_a, pp_stream);
-    else cudaFree(d_layer_a);
-    if (used_async_layer_b) cudaFreeAsync(d_layer_b, pp_stream);
-    else cudaFree(d_layer_b);
-#else
     cudaFree(d_layer_a);
     cudaFree(d_layer_b);
-#endif
     
     // Copy root to host (tree is complete now)
     cudaMemcpy(&buffer.merkle_root, buffer.d_merkle_tree + buffer.tree_size - 1,
