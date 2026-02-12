@@ -1252,9 +1252,9 @@ __global__ void __launch_bounds__(768) compute_leafs_from_buds_kernel(
         #pragma unroll 1
         for (uint32_t i = idx32; i < n32; i += stride_step) {
             uint32_t buddy32 = (i + layer_stride) & mask;
-            // Use read-only cache for better memory bandwidth
-            Digest bud_a = __ldg(&buds[i]);
-            Digest bud_b = __ldg(&buds[buddy32]);
+            // Load both buds before hashing for better memory access
+            Digest bud_a = buds[i];
+            Digest bud_b = buds[buddy32];
             leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
         }
     } else {
@@ -1266,8 +1266,8 @@ __global__ void __launch_bounds__(768) compute_leafs_from_buds_kernel(
         #pragma unroll 1
         for (size_t i = idx; i < num_leafs; i += stride_step) {
             size_t buddy_index = (i + layer_stride) & mask;
-            Digest bud_a = __ldg(&buds[i]);
-            Digest bud_b = __ldg(&buds[buddy_index]);
+            Digest bud_a = buds[i];
+            Digest bud_b = buds[buddy_index];
             leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
         }
     }
@@ -1287,9 +1287,9 @@ __global__ void __launch_bounds__(768) merkle_zip_kernel(
         #pragma unroll 1
         for (uint32_t i = idx; i < count32; i += stride) {
             uint32_t child_idx = 2 * i;
-            // Prefetch pattern - load children with better coalescing
-            Digest left = __ldg(&children[child_idx]);
-            Digest right = __ldg(&children[child_idx + 1]);
+            // Load children with coalesced memory access
+            Digest left = children[child_idx];
+            Digest right = children[child_idx + 1];
             parents[i] = tip5_hash_fixed_device(left, right);
         }
     } else {
@@ -1299,8 +1299,8 @@ __global__ void __launch_bounds__(768) merkle_zip_kernel(
         #pragma unroll 1
         for (size_t i = idx; i < count; i += stride) {
             size_t child_idx = 2 * i;
-            Digest left = __ldg(&children[child_idx]);
-            Digest right = __ldg(&children[child_idx + 1]);
+            Digest left = children[child_idx];
+            Digest right = children[child_idx + 1];
             parents[i] = tip5_hash_fixed_device(left, right);
         }
     }
