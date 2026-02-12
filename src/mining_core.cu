@@ -1999,13 +1999,13 @@ uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
 
     size_t vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
     if (prop.major >= 10) {
-        optimal = (vram_gb >= 23) ? 120000000ULL : 80000000ULL;
+        optimal = (vram_gb >= 23) ? 150000000ULL : 100000000ULL;
     } else if (prop.major == 9) {
-        optimal = (vram_gb >= 23) ? 80000000ULL : 40000000ULL;
+        optimal = (vram_gb >= 23) ? 120000000ULL : 60000000ULL;
     } else if (prop.major == 8 && prop.minor == 9) {
-        optimal = (vram_gb >= 23) ? 80000000ULL : 40000000ULL;  // 80M for 24 GB class
+        optimal = (vram_gb >= 23) ? 120000000ULL : 60000000ULL;  // Increased for better throughput
     } else {
-        optimal = (vram_gb >= 23) ? 60000000ULL : 30000000ULL;
+        optimal = (vram_gb >= 23) ? 100000000ULL : 50000000ULL;
     }
 
     // Apply bounds
@@ -3331,7 +3331,7 @@ __device__ __forceinline__ Digest mast_hash_from_pow_encoding(
     return result;
 }
 
-__global__ void __launch_bounds__(256, 2) mining_kernel_phase1_high_vram(
+__global__ void __launch_bounds__(512, 2) mining_kernel_phase1_high_vram(
     Phase1Params params,
     uint64_t* __restrict__ d_phase_indices) {
 
@@ -3360,7 +3360,7 @@ __global__ void __launch_bounds__(256, 2) mining_kernel_phase1_high_vram(
     }
 }
 
-__global__ void __launch_bounds__(256, 2) mining_kernel_phase2_high_vram(
+__global__ void __launch_bounds__(512, 2) mining_kernel_phase2_high_vram(
     Phase2Params params,
     const uint64_t* __restrict__ d_phase_indices,
     uint64_t* __restrict__ d_solution_nonce,
@@ -4155,7 +4155,7 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     // Precompute x^7(FIXED_LEN_VAL) once for all 62 iterations
     uint64_t x7_fixed = x7_computer_pipelined(FIXED_LEN_VAL);
 
-    #pragma unroll 2
+    #pragma unroll 4
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         // Specialized permutation handles the known right-side values internally
         // — no need to write state[5..15] here (saves 11 writes per iteration)
