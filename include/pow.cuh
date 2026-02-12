@@ -52,8 +52,13 @@ public:
     bool output_buffers_allocated;
     
     // Phase-split intermediate buffer (index_a, index_b per nonce; 16 bytes/nonce)
+    // EXPANDED: Use 20M capacity instead of batch_size for better throughput
     uint64_t* d_phase_indices;
     size_t d_phase_indices_capacity;
+    
+    // Texture memory binding for merkle tree (faster random access in phase 2)
+    cudaTextureObject_t tex_merkle_tree;
+    bool texture_bound;
     
     // GPU range initialization (only need to set once per GPU)
     bool gpu_range_initialized;
@@ -82,12 +87,19 @@ public:
         , output_buffers_allocated(false)
         , d_phase_indices(nullptr)
         , d_phase_indices_capacity(0)
+        , tex_merkle_tree(0)
+        , texture_bound(false)
         , gpu_range_initialized(false)
         , l2_persist_set(false) {}
     
     ~GuesserBuffer() { cleanup(); }
     
     void cleanup() {
+        if (texture_bound && tex_merkle_tree) {
+            cudaDestroyTextureObject(tex_merkle_tree);
+            tex_merkle_tree = 0;
+            texture_bound = false;
+        }
         if (d_merkle_tree) {
             cudaFree(d_merkle_tree);
             d_merkle_tree = nullptr;
@@ -102,6 +114,11 @@ public:
     }
     
     void cleanup_mining_resources() {
+        if (texture_bound && tex_merkle_tree) {
+            cudaDestroyTextureObject(tex_merkle_tree);
+            tex_merkle_tree = 0;
+            texture_bound = false;
+        }
         if (d_solution_nonce) { cudaFree(d_solution_nonce); d_solution_nonce = nullptr; }
         if (d_solution_found) { cudaFree(d_solution_found); d_solution_found = nullptr; }
         if (d_solution_path_a) { cudaFree(d_solution_path_a); d_solution_path_a = nullptr; }
@@ -147,6 +164,8 @@ public:
         , output_buffers_allocated(other.output_buffers_allocated)
         , d_phase_indices(other.d_phase_indices)
         , d_phase_indices_capacity(other.d_phase_indices_capacity)
+        , tex_merkle_tree(other.tex_merkle_tree)
+        , texture_bound(other.texture_bound)
         , gpu_range_initialized(other.gpu_range_initialized)
         , l2_persist_set(other.l2_persist_set) {
         other.d_merkle_tree = nullptr;
@@ -163,6 +182,8 @@ public:
         other.d_solution_final_hash = nullptr;
         other.d_phase_indices = nullptr;
         other.d_phase_indices_capacity = 0;
+        other.tex_merkle_tree = 0;
+        other.texture_bound = false;
         other.output_buffers_allocated = false;
         other.gpu_range_initialized = false;
         other.l2_persist_set = false;
