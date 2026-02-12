@@ -849,8 +849,8 @@ Digest hex_to_digest(const std::string& hex) {
 
     const size_t nbytes = std::min(bytes.size(), max_bytes);
     for (size_t i = 0; i < nbytes; ++i) {
-        const int limb_index = static_cast<int>(i / 8);
-        const int byte_offset = static_cast<int>(i % 8);
+        const int limb_index = static_cast<int>(i >> 3);   // i/8 strength reduction
+        const int byte_offset = static_cast<int>(i & 7);  // i%8 strength reduction
         result.values[limb_index] |= static_cast<uint64_t>(bytes[i]) << (byte_offset * 8);
     }
 
@@ -1235,8 +1235,10 @@ __device__ __noinline__ Digest compute_leaf_from_commitment_device(
     Digest buf[1 << NUM_BUD_LAYERS];
 
     // Compute all buds for this leaf
+    // Strength reduction: num_leafs = 2^27, so a % num_leafs → a & (num_leafs-1)
+    const uint64_t leaf_mask = num_leafs - 1ULL;
     for (int i = 0; i < span; ++i) {
-        uint64_t idx = (base_index + (uint64_t)i) % (uint64_t)num_leafs;
+        uint64_t idx = (base_index + (uint64_t)i) & leaf_mask;
         // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
         // hash = Tip5::hash_pair(hash, Digest::new([index, 0, 0, 0, round]))
         Digest hash = commitment;
@@ -1981,7 +1983,10 @@ void calculate_mining_launch_config(
     }
 
     // Calculate blocks needed for nonces
-    int needed_blocks = (num_nonces + threads_per_block - 1) / threads_per_block;
+    // Strength reduction: when TPB=256, (n+255)/256 → (n+255)>>8
+    int needed_blocks = (threads_per_block == MINING_THREADS_PER_BLOCK)
+        ? static_cast<int>((num_nonces + threads_per_block - 1ULL) >> 8)
+        : static_cast<int>((num_nonces + threads_per_block - 1) / threads_per_block);
 
     // Cap at max blocks
     blocks_per_grid = std::min(needed_blocks, max_blocks);
@@ -3798,7 +3803,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
 
     const int merkle_threads = 512;  // Larger blocks for merkle (simple hash, better occupancy)
     for (size_t layer = 0; layer < MERKLE_TREE_HEIGHT_; ++layer) {
-        size_t parent_count = current_count / 2;
+        size_t parent_count = current_count >> 1;  // /2 strength reduction
         Digest* parent_layer = buffer.d_merkle_tree + write_offset;
 
         int layerBlocks = (parent_count + merkle_threads - 1) / merkle_threads;
@@ -4047,7 +4052,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
             return GuesserBuffer();
         }
 
-        size_t next_layer_size = current_layer_size / 2;
+        size_t next_layer_size = current_layer_size >> 1;  // /2 strength reduction
 
         // Compute next layer from current layer
         int layerBlocks = (next_layer_size + threadsPerBlock - 1) / threadsPerBlock;

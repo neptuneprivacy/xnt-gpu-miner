@@ -179,6 +179,11 @@ __device__ __forceinline__ uint64_t fast_field_add(uint64_t a, uint64_t b) {
     return result;
 }
 
+// Goldilocks opt: 2*x = x+x (one add vs full mul) - for constant 2
+__device__ __forceinline__ uint64_t field_mul_by_2_ptx(uint64_t x) {
+    return fast_field_add(x, x);
+}
+
 __host__ inline uint64_t fast_field_add_host(uint64_t a, uint64_t b) {
     uint64_t sum = a + b;
     if (sum < a || sum >= GOLDILOCKS_MODULUS) {

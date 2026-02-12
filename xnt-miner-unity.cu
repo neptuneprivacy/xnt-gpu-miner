@@ -712,14 +712,14 @@ __host__ void tip5_sponge_squeeze_host(uint64_t* state, uint64_t* digest) {
 __device__ __noinline__ Digest tip5_hash_fixed_device(const Digest& left, const Digest& right) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::FixedLength);
-    
+
     // OPTIMIZATION #10: Directly write to state instead of using intermediate array
     for (int i = 0; i < DIGEST_LEN; ++i) {
         state[i] = left.values[i];
         state[i + DIGEST_LEN] = right.values[i];
     }
     tip5_permutation(state);
-    
+
     Digest result;
     tip5_sponge_squeeze(state, result.values);
     return result;
@@ -728,7 +728,7 @@ __device__ __noinline__ Digest tip5_hash_fixed_device(const Digest& left, const 
 __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_len) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);
-    
+
     size_t pos = 0;
     while (pos + RATE <= input_len) {
         for (size_t i = 0; i < RATE; i++) {
@@ -737,20 +737,20 @@ __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_le
         tip5_permutation(state);
         pos += RATE;
     }
-    
+
     size_t remaining = input_len - pos;
-    
+
     for (size_t i = 0; i < RATE; i++) {
         state[i] = BFE_ZERO;
     }
-    
+
     for (size_t i = 0; i < remaining; i++) {
         state[i] = input[pos + i];
     }
-    
+
     state[remaining] = BFE_ONE;
     tip5_permutation(state);
-    
+
     Digest result;
     tip5_sponge_squeeze(state, result.values);
     return result;
@@ -759,15 +759,15 @@ __device__ Digest tip5_hash_varlen_device(const uint64_t* input, size_t input_le
 __host__ Digest tip5_hash_fixed_host(const Digest& left, const Digest& right) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init_host(state, Domain::FixedLength);
-    
+
     uint64_t combined_input[RATE];
     for (int i = 0; i < DIGEST_LEN; ++i) {
         combined_input[i] = left.values[i];
         combined_input[i + DIGEST_LEN] = right.values[i];
     }
-    
+
     tip5_sponge_absorb_chunk_host(state, combined_input, RATE);
-    
+
     Digest result;
     tip5_sponge_squeeze_host(state, result.values);
     return result;
@@ -778,15 +778,15 @@ __host__ std::array<uint64_t, DIGEST_LEN> tip5_hash_fixed_host(
     const std::array<uint64_t, DIGEST_LEN>& right) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init_host(state, Domain::FixedLength);
-    
+
     uint64_t combined_input[RATE];
     for (int i = 0; i < DIGEST_LEN; ++i) {
         combined_input[i] = left[i];
         combined_input[i + DIGEST_LEN] = right[i];
     }
-    
+
     tip5_sponge_absorb_chunk_host(state, combined_input, RATE);
-    
+
     std::array<uint64_t, DIGEST_LEN> digest;
     tip5_sponge_squeeze_host(state, digest.data());
     return digest;
@@ -795,7 +795,7 @@ __host__ std::array<uint64_t, DIGEST_LEN> tip5_hash_fixed_host(
 __host__ Digest tip5_hash_varlen_host(const std::vector<uint64_t>& input) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init_host(state, Domain::VariableLength);
-    
+
     size_t pos = 0;
     while (pos + RATE <= input.size()) {
         for (size_t i = 0; i < RATE; i++) {
@@ -804,21 +804,21 @@ __host__ Digest tip5_hash_varlen_host(const std::vector<uint64_t>& input) {
         tip5_permutation_host(state);
         pos += RATE;
     }
-    
+
     size_t remaining = input.size() - pos;
-    
+
     for (size_t i = 0; i < RATE; i++) {
         state[i] = BFE_ZERO;
     }
-    
+
     for (size_t i = 0; i < remaining; i++) {
         state[i] = input[pos + i];
     }
-    
+
     state[remaining] = BFE_ONE;
-    
+
     tip5_permutation_host(state);
-    
+
     Digest result;
     tip5_sponge_squeeze_host(state, result.values);
     return result;
@@ -826,7 +826,7 @@ __host__ Digest tip5_hash_varlen_host(const std::vector<uint64_t>& input) {
 
 std::string digest_to_hex(const Digest& digest) {
     std::ostringstream oss;
-    
+
     // Match Rust: serialize bytes in order (little-endian per limb), fixed 40 bytes
     std::array<uint8_t, DIGEST_LEN * 8> bytes{};
     for (int limb = 0; limb < DIGEST_LEN; ++limb) {
@@ -835,31 +835,31 @@ std::string digest_to_hex(const Digest& digest) {
             bytes[limb * 8 + byte] = static_cast<uint8_t>((value >> (byte * 8)) & 0xFF);
         }
     }
-    
+
     oss << std::hex << std::setfill('0');
     for (size_t i = 0; i < bytes.size(); ++i) {
         oss << std::setw(2) << static_cast<int>(bytes[i]);
     }
-    
+
     return oss.str();
 }
 
 Digest hex_to_digest(const std::string& hex) {
     Digest result;
-    
+
     for (int i = 0; i < DIGEST_LEN; ++i) {
         result.values[i] = 0;
     }
-    
+
     std::string hex_str = hex;
     if (hex_str.size() >= 2 && hex_str[0] == '0' && (hex_str[1] == 'x' || hex_str[1] == 'X')) {
         hex_str = hex_str.substr(2);
     }
-    
+
     if (hex_str.length() % 2 != 0) {
         hex_str = "0" + hex_str;
     }
-    
+
     std::vector<uint8_t> bytes;
     bytes.reserve(hex_str.length() / 2);
     for (size_t i = 0; i + 1 < hex_str.length(); i += 2) {
@@ -867,56 +867,56 @@ Digest hex_to_digest(const std::string& hex) {
         uint8_t byte = static_cast<uint8_t>(std::stoul(byteString, nullptr, 16));
         bytes.push_back(byte);
     }
-    
+
     // Right-pad to 40 bytes if shorter
     const size_t max_bytes = DIGEST_LEN * 8;
     if (bytes.size() < max_bytes) {
         bytes.resize(max_bytes, 0);
     }
-    
+
     const size_t nbytes = std::min(bytes.size(), max_bytes);
     for (size_t i = 0; i < nbytes; ++i) {
-        const int limb_index = static_cast<int>(i / 8);
-        const int byte_offset = static_cast<int>(i % 8);
+        const int limb_index = static_cast<int>(i >> 3);   // i/8 strength reduction
+        const int byte_offset = static_cast<int>(i & 7);  // i%8 strength reduction
         result.values[limb_index] |= static_cast<uint64_t>(bytes[i]) << (byte_offset * 8);
     }
-    
+
     return result;
 }
 
 Digest arrayStringToDigest(const std::string& str) {
     Digest result;
-    
+
     for (int i = 0; i < DIGEST_LEN; ++i) {
         result.values[i] = 0;
     }
-    
+
     std::string data = str;
-    
+
     size_t start = data.find('[');
     size_t end = data.find(']');
     if (start != std::string::npos && end != std::string::npos && end > start) {
         data = data.substr(start + 1, end - start - 1);
     }
-    
+
     std::istringstream ss(data);
     std::string token;
     int index = 0;
-    
+
     while (std::getline(ss, token, ',') && index < DIGEST_LEN) {
         size_t first = token.find_first_not_of(" \t\n\r");
         size_t last = token.find_last_not_of(" \t\n\r");
         if (first != std::string::npos && last != std::string::npos) {
             token = token.substr(first, last - first + 1);
         }
-        
+
         try {
             result.values[index] = std::stoull(token);
         } catch (...) {
         }
         index++;
     }
-    
+
     return result;
 }
 
@@ -924,7 +924,7 @@ Digest parseDigestString(const std::string& str) {
     if (str.find('[') != std::string::npos) {
         return arrayStringToDigest(str);
     }
-    
+
     return hex_to_digest(str);
 }
 
@@ -974,13 +974,13 @@ __host__ Digest digest_multiply_scalar(const Digest& d, uint64_t scalar) {
         carry = product >> 64;
     }
 #endif
-    
+
     if (carry > 0) {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             result.values[i] = UINT64_MAX;
         }
     }
-    
+
     return result;
 }
 
@@ -996,7 +996,7 @@ __host__ Digest make_target_easier(const Digest& target, uint64_t factor) {
 
 // ===== MTREE CLASS IMPLEMENTATION =====
 
-MTree MTree::build_inplace(std::vector<Digest> leafs, 
+MTree MTree::build_inplace(std::vector<Digest> leafs,
                            std::vector<Digest> internal_nodes,
                            bool* cancel_flag) {
     // Calculate height
@@ -1006,47 +1006,47 @@ MTree MTree::build_inplace(std::vector<Digest> leafs,
         temp >>= 1;
         height++;
     }
-    
+
     size_t num_sequential_layers = std::min(height, size_t(8));
     size_t seq_cutoff_height = std::max(size_t(1), height - num_sequential_layers);
-    
+
     // First layer: connects leafs to internal nodes
     size_t range_layer_0_start = 1 << (height - 1);
     size_t range_layer_0_end = 1 << height;
-    
+
     // EXACT CPU LOGIC: Use merkle_zip like CPU version
-    merkle_zip(&internal_nodes[range_layer_0_start], leafs.data(), 
+    merkle_zip(&internal_nodes[range_layer_0_start], leafs.data(),
                range_layer_0_end - range_layer_0_start);
-    
+
     if (cancel_flag && *cancel_flag) {
         return MTree();
     }
-    
+
     // EXACT CPU LOGIC: Remaining layers connect internal nodes to internal nodes
     for (size_t layer = 1; layer < seq_cutoff_height; ++layer) {
         size_t parents_start = 1 << (height - 1 - layer);
         size_t mid_point = 1 << (height - layer);
-        
-        par_merkle_zip(&internal_nodes[parents_start], 
-                      &internal_nodes[mid_point], 
+
+        par_merkle_zip(&internal_nodes[parents_start],
+                      &internal_nodes[mid_point],
                       mid_point - parents_start,
                       cancel_flag);
-        
+
         if (cancel_flag && *cancel_flag) {
             return MTree();
         }
     }
-    
+
     // EXACT CPU LOGIC: Do top of tree sequentially
     for (size_t layer = seq_cutoff_height; layer < height; ++layer) {
         size_t parents_start = 1 << (height - 1 - layer);
         size_t mid_point = 1 << (height - layer);
-        
-        merkle_zip(&internal_nodes[parents_start], 
-                  &internal_nodes[mid_point], 
+
+        merkle_zip(&internal_nodes[parents_start],
+                  &internal_nodes[mid_point],
                   mid_point - parents_start);
     }
-    
+
     return MTree(std::move(leafs), std::move(internal_nodes));
 }
 
@@ -1056,7 +1056,7 @@ void MTree::merkle_zip(Digest* parents, const Digest* children, size_t count) {
     }
 }
 
-void MTree::par_merkle_zip(Digest* parents, const Digest* children, 
+void MTree::par_merkle_zip(Digest* parents, const Digest* children,
                            size_t count, bool* cancel_flag) {
     // Simple parallel implementation using OpenMP if available
     // Otherwise falls back to sequential
@@ -1071,7 +1071,7 @@ std::vector<Digest> MTree::path(size_t index) const {
     std::vector<Digest> path;
     size_t running_index = index + leafs_.size();
     path.push_back(leafs_[index ^ 1]);
-    
+
     // Calculate tree height as log2 of number of leafs
     size_t tree_height = 0;
     size_t temp = leafs_.size();
@@ -1079,12 +1079,12 @@ std::vector<Digest> MTree::path(size_t index) const {
         temp >>= 1;
         tree_height++;
     }
-    
+
     for (size_t i = 1; i < tree_height; ++i) {
         running_index >>= 1;
         path.push_back(internal_nodes_[running_index ^ 1]);
     }
-    
+
     return path;
 }
 
@@ -1096,13 +1096,13 @@ __global__ void __launch_bounds__(256) bitreverse_swap_leafs_kernel(
     uint32_t log2_n
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     if (idx >= num_leafs) return;
-    
+
     // Calculate bit-reversed index - match Rust bitreverse implementation exactly
     // Rust uses u32 and reverses only the lower log2_n bits
     uint32_t k = (uint32_t)idx;
-    
+
     // Manual bit-reversal matching Rust implementation (for log2_n bits)
     // This is more accurate than __brev which reverses all 32 bits
     uint32_t rev_k = k;
@@ -1112,7 +1112,7 @@ __global__ void __launch_bounds__(256) bitreverse_swap_leafs_kernel(
     rev_k = ((rev_k & 0x00ff00ff) << 8) | ((rev_k & 0xff00ff00) >> 8);
     rev_k = __funnelshift_r(rev_k, rev_k, 16);  // rotate_right(16)
     rev_k = rev_k >> ((32 - log2_n) & 0x1f);
-    
+
     // Only swap if k < rev_k (prevents double-swapping) - matches Rust swap_indices logic
     if (k < rev_k && rev_k < num_leafs) {
         Digest temp = leafs[k];
@@ -1129,20 +1129,20 @@ __global__ void __launch_bounds__(128) build_layer1_from_layer0_on_demand_kernel
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t layer1_start = 1ULL << (height - 2); // Layer 1 start index (2^25)
-    size_t layer1_count = 1ULL << (height - 2); // Number of nodes in layer 1  
+    size_t layer1_count = 1ULL << (height - 2); // Number of nodes in layer 1
     if (idx >= layer1_count) return;
-    
+
     // Write index will be [layer1_start + idx]
     size_t write_idx = layer1_start + idx;
-    
+
     // Layer 1 node at write_idx has children from layer 0
     size_t layer0_child_a = write_idx * 2;
     size_t layer0_child_b = layer0_child_a + 1;
-    
+
     // Compute layer 0 children on-demand from leaves
     // Each layer 0 node is built from 2 leaves
     Digest layer0_node_a, layer0_node_b;
-    
+
     // Compute layer 0 node a from its leaf children
     {
         uint64_t leaf_idx_a = (layer0_child_a - (1ULL << (height-1))) * 2;
@@ -1151,7 +1151,7 @@ __global__ void __launch_bounds__(128) build_layer1_from_layer0_on_demand_kernel
         Digest leaf_b = compute_leaf_from_commitment_device_parallel(commitment, leaf_idx_b, num_leafs);
         layer0_node_a = tip5_hash_fixed_device(leaf_a, leaf_b);
     }
-    
+
     // Compute layer 0 node b from its leaf children
     {
         uint64_t leaf_idx_a = (layer0_child_b - (1ULL << (height-1))) * 2;
@@ -1160,7 +1160,7 @@ __global__ void __launch_bounds__(128) build_layer1_from_layer0_on_demand_kernel
         Digest leaf_b = compute_leaf_from_commitment_device_parallel(commitment, leaf_idx_b, num_leafs);
         layer0_node_b = tip5_hash_fixed_device(leaf_a, leaf_b);
     }
-    
+
     // Hash layer 0 children to create layer 1 node
     internal_nodes[write_idx] = tip5_hash_fixed_device(layer0_node_a, layer0_node_b);
 }
@@ -1213,8 +1213,8 @@ __global__ void __launch_bounds__(256) compute_buds_kernel(
 }
 
 __global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
-    Digest* __restrict__ leafs, 
-    const Digest* __restrict__ buds, 
+    Digest* __restrict__ leafs,
+    const Digest* __restrict__ buds,
     size_t num_leafs, size_t layer) {
     // Fast 32-bit path when safe
     if (num_leafs <= 0xFFFFFFFFu && layer < 32) {
@@ -1237,8 +1237,8 @@ __global__ void __launch_bounds__(256) compute_leafs_from_buds_kernel(
 }
 
 __global__ void __launch_bounds__(256) merkle_zip_kernel(
-    Digest* __restrict__ parents, 
-    const Digest* __restrict__ children, 
+    Digest* __restrict__ parents,
+    const Digest* __restrict__ children,
     size_t count) {
     if (count <= 0xFFFFFFFFu) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1262,8 +1262,10 @@ __device__ __noinline__ Digest compute_leaf_from_commitment_device(
     Digest buf[1 << NUM_BUD_LAYERS];
 
     // Compute all buds for this leaf
+    // Strength reduction: num_leafs = 2^27, so a % num_leafs → a & (num_leafs-1)
+    const uint64_t leaf_mask = num_leafs - 1ULL;
     for (int i = 0; i < span; ++i) {
-        uint64_t idx = (base_index + (uint64_t)i) % (uint64_t)num_leafs;
+        uint64_t idx = (base_index + (uint64_t)i) & leaf_mask;
         // Bud computation: 32 rounds of hashing (BUDDING_ROUNDS)
         // hash = Tip5::hash_pair(hash, Digest::new([index, 0, 0, 0, round]))
         Digest hash = commitment;
@@ -1299,6 +1301,31 @@ __device__ __noinline__ Digest compute_leaf_from_commitment_device_parallel(
     return compute_leaf_from_commitment_device(commitment, base_index, num_leafs);
 }
 
+// Texture memory fetch helper for optimized merkle tree access
+// NOTE: Currently disabled due to invalid argument errors
+// Uses hardware texture cache for better random access performance
+__device__ __forceinline__ Digest fetch_tree_node_tex(cudaTextureObject_t tex, size_t index) {
+    // DISABLED: Always return default digest since texture binding is disabled
+    // TODO: Fix texture binding before enabling this optimization
+    return Digest::default_digest();
+    
+    // Original implementation (disabled):
+    // if (tex == 0) {
+    //     return Digest::default_digest();
+    // }
+    // size_t base_idx = index * 3;
+    // uint4 data0 = tex1Dfetch<uint4>(tex, base_idx);
+    // uint4 data1 = tex1Dfetch<uint4>(tex, base_idx + 1);
+    // uint4 data2 = tex1Dfetch<uint4>(tex, base_idx + 2);
+    // Digest d;
+    // d.values[0] = ((uint64_t)data0.y << 32) | data0.x;
+    // d.values[1] = ((uint64_t)data0.w << 32) | data0.z;
+    // d.values[2] = ((uint64_t)data1.y << 32) | data1.x;
+    // d.values[3] = ((uint64_t)data1.w << 32) | data1.z;
+    // d.values[4] = ((uint64_t)data2.y << 32) | data2.x;
+    // return d;
+}
+
 __device__ __noinline__ Digest get_internal_node_safe(
     const Digest* d_internal_nodes,
     size_t node_index,
@@ -1311,25 +1338,25 @@ __device__ __noinline__ Digest get_internal_node_safe(
     if (node_index < stored_nodes_count) {
         return d_internal_nodes[node_index];
     }
-    
+
     // Slow path: Compute layer 0 node on-demand if needed
     const size_t layer0_start = 1ULL << (MERKLE_TREE_HEIGHT_ - 1); // 2^26
     const size_t layer0_end = 1ULL << MERKLE_TREE_HEIGHT_;   // 2^27
-    
+
     if (node_index >= layer0_start && node_index < layer0_end) {
         // Layer 0 node - compute from leaves
         size_t layer0_idx = node_index - layer0_start;
         uint64_t leaf_a_idx = layer0_idx * 2;
         uint64_t leaf_b_idx = leaf_a_idx + 1;
-        
+
         // Use leaf_prefix (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
         Digest leaf_a = compute_leaf_from_commitment_device(leaf_prefix, leaf_a_idx, num_leafs);
         Digest leaf_b = compute_leaf_from_commitment_device(leaf_prefix, leaf_b_idx, num_leafs);
-        
+
         // Hash and return
         return tip5_hash_fixed_device(leaf_a, leaf_b);
     }
-    
+
     // Unknown index - return zero digest
     return Digest::default_digest();
 }
@@ -1341,9 +1368,9 @@ __device__ void compute_merkle_path(
     const Digest* d_leafs,
     size_t num_leafs,
     size_t merkle_height) {
-    
+
     size_t running_index = leaf_index;
-    
+
     // First level: sibling leaf
     size_t sibling_leaf_index = running_index ^ 1;
     if (d_leafs != nullptr && sibling_leaf_index < num_leafs) {
@@ -1352,12 +1379,12 @@ __device__ void compute_merkle_path(
         path[0] = Digest::default_digest();
     }
     running_index >>= 1;
-    
+
     // Subsequent levels: sibling internal nodes
     for (size_t i = 1; i < merkle_height; ++i) {
         size_t layer_start = layer_start_index_device(i - 1, num_leafs);
         size_t sibling_index = layer_start + (running_index ^ 1);
-        
+
         path[i] = d_internal_nodes[sibling_index];
         running_index >>= 1;
     }
@@ -1372,7 +1399,7 @@ __device__ void compute_merkle_paths(
     const Digest* d_leafs,
     size_t num_leafs,
     size_t merkle_height) {
-    
+
     compute_merkle_path(path_a, index_a, d_internal_nodes, d_leafs, num_leafs, merkle_height);
     compute_merkle_path(path_b, index_b, d_internal_nodes, d_leafs, num_leafs, merkle_height);
 }
@@ -1415,17 +1442,17 @@ __device__ Digest get_cached_node(size_t index) {
 
 bool MiningOutputBuffers::allocate() {
     cudaError_t err;
-    
+
     err = cudaMalloc(&d_solution_nonce, sizeof(uint64_t));
     if (err != cudaSuccess) return false;
-    
+
     err = cudaMalloc(&d_solution_found, sizeof(int));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce);
         d_solution_nonce = nullptr;
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce);
@@ -1434,7 +1461,7 @@ bool MiningOutputBuffers::allocate() {
         d_solution_found = nullptr;
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce);
@@ -1445,7 +1472,7 @@ bool MiningOutputBuffers::allocate() {
         d_solution_path_a = nullptr;
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_nonce_digest, sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce);
@@ -1458,7 +1485,7 @@ bool MiningOutputBuffers::allocate() {
         d_solution_path_b = nullptr;
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce);
@@ -1473,7 +1500,7 @@ bool MiningOutputBuffers::allocate() {
         d_solution_nonce_digest = nullptr;
         return false;
     }
-    
+
     return true;
 }
 
@@ -1506,7 +1533,7 @@ void MiningOutputBuffers::free() {
 
 bool MiningOutputBuffers::reset() {
     if (!d_solution_found) return false;
-    
+
     cudaError_t err = cudaMemset(d_solution_found, 0, sizeof(int));
     return err == cudaSuccess;
 }
@@ -1523,21 +1550,56 @@ bool GuesserBuffer::ensure_mining_resources() {
         }
         stream_initialized = true;
     }
-    
+
+    // DISABLED: Texture memory binding causing "invalid argument" errors
+    // TODO: Fix texture binding implementation
+    // if (d_merkle_tree && tree_size > 0 && !texture_bound) {
+    //     cudaResourceDesc resDesc;
+    //     memset(&resDesc, 0, sizeof(resDesc));
+    //     resDesc.resType = cudaResourceTypeLinear;
+    //     resDesc.res.linear.devPtr = d_merkle_tree;
+    //     resDesc.res.linear.desc = cudaCreateChannelDesc<uint4>();
+    //     resDesc.res.linear.sizeInBytes = tree_size * sizeof(Digest);
+    //
+    //     cudaTextureDesc texDesc;
+    //     memset(&texDesc, 0, sizeof(texDesc));
+    //     texDesc.readMode = cudaReadModeElementType;
+    //
+    //     cudaError_t err = cudaCreateTextureObject(&tex_merkle_tree, &resDesc, &texDesc, NULL);
+    //     if (err == cudaSuccess) {
+    //         texture_bound = true;
+    //     } else {
+    //         std::cerr << "[WARNING] Failed to bind texture memory: " << cudaGetErrorString(err) << std::endl;
+    //         tex_merkle_tree = 0;
+    //     }
+    // }
+
+    // DISABLED: Expanded phase buffer allocation may be causing kernel issues
+    // TODO: Re-enable after fixing texture memory issues
+    // if (!d_phase_indices || d_phase_indices_capacity == 0) {
+    //     const size_t EXPANDED_CAPACITY = 20 * 1024 * 1024;  // 20M index pairs
+    //     cudaError_t err = cudaMalloc(&d_phase_indices, EXPANDED_CAPACITY * 2 * sizeof(uint64_t));
+    //     if (err == cudaSuccess) {
+    //         d_phase_indices_capacity = EXPANDED_CAPACITY;
+    //     } else {
+    //         std::cerr << "[WARNING] Failed to allocate expanded phase buffer: " << cudaGetErrorString(err) << std::endl;
+    //     }
+    // }
+
     // Allocate output buffers if not allocated
     if (!output_buffers_allocated) {
         cudaError_t err;
-        
+
         err = cudaMalloc(&d_solution_nonce, sizeof(uint64_t));
         if (err != cudaSuccess) { LOG_ERROR("alloc d_solution_nonce", err); return false; }
-        
+
         err = cudaMalloc(&d_solution_found, sizeof(int));
-        if (err != cudaSuccess) { 
+        if (err != cudaSuccess) {
             cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
-            LOG_ERROR("alloc d_solution_found", err); 
-            return false; 
+            LOG_ERROR("alloc d_solution_found", err);
+            return false;
         }
-        
+
         err = cudaMalloc(&d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
         if (err != cudaSuccess) {
             cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -1545,7 +1607,7 @@ bool GuesserBuffer::ensure_mining_resources() {
             LOG_ERROR("alloc d_solution_path_a", err);
             return false;
         }
-        
+
         err = cudaMalloc(&d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
         if (err != cudaSuccess) {
             cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -1554,7 +1616,7 @@ bool GuesserBuffer::ensure_mining_resources() {
             LOG_ERROR("alloc d_solution_path_b", err);
             return false;
         }
-        
+
         err = cudaMalloc(&d_solution_nonce_digest, sizeof(Digest));
         if (err != cudaSuccess) {
             cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -1564,7 +1626,7 @@ bool GuesserBuffer::ensure_mining_resources() {
             LOG_ERROR("alloc d_solution_nonce_digest", err);
             return false;
         }
-        
+
         err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
         if (err != cudaSuccess) {
             cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -1575,16 +1637,16 @@ bool GuesserBuffer::ensure_mining_resources() {
             LOG_ERROR("alloc d_solution_final_hash", err);
             return false;
         }
-        
+
         output_buffers_allocated = true;
     }
-    
+
     return true;
 }
 
 bool GuesserBuffer::reset_output_buffers() {
     if (!d_solution_found) return false;
-    
+
     // Use async memset on the mining stream for better overlap
     cudaError_t err = cudaMemsetAsync(d_solution_found, 0, sizeof(int), mining_stream);
     return err == cudaSuccess;
@@ -1596,23 +1658,23 @@ bool GuesserBuffer::reset_output_buffers() {
 // Call this once per job when the tree changes
 bool initialize_top_tree_cache(const Digest* d_merkle_tree, size_t num_leafs) {
     if (g_top_tree_cache_initialized) return true;
-    
+
     // Cache top TOP_TREE_CACHE_SIZE internal nodes in constant memory.
     // These are the first nodes (lowest indices) which correspond to the top
     // levels of the Merkle tree, accessed by all threads in the mining kernel.
-    
+
     cudaError_t err = cudaMemcpyToSymbol(
-        d_top_tree_cache, 
+        d_top_tree_cache,
         d_merkle_tree,  // First TOP_TREE_CACHE_SIZE nodes (as raw bytes)
         TOP_TREE_CACHE_SIZE * DIGEST_LEN * sizeof(uint64_t),
         0,
         cudaMemcpyDeviceToDevice);
-    
+
     if (err != cudaSuccess) {
         LOG_ERROR("initialize_top_tree_cache", err);
         return false;
     }
-    
+
     g_top_tree_cache_initialized = true;
     return true;
 }
@@ -1656,35 +1718,35 @@ __global__ void parallel_mining_kernel_high_vram(
     Digest* __restrict__ d_solution_path_b,
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
-    
+
     // Load S-box lookup table into shared memory (one load per thread)
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
     }
     __syncthreads();
-    
+
     // Check if solution already found
     if (*d_solution_found) return;
-    
+
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
-    
+
     // Cache constant values outside loop to prevent repeated memory accesses
     // Merkle root is constant - read once and reuse to maintain 40 MH/s performance
     const Digest* __restrict__ root_ptr = &d_internal_nodes[num_leafs - 2];
     const Digest merkle_root = *root_ptr;  // Cache constant value
-    
+
     // Check solution flag periodically to exit early (one global read per 16K nonces)
     const uint64_t CHECK_INTERVAL = 16384ULL;
-    
+
     // Process nonces
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found)
             break;
-        
+
         // Sequential nonce within GPU's range (using original working format)
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
-        
+
         // Nonce digest - EXACT ORIGINAL FORMAT (this was working at 13-15 M/s!)
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
@@ -1692,11 +1754,11 @@ __global__ void parallel_mining_kernel_high_vram(
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
-        
+
         // Compute indices from index picker preimage and nonce
         uint64_t index_a, index_b;
         Pow_indices_device(hash, nonce_digest, index_a, index_b);
-        
+
         // Compute POW hash directly from global memory - no Pow struct needed
         // This eliminates 2240 bytes of register pressure per thread
         // Uses top tree cache for fast access to upper Merkle levels
@@ -1710,10 +1772,10 @@ __global__ void parallel_mining_kernel_high_vram(
             index_b,  // path_index_b
             num_leafs,
             merkle_height);
-        
+
         // Check against target - PTX-optimized comparison (solution is rare)
         bool is_solution = digest_less_equal_ptx(final_hash, target);
-        
+
         if (__builtin_expect(is_solution, 0)) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
@@ -1721,10 +1783,10 @@ __global__ void parallel_mining_kernel_high_vram(
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_digest.values[0]);
                 // Store full nonce digest so host can submit all 5 limbs
                 *d_solution_nonce_digest = nonce_digest;
-                
+
                 // Store the final_hash that met the threshold (for debugging)
                 *d_solution_final_hash = final_hash;
-                
+
                 // Recompute paths for solution storage (solutions are rare, so this is fine)
                 // Path A
                 {
@@ -1733,8 +1795,8 @@ __global__ void parallel_mining_kernel_high_vram(
                     for (size_t level = 1; level < merkle_height; ++level) {
                         running_index >>= 1;
                         size_t sibling_index = running_index ^ 1;
-                        d_solution_path_a[level] = (sibling_index < num_leafs) 
-                            ? d_internal_nodes[sibling_index] 
+                        d_solution_path_a[level] = (sibling_index < num_leafs)
+                            ? d_internal_nodes[sibling_index]
                             : Digest::default_digest();
                     }
                 }
@@ -1745,12 +1807,12 @@ __global__ void parallel_mining_kernel_high_vram(
                     for (size_t level = 1; level < merkle_height; ++level) {
                         running_index >>= 1;
                         size_t sibling_index = running_index ^ 1;
-                        d_solution_path_b[level] = (sibling_index < num_leafs) 
-                            ? d_internal_nodes[sibling_index] 
+                        d_solution_path_b[level] = (sibling_index < num_leafs)
+                            ? d_internal_nodes[sibling_index]
                             : Digest::default_digest();
                     }
                 }
-                
+
                 return;
             }
         }
@@ -1786,25 +1848,25 @@ __global__ void parallel_mining_kernel_low_vram(
     Digest* __restrict__ d_solution_path_b,
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
-    
+
     // Load S-box lookup table into shared memory
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
     }
     __syncthreads();
-    
+
     if (*d_solution_found) return;
-    
+
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
-    
+
     // Check solution flag less frequently to reduce global memory traffic and cache pollution
     const uint64_t CHECK_INTERVAL = 8192ULL;
     for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) return;
-        
+
         uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
-        
+
         // Nonce digest - MUST match Rust: Digest(bfe_array![0, 0, 0, 0, i])
         // The nonce value goes in the LAST limb (index 4), not the first!
         Digest nonce_digest;
@@ -1813,26 +1875,26 @@ __global__ void parallel_mining_kernel_low_vram(
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = nonce_value;
-        
+
         uint64_t index_a, index_b;
         Pow_indices_device(hash, nonce_digest, index_a, index_b);
-        
+
         // Paths are ALWAYS computed using original indices (matching Rust guess())
         // For HardforkAlpha, leaves are swapped during preprocessing, so paths use original indices
         // but the tree structure matches the swapped leaves
         uint64_t path_index_a = index_a;
         uint64_t path_index_b = index_b;
-        
+
         // Commitment is needed for get_internal_node_safe (for computing missing nodes)
         Digest commitment = mast_paths.commit_device();
         // leaf_prefix is passed as parameter (commitment for Reboot/Xnt, prev_block_digest for HardforkAlpha)
-        
+
         // Compute final hash directly from global memory - no Pow struct or local arrays needed
         // This eliminates 2240 bytes of register pressure per thread (same as high VRAM version)
         // Root is at last index in sequentially-built tree
         const Digest* __restrict__ root_ptr = &d_internal_nodes[stored_nodes_count - 1];
         Digest merkle_root = *root_ptr;
-        
+
         // Use optimized low VRAM version that computes nodes on-demand
         Digest final_hash = fast_mast_hash_direct_low_vram(
             mast_paths,
@@ -1846,19 +1908,19 @@ __global__ void parallel_mining_kernel_low_vram(
             stored_nodes_count,
             commitment,
             leaf_prefix);
-        
+
         // Check against target - PTX-optimized comparison (solution is rare)
         bool is_solution = digest_less_equal_ptx(final_hash, target);
-        
+
         if (__builtin_expect(is_solution, 0)) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_value);
-                
+
                 // Store the final_hash that met the threshold (for debugging)
                 *d_solution_final_hash = final_hash;
                 *d_solution_nonce_digest = nonce_digest;
-                
+
                 // Store paths - use get_internal_node_safe for both stored and computed nodes
                 size_t running_index_a = path_index_a + num_leafs;
                 size_t sibling_leaf_index_a = path_index_a ^ 1;
@@ -1873,7 +1935,7 @@ __global__ void parallel_mining_kernel_low_vram(
                     size_t sibling_index_a = running_index_a ^ 1;
                     d_solution_path_a[level] = get_internal_node_safe(d_internal_nodes, sibling_index_a, stored_nodes_count, commitment, leaf_prefix, num_leafs);
                 }
-            
+
                 size_t running_index_b = path_index_b + num_leafs;
                 size_t sibling_leaf_index_b = path_index_b ^ 1;
                 // Use original index for computation (not bit-reversed)
@@ -1887,7 +1949,7 @@ __global__ void parallel_mining_kernel_low_vram(
                     size_t sibling_index_b = running_index_b ^ 1;
                     d_solution_path_b[level] = get_internal_node_safe(d_internal_nodes, sibling_index_b, stored_nodes_count, commitment, leaf_prefix, num_leafs);
                 }
-            
+
                 return;
             }
         }
@@ -1901,18 +1963,18 @@ void calculate_mining_launch_config(
     int& threads_per_block,
     int& blocks_per_grid,
     int gpu_id) {
-    
+
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
-    
+
     threads_per_block = (g_block_size > 0) ? g_block_size : MINING_THREADS_PER_BLOCK;
-    
+
     // Calculate optimal number of blocks
     // Note: Temporarily disabled due to CUDA 13.0 compatibility issue
     // int min_grid_size, optimal_block_size;
     // cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &optimal_block_size,
     //                                     parallel_mining_kernel_high_vram, 0, 0);
-    
+
     // Use multiple of SM count for good occupancy
     // Architecture-specific grid sizing based on compute capability
     // SM 100/120 = Blackwell (RTX 5090), SM 89 = Ada (RTX 4090), SM 90 = Hopper
@@ -1932,7 +1994,7 @@ void calculate_mining_launch_config(
         blocks_per_sm = 8;
     }
     int max_blocks = num_sms * blocks_per_sm;
-    
+
     // Override via env or --blocks: 680 = fast miner config from profile
     if (g_blocks_per_grid > 0) {
         blocks_per_grid = std::min(g_blocks_per_grid, MAX_GRID_DIM_X);
@@ -1946,51 +2008,51 @@ void calculate_mining_launch_config(
             return;
         }
     }
-    
+
     // Calculate blocks needed for nonces
-    int needed_blocks = (num_nonces + threads_per_block - 1) / threads_per_block;
-    
+    // Strength reduction: when TPB=256, (n+255)/256 → (n+255)>>8
+    int needed_blocks = (threads_per_block == MINING_THREADS_PER_BLOCK)
+        ? static_cast<int>((num_nonces + threads_per_block - 1ULL) >> 8)
+        : static_cast<int>((num_nonces + threads_per_block - 1) / threads_per_block);
+
     // Cap at max blocks
     blocks_per_grid = std::min(needed_blocks, max_blocks);
     blocks_per_grid = std::min(blocks_per_grid, MAX_GRID_DIM_X);
-    blocks_per_grid = 24*num_sms;
+    blocks_per_grid = std::min(blocks_per_grid, 24 * num_sms);
 }
 
 uint64_t get_optimal_batch_size(int gpu_id, int target_duration_ms) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, gpu_id);
-    
+
     // Base batch size scaled by SM count and architecture
     // Target ~800-900ms kernel duration for good responsiveness
     uint64_t optimal;
-    
+
+    size_t vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
     if (prop.major >= 10) {
-        // Blackwell (RTX 5090) - 192 SMs, larger batches
-        optimal = 80000000ULL;
+        optimal = (vram_gb >= 23) ? 140000000ULL : 95000000ULL;
     } else if (prop.major == 9) {
-        // Hopper - medium batch
-        optimal = 40000000ULL;
+        optimal = (vram_gb >= 23) ? 95000000ULL : 50000000ULL;
     } else if (prop.major == 8 && prop.minor == 9) {
-        // Ada Lovelace (RTX 4090) - 64 SMs; sweet spot for throughput
-        optimal = 40000000ULL;  // 40M nonces per batch
+        optimal = (vram_gb >= 23) ? 95000000ULL : 50000000ULL;  // Conservative increase for better throughput
     } else {
-        // Ampere and others
-        optimal = 30000000ULL;
+        optimal = (vram_gb >= 23) ? 75000000ULL : 40000000ULL;
     }
-    
+
     // Apply bounds
     const uint64_t min_batch = 1;
     const uint64_t max_batch = 100000000;  // Increased max for high-end GPUs
-    
+
     optimal = std::max(optimal, min_batch);
     optimal = std::min(optimal, max_batch);
-    
+
     return optimal;
 }
 
 MiningKernelType select_mining_kernel(int gpu_id) {
     VramMode mode = detect_vram_mode(gpu_id);
-    
+
     switch (mode) {
         case VramMode::HIGH_VRAM:
             return MiningKernelType::HIGH_VRAM;
@@ -2019,22 +2081,26 @@ bool sync_and_check_errors(const char* stage) {
     return true;
 }
 
-// Forward declare phase-split kernels (defined after fast_mast_hash_direct)
-extern __global__ void mining_kernel_phase1_high_vram(
-    const Digest hash,
-    const uint64_t start_nonce,
-    const uint64_t num_nonces,
-    uint64_t* __restrict__ d_phase_indices);
+// Phase-split param structs (defined early so mine_pow_with_buffer can use them)
+struct Phase1Params {
+    Digest index_picker_preimage;  // For Pow_indices only; no tree/target
+    uint64_t start_nonce;
+    uint64_t num_nonces;
+};
+struct Phase2Params {
+    const Digest* d_leafs;
+    const Digest* d_internal_nodes;
+    Digest merkle_root;
+    size_t num_leafs;
+    size_t merkle_height;
+    Digest target;
+    PowMastPaths mast_paths;
+    uint64_t start_nonce;
+    uint64_t num_nonces;
+};
+extern __global__ void mining_kernel_phase1_high_vram(Phase1Params params, uint64_t* __restrict__ d_phase_indices);
 extern __global__ void mining_kernel_phase2_high_vram(
-    const Digest* __restrict__ d_leafs,
-    const Digest* __restrict__ d_internal_nodes,
-    const Digest hash,
-    const Digest target,
-    const uint64_t start_nonce,
-    const uint64_t num_nonces,
-    const size_t num_leafs,
-    const size_t merkle_height,
-    const PowMastPaths mast_paths,
+    Phase2Params params,
     const uint64_t* __restrict__ d_phase_indices,
     uint64_t* __restrict__ d_solution_nonce,
     int* __restrict__ d_solution_found,
@@ -2053,35 +2119,35 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     uint64_t max_nonces,
     int consensus_rule_set,
     bool* cancel_flag) {
-    
+
     if (!buffer.is_valid()) {
         LOG_DEBUG("mine_pow_with_buffer: invalid buffer");
         return std::nullopt;
     }
-    
+
     // Ensure persistent mining resources are allocated (stream + output buffers)
     if (!buffer.ensure_mining_resources()) {
         LOG_DEBUG("mine_pow_with_buffer: failed to ensure mining resources");
         return std::nullopt;
     }
-    
+
     // Reset the solution_found flag (async on stream)
     if (!buffer.reset_output_buffers()) {
         return std::nullopt;
     }
-    
+
     // Get launch configuration
     int threads_per_block, blocks_per_grid;
     int gpu_id;
     cudaGetDevice(&gpu_id);
     calculate_mining_launch_config(max_nonces, threads_per_block, blocks_per_grid, gpu_id);
-    
+
     // Calculate GPU's dedicated nonce range to avoid overlap with other GPUs
     // Only set once per buffer - the range doesn't change during mining
     if (!buffer.gpu_range_initialized) {
         int actual_gpu_count = g_total_gpu_count.load();
         GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
-        
+
         // Copy range to constant memory (avoids register pressure from extra parameters)
         cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
         if (range_err != cudaSuccess) {
@@ -2093,31 +2159,39 @@ std::optional<MiningSolution> mine_pow_with_buffer(
             LOG_ERROR("copy range_size", range_err);
             return std::nullopt;
         }
-        
+
         // Initialize top tree cache (top 8 levels in constant memory)
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             LOG_DEBUG("mine_pow_with_buffer: failed to initialize top tree cache");
             // Non-fatal - continue without cache
         }
-        
+
         buffer.gpu_range_initialized = true;
     }
-    
+
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
-    
-    // Phase split default ON for HIGH_VRAM; set XNT_USE_PHASE_SPLIT=0 to disable
-    bool use_phase_split = false;
-    if (kernel_type == MiningKernelType::HIGH_VRAM) {
-        const char* env = std::getenv("XNT_USE_PHASE_SPLIT");
-        use_phase_split = (env == nullptr || env[0] != '0');
+
+    // Phase split is default for HIGH_VRAM; set XNT_USE_PHASE_SPLIT=0 to disable
+    bool use_phase_split = (kernel_type == MiningKernelType::HIGH_VRAM);
+    if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '0') {
+        use_phase_split = false;
     }
-    
+
     if (use_phase_split) {
         // Phase-split: d_phase_indices stores (index_a, index_b) = 16 bytes/nonce
-        // RTX 4090: 40M nonces * 16 = 640 MB, so full batch fits
-        constexpr size_t PHASE_CHUNK_MAX = 50ULL * 1024 * 1024;  // 50M nonces = 800 MB
+        // RTX 4090 (24 GB): ~14 GB free after ~10 GB mining buffer; use up to 8 GB for phase buffer
+        constexpr size_t PHASE_CHUNK_MAX = 500ULL * 1024 * 1024;  // 500M nonces = 8 GB
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp prop;
         size_t need_cap = std::min(max_nonces, PHASE_CHUNK_MAX);
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            size_t vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
+            if (vram_gb >= 23) {  // 23+ GB (RTX 4090 reports ~23.98)
+                need_cap = PHASE_CHUNK_MAX;
+            }
+        }
         if (buffer.d_phase_indices_capacity < need_cap) {
             if (buffer.d_phase_indices) {
                 cudaFree(buffer.d_phase_indices);
@@ -2132,29 +2206,32 @@ std::optional<MiningSolution> mine_pow_with_buffer(
             }
         }
     }
-    
+
     if (use_phase_split && buffer.d_phase_indices) {
         // Process in chunks to fit buffer
         uint64_t off = 0;
+        Digest merkle_root = buffer.merkle_root;  // Already set by preprocess
         while (off < max_nonces) {
             uint64_t chunk = std::min(max_nonces - off, buffer.d_phase_indices_capacity);
-            mining_kernel_phase1_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
-                buffer.index_picker_preimage,
-                start_nonce + off,
-                chunk,
-                buffer.d_phase_indices);
+            Phase1Params p1;
+            p1.index_picker_preimage = buffer.index_picker_preimage;
+            p1.start_nonce = start_nonce + off;
+            p1.num_nonces = chunk;
+            mining_kernel_phase1_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(p1, buffer.d_phase_indices);
             if (!check_kernel_launch_errors("mining_kernel_phase1")) return std::nullopt;
-            
+
+            Phase2Params p2;
+            p2.d_leafs = buffer.d_leafs;
+            p2.d_internal_nodes = buffer.d_merkle_tree;
+            p2.merkle_root = merkle_root;
+            p2.num_leafs = buffer.num_leafs;
+            p2.merkle_height = MERKLE_TREE_HEIGHT_;
+            p2.target = target;
+            p2.mast_paths = mast_paths;
+            p2.start_nonce = start_nonce + off;
+            p2.num_nonces = chunk;
             mining_kernel_phase2_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
-                buffer.d_leafs,
-                buffer.d_merkle_tree,
-                buffer.index_picker_preimage,
-                target,
-                start_nonce + off,
-                chunk,
-                buffer.num_leafs,
-                MERKLE_TREE_HEIGHT_,
-                mast_paths,
+                p2,
                 buffer.d_phase_indices,
                 buffer.d_solution_nonce,
                 buffer.d_solution_found,
@@ -2163,7 +2240,7 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.d_solution_nonce_digest,
                 buffer.d_solution_final_hash);
             if (!check_kernel_launch_errors("mining_kernel_phase2")) return std::nullopt;
-            
+
             int sol = 0;
             cudaMemcpy(&sol, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
             if (sol) break;
@@ -2191,7 +2268,7 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.d_solution_nonce_digest,
                 buffer.d_solution_final_hash);
             break;
-            
+
         case MiningKernelType::LOW_VRAM:
             parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 nullptr,
@@ -2214,14 +2291,14 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.d_solution_final_hash);
             break;
     }
-    
+
     mining_kernel_finalize<<<1, 1, 0, buffer.mining_stream>>>(buffer.d_solution_found);
-    
+
     // Check for launch errors
     if (!check_kernel_launch_errors("mining_kernel")) {
         return std::nullopt;
     }
-    
+
     // Check if solution was found
     // Note: cudaMemcpy implicitly synchronizes with the device, so no need for explicit sync
     int solution_found = 0;
@@ -2230,35 +2307,35 @@ std::optional<MiningSolution> mine_pow_with_buffer(
         LOG_ERROR("mining_kernel memcpy sync", sync_err);
         return std::nullopt;
     }
-    
+
     if (solution_found) {
         // Copy solution data back to host
         Pow solution;
-        
+
         uint64_t nonce_value;
         cudaMemcpy(&nonce_value, buffer.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-        
+
         cudaMemcpy(&solution.nonce, buffer.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
-        cudaMemcpy(solution.path_a, buffer.d_solution_path_a, 
+        cudaMemcpy(solution.path_a, buffer.d_solution_path_a,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
         cudaMemcpy(solution.path_b, buffer.d_solution_path_b,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
-        
+
         // Copy the final_hash that kernel computed (for debugging)
         Digest kernel_final_hash;
         cudaMemcpy(&kernel_final_hash, buffer.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
-        
+
         // Set root from buffer
         solution.root = buffer.merkle_root;
-        
+
         // Return both solution and kernel_final_hash
         MiningSolution mining_solution;
         mining_solution.pow = solution;
         mining_solution.kernel_final_hash = kernel_final_hash;
-        
+
         return mining_solution;
     }
-    
+
     return std::nullopt;
 }
 
@@ -2272,27 +2349,27 @@ MiningResult mine_batch(
     uint64_t batch_size,
     int consensus_rule_set,
     bool* cancel_flag) {
-    
+
     MiningResult result;
-    
+
     auto start_time = std::chrono::high_resolution_clock::now();
-    
+
     auto solution = mine_pow_with_buffer(
         buffer, target, mast_paths,
         start_nonce, batch_size, consensus_rule_set, cancel_flag);
-    
+
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-    
+
     result.elapsed_seconds = duration.count() / 1e6;
     result.nonces_tested = batch_size;
-    
+
     if (solution.has_value()) {
         result.solution_found = true;
         result.pow_solution = solution.value().pow;
         result.solution_hash = solution.value().kernel_final_hash;  // Use kernel's final_hash
     }
-    
+
     return result;
 }
 
@@ -2302,20 +2379,20 @@ MiningResult mine_batch(
 
 bool AsyncMiningSlot::allocate() {
     if (allocated) return true;
-    
+
     cudaError_t err;
-    
+
     // Allocate device buffers
     err = cudaMalloc(&d_solution_nonce, sizeof(uint64_t));
     if (err != cudaSuccess) { LOG_ERROR("AsyncMiningSlot alloc d_solution_nonce", err); return false; }
-    
+
     err = cudaMalloc(&d_solution_found, sizeof(int));
-    if (err != cudaSuccess) { 
+    if (err != cudaSuccess) {
         cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
-        LOG_ERROR("AsyncMiningSlot alloc d_solution_found", err); 
-        return false; 
+        LOG_ERROR("AsyncMiningSlot alloc d_solution_found", err);
+        return false;
     }
-    
+
     err = cudaMalloc(&d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -2323,7 +2400,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot alloc d_solution_path_a", err);
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -2332,7 +2409,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot alloc d_solution_path_b", err);
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_nonce_digest, sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -2342,7 +2419,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot alloc d_solution_nonce_digest", err);
         return false;
     }
-    
+
     err = cudaMalloc(&d_solution_final_hash, sizeof(Digest));
     if (err != cudaSuccess) {
         cudaFree(d_solution_nonce); d_solution_nonce = nullptr;
@@ -2353,7 +2430,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot alloc d_solution_final_hash", err);
         return false;
     }
-    
+
     // Allocate pinned host memory for async copy
     err = cudaMallocHost(&h_solution_found_pinned, sizeof(int));
     if (err != cudaSuccess) {
@@ -2366,7 +2443,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot alloc h_solution_found_pinned", err);
         return false;
     }
-    
+
     // Create stream with high priority for mining
     int least_priority, greatest_priority;
     cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
@@ -2382,7 +2459,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot create stream", err);
         return false;
     }
-    
+
     // Create event for completion tracking
     err = cudaEventCreateWithFlags(&completion_event, cudaEventDisableTiming);
     if (err != cudaSuccess) {
@@ -2397,7 +2474,7 @@ bool AsyncMiningSlot::allocate() {
         LOG_ERROR("AsyncMiningSlot create event", err);
         return false;
     }
-    
+
     allocated = true;
     kernel_launched = false;
     return true;
@@ -2427,14 +2504,14 @@ bool AsyncMiningSlot::reset() {
 
 bool DoubleBufferedMiner::initialize() {
     if (initialized) return true;
-    
+
     for (int i = 0; i < 2; ++i) {
         if (!slots[i].allocate()) {
             cleanup();
             return false;
         }
     }
-    
+
     current_slot = 0;
     initialized = true;
     return true;
@@ -2454,7 +2531,7 @@ bool DoubleBufferedMiner::launch_async(
     uint64_t start_nonce,
     uint64_t num_nonces,
     int consensus_rule_set) {
-    
+
     return launch_mining_kernel_async(
         slots[current_slot], buffer, target, mast_paths,
         start_nonce, num_nonces, consensus_rule_set);
@@ -2471,7 +2548,7 @@ int DoubleBufferedMiner::check_previous_slot(MiningSolution* out_solution, Guess
 bool DoubleBufferedMiner::wait_current_slot() {
     AsyncMiningSlot& slot = slots[current_slot];
     if (!slot.kernel_launched) return true;
-    
+
     cudaError_t err = cudaStreamSynchronize(slot.stream);
     return err == cudaSuccess;
 }
@@ -2484,27 +2561,27 @@ bool launch_mining_kernel_async(
     uint64_t start_nonce,
     uint64_t num_nonces,
     int consensus_rule_set) {
-    
+
     if (!buffer.is_valid() || !slot.allocated) {
         return false;
     }
-    
+
     // Reset slot for new batch
     if (!slot.reset()) {
         return false;
     }
-    
+
     // Store batch info for later retrieval
     slot.batch_start_nonce = start_nonce;
     slot.batch_size = num_nonces;
-    
+
     // Ensure GPU range is initialized (one-time setup)
     if (!buffer.gpu_range_initialized) {
         int gpu_id;
         cudaGetDevice(&gpu_id);
         int actual_gpu_count = g_total_gpu_count.load();
         GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
-        
+
         cudaError_t range_err = cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
         if (range_err != cudaSuccess) {
             LOG_ERROR("async copy range_start", range_err);
@@ -2515,24 +2592,48 @@ bool launch_mining_kernel_async(
             LOG_ERROR("async copy range_size", range_err);
             return false;
         }
-        
+
         if (!initialize_top_tree_cache(buffer.d_merkle_tree, buffer.num_leafs)) {
             // Non-fatal
         }
-        
+
         buffer.gpu_range_initialized = true;
     }
-    
+
     // Get launch configuration
     int threads_per_block, blocks_per_grid;
     int gpu_id;
     cudaGetDevice(&gpu_id);
     calculate_mining_launch_config(num_nonces, threads_per_block, blocks_per_grid, gpu_id);
-    
+
     // Select and launch kernel on slot's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
-    
-    switch (kernel_type) {
+    bool use_phase_split = (kernel_type == MiningKernelType::HIGH_VRAM) && buffer.d_phase_indices;
+    if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '0') use_phase_split = false;
+
+    if (kernel_type == MiningKernelType::HIGH_VRAM && use_phase_split) {
+        uint64_t chunk = std::min(num_nonces, buffer.d_phase_indices_capacity);
+        Phase1Params p1;
+        p1.index_picker_preimage = buffer.index_picker_preimage;
+        p1.start_nonce = start_nonce;
+        p1.num_nonces = chunk;
+        mining_kernel_phase1_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(p1, buffer.d_phase_indices);
+        Phase2Params p2;
+        p2.d_leafs = buffer.d_leafs;
+        p2.d_internal_nodes = buffer.d_merkle_tree;
+        p2.merkle_root = buffer.merkle_root;
+        p2.num_leafs = buffer.num_leafs;
+        p2.merkle_height = MERKLE_TREE_HEIGHT_;
+        p2.target = target;
+        p2.mast_paths = mast_paths;
+        p2.start_nonce = start_nonce;
+        p2.num_nonces = chunk;
+        mining_kernel_phase2_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
+            p2, buffer.d_phase_indices,
+            slot.d_solution_nonce, slot.d_solution_found,
+            slot.d_solution_path_a, slot.d_solution_path_b,
+            slot.d_solution_nonce_digest, slot.d_solution_final_hash);
+    } else switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
                 buffer.d_leafs,
@@ -2553,7 +2654,7 @@ bool launch_mining_kernel_async(
                 slot.d_solution_nonce_digest,
                 slot.d_solution_final_hash);
             break;
-            
+
         case MiningKernelType::LOW_VRAM:
             parallel_mining_kernel_low_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
                 nullptr,
@@ -2576,23 +2677,23 @@ bool launch_mining_kernel_async(
                 slot.d_solution_final_hash);
             break;
     }
-    
+
     mining_kernel_finalize<<<1, 1, 0, slot.stream>>>(slot.d_solution_found);
-    
+
     // Check for launch errors
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         LOG_ERROR("async mining kernel launch", err);
         return false;
     }
-    
+
     // Queue async copy of solution_found flag to pinned host memory
-    cudaMemcpyAsync(slot.h_solution_found_pinned, slot.d_solution_found, 
+    cudaMemcpyAsync(slot.h_solution_found_pinned, slot.d_solution_found,
                     sizeof(int), cudaMemcpyDeviceToHost, slot.stream);
-    
+
     // Record completion event
     cudaEventRecord(slot.completion_event, slot.stream);
-    
+
     slot.kernel_launched = true;
     return true;
 }
@@ -2601,53 +2702,53 @@ int check_async_mining_result(
     AsyncMiningSlot& slot,
     MiningSolution* out_solution,
     GuesserBuffer& buffer) {
-    
+
     if (!slot.kernel_launched) {
         return 0;  // No kernel was launched
     }
-    
+
     // Check if kernel has completed (non-blocking)
     cudaError_t status = cudaEventQuery(slot.completion_event);
-    
+
     if (status == cudaErrorNotReady) {
         return -1;  // Kernel still running
     }
-    
+
     if (status != cudaSuccess) {
         LOG_ERROR("check_async_mining_result event query", status);
         slot.kernel_launched = false;
         return 0;
     }
-    
+
     // Kernel completed - check if solution was found
     slot.kernel_launched = false;
-    
+
     int solution_found = *slot.h_solution_found_pinned;
-    
+
     if (solution_found && out_solution) {
         // Copy solution data back to host (blocking, but solutions are rare)
         Pow solution;
-        
+
         uint64_t nonce_value;
         cudaMemcpy(&nonce_value, slot.d_solution_nonce, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-        
+
         cudaMemcpy(&solution.nonce, slot.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
-        cudaMemcpy(solution.path_a, slot.d_solution_path_a, 
+        cudaMemcpy(solution.path_a, slot.d_solution_path_a,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
         cudaMemcpy(solution.path_b, slot.d_solution_path_b,
                    MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
-        
+
         Digest kernel_final_hash;
         cudaMemcpy(&kernel_final_hash, slot.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
-        
+
         solution.root = buffer.merkle_root;
-        
+
         out_solution->pow = solution;
         out_solution->kernel_final_hash = kernel_final_hash;
-        
+
         return 1;  // Solution found
     }
-    
+
     return 0;  // No solution
 }
 // ========== Inlined from kernels.cu (end) ==========
@@ -2663,7 +2764,7 @@ __device__ Digest PowMastPaths::commit_device() const {
     // Match Rust: Tip5::hash_varlen over flattened pow, header, kernel digests
     uint64_t values[DIGEST_LEN * 6];
     size_t pos = 0;
-    
+
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
             values[pos++] = pow[i].values[j];
@@ -2677,7 +2778,7 @@ __device__ Digest PowMastPaths::commit_device() const {
     for (int j = 0; j < DIGEST_LEN; ++j) {
         values[pos++] = kernel[0].values[j];
     }
-    
+
     return tip5_hash_varlen_device(values, pos);
 }
 
@@ -2720,13 +2821,13 @@ __host__ Digest PowMastPaths::commit() const {
     // Match Rust: Tip5::hash_varlen over flattened pow, header, kernel digests
     std::vector<uint64_t> values;
     values.reserve(DIGEST_LEN * 6);
-    
+
     auto append_digest = [&values](const Digest& d) {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             values.push_back(d.values[i]);
         }
     };
-    
+
     for (int i = 0; i < 3; ++i) {
         append_digest(pow[i]);
     }
@@ -2734,7 +2835,7 @@ __host__ Digest PowMastPaths::commit() const {
         append_digest(header[i]);
     }
     append_digest(kernel[0]);
-    
+
     return tip5_hash_varlen_host(values);
 }
 
@@ -2744,7 +2845,7 @@ Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
     auto header_mast_hash = tip5_hash_fixed_host(tip5_hash_varlen_host(pow_encoding), this->pow[0]);
     header_mast_hash = tip5_hash_fixed_host(header_mast_hash, this->pow[1]);
     header_mast_hash = tip5_hash_fixed_host(this->pow[2], header_mast_hash);
-    
+
     // Convert header_mast_hash to vector for varlen hash
     std::vector<uint64_t> header_encoding;
     for (const auto& val : header_mast_hash.values) {
@@ -2752,7 +2853,7 @@ Digest PowMastPaths::fast_mast_hash(const Pow& pow_obj) const {
     }
     auto kernel_mast_hash = tip5_hash_fixed_host(tip5_hash_varlen_host(header_encoding), this->header[0]);
     kernel_mast_hash = tip5_hash_fixed_host(kernel_mast_hash, this->header[1]);
-    
+
     // Convert kernel_mast_hash to vector for varlen hash
     std::vector<uint64_t> kernel_encoding;
     for (const auto& val : kernel_mast_hash.values) {
@@ -2777,12 +2878,12 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
     tip5_sponge_init(state, Domain::VariableLength);
     constexpr size_t kMerkleHeight = MERKLE_TREE_HEIGHT_;
     (void)merkle_height; // Mining uses fixed height; keep param to avoid API churn.
-    
+
     // Total encoding: nonce(5) + path_b(135) + path_a(135) + root(5) = 280 words
     // RATE = 10, so 28 full chunks
-    
+
     int chunk_pos = 0;
-    
+
     // Inline absorb - directly write to state, permute when full
     #define ABSORB_VALUE(val) do { \
         state[chunk_pos++] = (val); \
@@ -2805,10 +2906,10 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         ABSORB_VALUE(__ldg(&(p)->values[3])); \
         ABSORB_VALUE(__ldg(&(p)->values[4])); \
     } while(0)
-    
+
     // 1. Add nonce (5 words)
     ABSORB_DIGEST(nonce);
-    
+
     // 2. Add path_b (27 * 5 = 135 words) - optimized with read-only cache hints
     {
         size_t running_index = path_index_b + num_leafs;
@@ -2816,7 +2917,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
         size_t sibling_leaf = path_index_b ^ 1;
         // Use __ldg() for read-only global memory - enables read-only cache
         ABSORB_DIGEST_PTR_LDG(&d_leafs[sibling_leaf]);
-        
+
         // Levels 1-26: internal nodes - use read-only cache and constant memory
         #pragma unroll
         for (size_t level = 1; level < kMerkleHeight; ++level) {
@@ -2835,14 +2936,14 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
                 }
         }
     }
-    
+
     // 3. Add path_a (27 * 5 = 135 words) - optimized with read-only cache hints
     {
         size_t running_index = path_index_a + num_leafs;
         // Level 0: leaf sibling - use read-only cache hint for better caching
         size_t sibling_leaf = path_index_a ^ 1;
         ABSORB_DIGEST_PTR_LDG(&d_leafs[sibling_leaf]);
-        
+
         // Levels 1-26: internal nodes - use read-only cache and constant memory
         #pragma unroll
         for (size_t level = 1; level < kMerkleHeight; ++level) {
@@ -2861,14 +2962,14 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
                 }
         }
     }
-    
+
     // 4. Add root (5 words)
     ABSORB_DIGEST(root);
-    
+
     #undef ABSORB_DIGEST_PTR_LDG
     #undef ABSORB_DIGEST
     #undef ABSORB_VALUE
-    
+
     // Final padding (280 % 10 = 0, so chunk_pos should be 0)
     // Zero remaining slots and add padding marker
     #pragma unroll
@@ -2877,7 +2978,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
     }
     state[chunk_pos] = BFE_ONE;
     tip5_permutation(state);
-    
+
     Digest result;
     #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
@@ -2890,9 +2991,9 @@ __device__ __noinline__ Digest hash_pow_encoding_direct(
 __device__ __noinline__ Digest hash_pow_encoding_streaming(const Pow& pow_obj) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);
-    
+
     int chunk_pos = 0;
-    
+
     #define ABSORB_VALUE(val) do { \
         state[chunk_pos++] = (val); \
         if (chunk_pos == RATE) { \
@@ -2907,40 +3008,40 @@ __device__ __noinline__ Digest hash_pow_encoding_streaming(const Pow& pow_obj) {
         ABSORB_VALUE((d).values[3]); \
         ABSORB_VALUE((d).values[4]); \
     } while(0)
-    
+
     // 1. Add nonce (5 words)
     for (int i = 0; i < DIGEST_LEN; ++i) {
         ABSORB_VALUE(pow_obj.nonce.values[i]);
     }
-    
+
     // 2. Add path_b (27 * 5 = 135 words)
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
             ABSORB_VALUE(pow_obj.path_b[i].values[j]);
         }
     }
-    
+
     // 3. Add path_a (27 * 5 = 135 words)
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
             ABSORB_VALUE(pow_obj.path_a[i].values[j]);
         }
     }
-    
+
     // 4. Add root (5 words)
     for (int i = 0; i < DIGEST_LEN; ++i) {
         ABSORB_VALUE(pow_obj.root.values[i]);
     }
-    
+
     #undef ABSORB_VALUE
-    
+
     // Final padding
     for (int i = chunk_pos; i < RATE; ++i) {
         state[i] = BFE_ZERO;
     }
     state[chunk_pos] = BFE_ONE;
     tip5_permutation(state);
-    
+
     Digest result;
     for (int i = 0; i < DIGEST_LEN; ++i) {
         result.values[i] = state[i];
@@ -2951,16 +3052,16 @@ __device__ __noinline__ Digest hash_pow_encoding_streaming(const Pow& pow_obj) {
 __device__ __noinline__ Digest PowMastPaths::fast_mast_hash_device(const Pow& pow_obj) const {
     // Streaming hash - no large local array needed
     Digest pow_encoding_digest = hash_pow_encoding_streaming(pow_obj);
-    
+
     // MAST hash chain
     Digest header_mast_hash = tip5_hash_fixed_device(pow_encoding_digest, pow[0]);
     header_mast_hash = tip5_hash_fixed_device(header_mast_hash, pow[1]);
     header_mast_hash = tip5_hash_fixed_device(pow[2], header_mast_hash);
-    
+
     // Use specialized 5-word hash function instead of building array
     Digest kernel_mast_hash = tip5_hash_fixed_device(tip5_hash_varlen_len5_device(header_mast_hash), header[0]);
     kernel_mast_hash = tip5_hash_fixed_device(kernel_mast_hash, header[1]);
-    
+
     return tip5_hash_fixed_device(tip5_hash_varlen_len5_device(kernel_mast_hash), kernel[0]);
 }
 
@@ -2981,9 +3082,9 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     tip5_sponge_init(state, Domain::VariableLength);
     constexpr size_t kMerkleHeight = MERKLE_TREE_HEIGHT_;
     (void)merkle_height; // Mining uses fixed height; keep param to avoid API churn.
-    
+
     int chunk_pos = 0;
-    
+
     #define ABSORB_VALUE(val) do { \
         state[chunk_pos++] = (val); \
         if (chunk_pos == RATE) { \
@@ -2991,10 +3092,10 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
             chunk_pos = 0; \
         } \
     } while(0)
-    
+
     // 1. Add nonce (5 words)
     ABSORB_DIGEST(nonce);
-    
+
     // 2. Add path_b (27 * 5 = 135 words) - compute on-demand
     {
         size_t running_index = path_index_b + num_leafs;
@@ -3002,7 +3103,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
         // Compute leaf on-demand
         Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
         ABSORB_DIGEST(sib);
-        
+
         // Levels 1-26: use get_internal_node_safe
         #pragma unroll
         for (size_t level = 1; level < kMerkleHeight; ++level) {
@@ -3012,7 +3113,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
             ABSORB_DIGEST(node);
         }
     }
-    
+
     // 3. Add path_a (27 * 5 = 135 words) - compute on-demand
     {
         size_t running_index = path_index_a + num_leafs;
@@ -3020,7 +3121,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
         // Compute leaf on-demand
         Digest sib = compute_leaf_from_commitment_device_parallel(leaf_prefix, sibling_leaf_index, num_leafs);
         ABSORB_DIGEST(sib);
-        
+
         // Levels 1-26: use get_internal_node_safe
         #pragma unroll
         for (size_t level = 1; level < kMerkleHeight; ++level) {
@@ -3030,13 +3131,13 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
             ABSORB_DIGEST(node);
         }
     }
-    
+
     // 4. Add root (5 words)
     ABSORB_DIGEST(root);
-    
+
     #undef ABSORB_DIGEST
     #undef ABSORB_VALUE
-    
+
     // Final padding
     #pragma unroll
     for (int i = chunk_pos; i < RATE; ++i) {
@@ -3044,7 +3145,7 @@ __device__ __noinline__ Digest hash_pow_encoding_direct_low_vram(
     }
     state[chunk_pos] = BFE_ONE;
     tip5_permutation(state);
-    
+
     Digest result;
     #pragma unroll
     for (int i = 0; i < DIGEST_LEN; ++i) {
@@ -3062,14 +3163,14 @@ __device__ __forceinline__ void tip5_hash_fixed_inplace(uint64_t* state, const D
     state[2] = left.values[2];
     state[3] = left.values[3];
     state[4] = left.values[4];
-    
+
     // Load right digest into state[5..9]
     state[5] = right.values[0];
     state[6] = right.values[1];
     state[7] = right.values[2];
     state[8] = right.values[3];
     state[9] = right.values[4];
-    
+
     // Capacity region (state[10..15]) = FixedLength domain
     constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
     state[10] = FIXED_LEN_VAL;
@@ -3078,7 +3179,7 @@ __device__ __forceinline__ void tip5_hash_fixed_inplace(uint64_t* state, const D
     state[13] = FIXED_LEN_VAL;
     state[14] = FIXED_LEN_VAL;
     state[15] = FIXED_LEN_VAL;
-    
+
     tip5_permutation(state);
 }
 
@@ -3091,14 +3192,14 @@ __device__ __forceinline__ void tip5_hash_varlen5_inplace(uint64_t* state, const
     state[2] = in.values[2];
     state[3] = in.values[3];
     state[4] = in.values[4];
-    
+
     // Padding: state[5] = 1, state[6..9] = 0
     state[5] = BFE_ONE;
     state[6] = 0ULL;
     state[7] = 0ULL;
     state[8] = 0ULL;
     state[9] = 0ULL;
-    
+
     // Capacity region (state[10..15]) = VariableLength domain (0)
     state[10] = 0ULL;
     state[11] = 0ULL;
@@ -3106,7 +3207,7 @@ __device__ __forceinline__ void tip5_hash_varlen5_inplace(uint64_t* state, const
     state[13] = 0ULL;
     state[14] = 0ULL;
     state[15] = 0ULL;
-    
+
     tip5_permutation(state);
 }
 
@@ -3205,10 +3306,10 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
     Digest pow_encoding_digest = hash_pow_encoding_direct(
         nonce, root, d_leafs, d_internal_nodes,
         path_index_a, path_index_b, num_leafs, merkle_height);
-    
+
     // OPTIMIZED MAST hash chain - reuse single state array
     uint64_t state[STATE_SIZE];
-    
+
     // Keep the rolling digest in state[0..4] to avoid temporary Digest copies.
     // Step 1: state = hash(pow_encoding_digest, pow[0])
     tip5_hash_fixed_inplace(state, pow_encoding_digest, mast_paths.pow[0]);
@@ -3226,7 +3327,7 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
     tip5_hash_varlen5_state(state);
     // Step 8: state = hash(state, kernel[0])
     tip5_hash_fixed_left_state(state, mast_paths.kernel[0]);
-    
+
     Digest result;
     result.values[0] = state[0];
     result.values[1] = state[1];
@@ -3238,8 +3339,8 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
 
 // ===== PHASE-SPLIT KERNELS (XNT_USE_PHASE_SPLIT=1) =====
 // Phase 1: Pow_indices only → store (index_a, index_b) buffer (16 bytes/nonce)
-// Phase 2: Read buffer, fast_mast_hash_direct (hash_pow_encoding + MAST) → target check
-// Uses less VRAM than pow_encoding buffer; RTX 4090 can handle full batch.
+// Phase 2: Read buffer, hash_pow_encoding + mast_hash → target check
+// Structs Phase1Params/Phase2Params defined earlier near forward declarations.
 
 __device__ __forceinline__ Digest mast_hash_from_pow_encoding(
     const Digest& pow_encoding_digest,
@@ -3263,46 +3364,36 @@ __device__ __forceinline__ Digest mast_hash_from_pow_encoding(
 }
 
 __global__ void __launch_bounds__(256, 2) mining_kernel_phase1_high_vram(
-    const Digest hash,
-    const uint64_t start_nonce,
-    const uint64_t num_nonces,
+    Phase1Params params,
     uint64_t* __restrict__ d_phase_indices) {
-    
+
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
     }
     __syncthreads();
-    
+
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
-    
-    for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
-        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+
+    for (uint64_t idx = tid; idx < params.num_nonces; idx += stride) {
+        uint64_t nonce_value = d_gpu_range_start + params.start_nonce + idx;
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
         nonce_digest.values[1] = 0;
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
-        
+
         uint64_t index_a, index_b;
-        Pow_indices_device(hash, nonce_digest, index_a, index_b);
-        
+        Pow_indices_device(params.index_picker_preimage, nonce_digest, index_a, index_b);
+
         d_phase_indices[idx * 2] = index_a;
         d_phase_indices[idx * 2 + 1] = index_b;
     }
 }
 
 __global__ void __launch_bounds__(256, 2) mining_kernel_phase2_high_vram(
-    const Digest* __restrict__ d_leafs,
-    const Digest* __restrict__ d_internal_nodes,
-    const Digest hash,
-    const Digest target,
-    const uint64_t start_nonce,
-    const uint64_t num_nonces,
-    const size_t num_leafs,
-    const size_t merkle_height,
-    const PowMastPaths mast_paths,
+    Phase2Params params,
     const uint64_t* __restrict__ d_phase_indices,
     uint64_t* __restrict__ d_solution_nonce,
     int* __restrict__ d_solution_found,
@@ -3310,62 +3401,61 @@ __global__ void __launch_bounds__(256, 2) mining_kernel_phase2_high_vram(
     Digest* __restrict__ d_solution_path_b,
     Digest* __restrict__ d_solution_nonce_digest,
     Digest* __restrict__ d_solution_final_hash) {
-    
+
     if (threadIdx.x < 256) {
         s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
     }
     __syncthreads();
-    
+
     if (*d_solution_found) return;
-    
-    const Digest merkle_root = d_internal_nodes[num_leafs - 2];
+
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = gridDim.x * blockDim.x;
     const uint64_t CHECK_INTERVAL = 16384ULL;
-    
-    for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
+
+    for (uint64_t idx = tid; idx < params.num_nonces; idx += stride) {
         if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) break;
-        
+
         uint64_t index_a = d_phase_indices[idx * 2];
         uint64_t index_b = d_phase_indices[idx * 2 + 1];
-        
-        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+
+        uint64_t nonce_value = d_gpu_range_start + params.start_nonce + idx;
         Digest nonce_digest;
         nonce_digest.values[0] = nonce_value;
         nonce_digest.values[1] = 0;
         nonce_digest.values[2] = 0;
         nonce_digest.values[3] = 0;
         nonce_digest.values[4] = 0;
-        
+
         Digest pow_enc = hash_pow_encoding_direct(
-            nonce_digest, merkle_root, d_leafs, d_internal_nodes,
-            index_a, index_b, num_leafs, merkle_height);
-        Digest final_hash = mast_hash_from_pow_encoding(pow_enc, mast_paths);
-        bool is_solution = digest_less_equal_ptx(final_hash, target);
-        
+            nonce_digest, params.merkle_root, params.d_leafs, params.d_internal_nodes,
+            index_a, index_b, params.num_leafs, params.merkle_height);
+        Digest final_hash = mast_hash_from_pow_encoding(pow_enc, params.mast_paths);
+        bool is_solution = digest_less_equal_ptx(final_hash, params.target);
+
         if (__builtin_expect(is_solution, 0)) {
             int was = atomicCAS(d_solution_found, 0, 1);
             if (was == 0) {
                 atomicExch((unsigned long long*)d_solution_nonce, nonce_digest.values[0]);
                 *d_solution_nonce_digest = nonce_digest;
                 *d_solution_final_hash = final_hash;
-                
-                size_t running_index = index_a + num_leafs;
-                d_solution_path_a[0] = d_leafs[index_a ^ 1];
-                for (size_t level = 1; level < merkle_height; ++level) {
+
+                size_t running_index = index_a + params.num_leafs;
+                d_solution_path_a[0] = params.d_leafs[index_a ^ 1];
+                for (size_t level = 1; level < params.merkle_height; ++level) {
                     running_index >>= 1;
                     size_t sibling_index = running_index ^ 1;
-                    d_solution_path_a[level] = (sibling_index < num_leafs)
-                        ? d_internal_nodes[sibling_index]
+                    d_solution_path_a[level] = (sibling_index < params.num_leafs)
+                        ? params.d_internal_nodes[sibling_index]
                         : Digest::default_digest();
                 }
-                running_index = index_b + num_leafs;
-                d_solution_path_b[0] = d_leafs[index_b ^ 1];
-                for (size_t level = 1; level < merkle_height; ++level) {
+                running_index = index_b + params.num_leafs;
+                d_solution_path_b[0] = params.d_leafs[index_b ^ 1];
+                for (size_t level = 1; level < params.merkle_height; ++level) {
                     running_index >>= 1;
                     size_t sibling_index = running_index ^ 1;
-                    d_solution_path_b[level] = (sibling_index < num_leafs)
-                        ? d_internal_nodes[sibling_index]
+                    d_solution_path_b[level] = (sibling_index < params.num_leafs)
+                        ? params.d_internal_nodes[sibling_index]
                         : Digest::default_digest();
                 }
                 return;
@@ -3394,10 +3484,10 @@ __device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
         nonce, root, d_internal_nodes,
         path_index_a, path_index_b, num_leafs, merkle_height,
         stored_nodes_count, commitment, leaf_prefix);
-    
+
     // OPTIMIZED MAST hash chain - reuse single state array
     uint64_t state[STATE_SIZE];
-    
+
     // Keep the rolling digest in state[0..4] to avoid temporary Digest copies.
     // Step 1: state = hash(pow_encoding_digest, pow[0])
     tip5_hash_fixed_inplace(state, pow_encoding_digest, mast_paths.pow[0]);
@@ -3415,7 +3505,7 @@ __device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
     tip5_hash_varlen5_state(state);
     // Step 8: state = hash(state, kernel[0])
     tip5_hash_fixed_left_state(state, mast_paths.kernel[0]);
-    
+
     Digest result;
     result.values[0] = state[0];
     result.values[1] = state[1];
@@ -3428,15 +3518,15 @@ __device__ __noinline__ Digest fast_mast_hash_direct_low_vram(
 VramMode detect_vram_mode(int gpu_id) {
     cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, gpu_id);
-    
+
     if (err != cudaSuccess) {
         LOG_DEBUG("Failed to get device properties for GPU " << gpu_id);
         return VramMode::HIGH_VRAM;
     }
-    
+
     size_t total_vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
     LOG_DEBUG("GPU " << gpu_id << " has " << total_vram_gb << " GB VRAM");
-    
+
     if (total_vram_gb >= 11) {
         return VramMode::HIGH_VRAM;
     } else {
@@ -3446,7 +3536,7 @@ VramMode detect_vram_mode(int gpu_id) {
 
 __device__ Digest Pow::bud(const Digest& commitment, uint64_t index) {
     Digest hash = commitment;
-    
+
     for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
         Digest round_digest;
         round_digest.values[0] = index;
@@ -3456,13 +3546,13 @@ __device__ Digest Pow::bud(const Digest& commitment, uint64_t index) {
         round_digest.values[4] = round;
         hash = tip5_hash_fixed_device(hash, round_digest);
     }
-    
+
     return hash;
 }
 
 __host__ Digest Pow::bud_host(const Digest& commitment, uint64_t index) {
     Digest hash = commitment;
-    
+
     for (size_t round = 0; round < BUDDING_ROUNDS; ++round) {
         Digest round_digest;
         round_digest.values[0] = index;
@@ -3472,51 +3562,51 @@ __host__ Digest Pow::bud_host(const Digest& commitment, uint64_t index) {
         round_digest.values[4] = round;
         hash = tip5_hash_fixed_host(hash, round_digest);
     }
-    
+
     return hash;
 }
 
-__device__ void Pow::indices(const Digest& hash, const Digest& nonce, 
+__device__ void Pow::indices(const Digest& hash, const Digest& nonce,
                               uint64_t& index_a, uint64_t& index_b) {
     Digest indexer = tip5_hash_fixed_device(hash, nonce);
-    
+
     // Use fast right-zero hash variant for the bulk of repetitions
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         indexer = tip5_hash_fixed_right_zero_device(indexer);
     }
-    
+
     index_a = indexer.values[0] & MERKLE_INDEX_MASK;
     index_b = indexer.values[1] & MERKLE_INDEX_MASK;
 }
 
 __host__ std::pair<uint64_t, uint64_t> Pow::indices(const Digest& hash, const Digest& nonce) {
     Digest indexer = tip5_hash_fixed_host(hash, nonce);
-    
+
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         indexer = tip5_hash_fixed_host(indexer, Digest::default_digest());
     }
-    
+
     uint64_t index_a = indexer.values[0] & MERKLE_INDEX_MASK;
     uint64_t index_b = indexer.values[1] & MERKLE_INDEX_MASK;
-    
+
     return {index_a, index_b};
 }
 
-__host__ Digest Pow::compute_leaf_from_commitment_host(const Digest& commitment, 
-                                                        uint64_t index, 
+__host__ Digest Pow::compute_leaf_from_commitment_host(const Digest& commitment,
+                                                        uint64_t index,
                                                         uint64_t num_leafs) {
     return bud_host(commitment, index);
 }
 
-__host__ bool Pow::verify_merkle_path_host(const Digest& root, uint64_t index, 
+__host__ bool Pow::verify_merkle_path_host(const Digest& root, uint64_t index,
                                             const Digest* path, const Digest& element) {
     if (index >= (1ULL << MERKLE_TREE_HEIGHT_)) {
         return false;
     }
-    
+
     uint64_t running_index = index;
     Digest running_digest = element;
-    
+
     for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         if (running_index & 1) {
             // Right child: hash(sibling, running_digest)
@@ -3527,7 +3617,7 @@ __host__ bool Pow::verify_merkle_path_host(const Digest& root, uint64_t index,
         }
         running_index >>= 1;
     }
-    
+
     // Compare with root
     for (int i = 0; i < DIGEST_LEN; ++i) {
         if (running_digest.values[i] != root.values[i]) {
@@ -3550,27 +3640,27 @@ __host__ uint64_t Pow::bitreverse_host(uint64_t n, uint32_t log2_n) {
 std::vector<uint64_t> Pow::encode() const {
     std::vector<uint64_t> encoding;
     encoding.reserve(DIGEST_LEN * (1 + 2 * MERKLE_TREE_HEIGHT_ + 1));
-    
+
     for (int i = 0; i < DIGEST_LEN; ++i) {
         encoding.push_back(nonce.values[i]);
     }
-    
+
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
             encoding.push_back(path_b[i].values[j]);
         }
     }
-    
+
     for (int i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
         for (int j = 0; j < DIGEST_LEN; ++j) {
             encoding.push_back(path_a[i].values[j]);
         }
     }
-    
+
     for (int i = 0; i < DIGEST_LEN; ++i) {
         encoding.push_back(root.values[i]);
     }
-    
+
     return encoding;
 }
 
@@ -3587,19 +3677,19 @@ __host__ GuesserBuffer Pow::preprocess_gpu(const PowMastPaths& mast_auth_paths,
                                             bool* cancel_flag) {
     // For mainnet blocks >= 15256, we always use CONSENSUS_XNT
     LOG_DEBUG("preprocess: starting (XNT consensus mode)");
-    
+
     int current_gpu = 0;
     cudaError_t cuda_error = cudaGetDevice(&current_gpu);
     if (cuda_error != cudaSuccess) {
         LOG_ERROR("get device in preprocess", cuda_error);
         return GuesserBuffer();
     }
-    
+
     VramMode vram_mode = detect_vram_mode(current_gpu);
-    
+
     switch (vram_mode) {
         case VramMode::HIGH_VRAM:
-            return preprocess_gpu_high_vram(mast_auth_paths, prev_block_digest, 
+            return preprocess_gpu_high_vram(mast_auth_paths, prev_block_digest,
                                             consensus_rule_set, cancel_flag);
         case VramMode::LOW_VRAM:
             return preprocess_gpu_low_vram(mast_auth_paths, prev_block_digest,
@@ -3615,43 +3705,43 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
                                                       int consensus_rule_set,
                                                       bool* cancel_flag) {
     GuesserBuffer buffer;
-    
+
     // For mainnet blocks >= 15256, we use CONSENSUS_XNT
     // Always use mast_auth_paths.commit() for XNT consensus
     Digest commitment = mast_auth_paths.commit();
-    
+
     buffer.hash = commitment;
     buffer.prev_block_digest = prev_block_digest;  // Still needed for validation
     buffer.consensus_rule_set = CONSENSUS_XNT;  // Always XNT for blocks >= 15256
     buffer.mast_paths = mast_auth_paths;
     buffer.num_leafs = MERKLE_NUM_LEAFS;
-    
+
     LOG_DEBUG("preprocess_high_vram: commitment computed");
-    
+
     if (cancel_flag && *cancel_flag) {
         return GuesserBuffer();
     }
-    
+
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     cudaError_t alloc_err = cudaMalloc(&buffer.d_leafs, leafs_size);
     if (alloc_err != cudaSuccess) {
         LOG_ERROR("cudaMalloc leafs", alloc_err);
         return GuesserBuffer();
     }
-    
+
     LOG_DEBUG("preprocess_high_vram: allocated " << (leafs_size / (1024*1024)) << " MB for leafs");
-    
+
     // NOTE: d_merkle_tree allocation is deferred until after the temp buffer is freed.
     // This reduces peak GPU memory by ~5 GB, allowing async preprocessing (P2.7) to
     // run concurrently with mining on the same 24 GB GPU:
     //   Peak with deferred alloc: old_buffer(10.7GB) + new_leafs(5.4GB) + temp(5.4GB) = 21.5 GB
     //   Peak without deferral:    old_buffer(10.7GB) + new_leafs(5.4GB) + temp(5.4GB) + new_tree(5.4GB) = 26.9 GB
-    
+
     if (cancel_flag && *cancel_flag) {
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     // Use a dedicated stream for all preprocessing kernels.
     // Kernels on the same stream execute in-order, so we only need one sync at the end.
     // This eliminates ~33 cudaDeviceSynchronize() calls (full-device barriers) and lets
@@ -3663,14 +3753,14 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     int threadsPerBlock = 256;
     int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
-    
-    // Step 1: Compute buds
+
+    // Step 1: Compute buds (register-heavy: 32 TIP5 rounds/thread)
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         buffer.d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
-    
+
     // Step 2: Convert buds → leafs through NUM_BUD_LAYERS iterations
     size_t temp_buffer_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
@@ -3681,44 +3771,45 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     Digest* current_buds = buffer.d_leafs;
     Digest* current_leafs = d_temp_leafs;
-    
+
+    const int leaf_threads = 512;  // Simple hash per thread, larger blocks help
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
-        int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
-        compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
+        int layerBlocks = (MERKLE_NUM_LEAFS + leaf_threads - 1) / leaf_threads;
+        compute_leafs_from_buds_kernel<<<layerBlocks, leaf_threads, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
         std::swap(current_buds, current_leafs);
     }
-    
+
     // Copy final leafs to buffer.d_leafs if needed (async on same stream)
     if (current_buds != buffer.d_leafs) {
         cudaMemcpyAsync(buffer.d_leafs, current_buds, temp_buffer_size,
                         cudaMemcpyDeviceToDevice, pp_stream);
     }
-    
+
     // Sync bud+leaf phase, then free temp buffer BEFORE allocating merkle tree.
     // This keeps peak memory within ~21.5 GB (fits 24 GB alongside old mining buffer).
     cudaError_t leaf_sync = cudaStreamSynchronize(pp_stream);
     cudaFree(d_temp_leafs);
     d_temp_leafs = nullptr;
-    
+
     if (leaf_sync != cudaSuccess) {
         LOG_ERROR("preprocessing leaf sync", leaf_sync);
         cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     if (cancel_flag && *cancel_flag) {
         cudaStreamDestroy(pp_stream);
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     LOG_DEBUG("preprocess_high_vram: bud+leaf phase complete, allocating merkle tree");
-    
+
     // Now allocate d_merkle_tree (temp buffer is freed, so we have room)
     size_t internal_size = (MERKLE_NUM_LEAFS - 1) * sizeof(Digest);
     alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
@@ -3729,52 +3820,56 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         return GuesserBuffer();
     }
     buffer.tree_size = MERKLE_NUM_LEAFS - 1;
-    
+
     LOG_DEBUG("preprocess_high_vram: allocated " << (internal_size / (1024*1024)) << " MB for internal nodes");
-    
+
     // Step 3: Build Merkle tree layer-by-layer (all on same stream)
     size_t current_count = MERKLE_NUM_LEAFS;
     const Digest* current_layer = buffer.d_leafs;
     size_t write_offset = 0;
-    
+
+    const int merkle_threads = 512;  // Larger blocks for merkle (simple hash, better occupancy)
     for (size_t layer = 0; layer < MERKLE_TREE_HEIGHT_; ++layer) {
-        size_t parent_count = current_count / 2;
+        size_t parent_count = current_count >> 1;  // /2 strength reduction
         Digest* parent_layer = buffer.d_merkle_tree + write_offset;
-        
-        int layerBlocks = (parent_count + threadsPerBlock - 1) / threadsPerBlock;
-        merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
+
+        int layerBlocks = (parent_count + merkle_threads - 1) / merkle_threads;
+        merkle_zip_kernel<<<layerBlocks, merkle_threads, 0, pp_stream>>>(
             parent_layer, current_layer, parent_count);
-        
+
         current_layer = parent_layer;
         write_offset += parent_count;
         current_count = parent_count;
     }
-    
+
     // Single sync: wait for Merkle tree build to complete
     cudaError_t sync_err = cudaStreamSynchronize(pp_stream);
     cudaStreamDestroy(pp_stream);
-    
+
     if (sync_err != cudaSuccess) {
         LOG_ERROR("preprocessing stream sync", sync_err);
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     // Check for cancellation after sync
     if (cancel_flag && *cancel_flag) {
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     LOG_DEBUG("preprocess_high_vram: Merkle tree built");
-    
+
     // Copy root to host (tree is complete now)
     cudaMemcpy(&buffer.merkle_root, buffer.d_merkle_tree + buffer.tree_size - 1,
                sizeof(Digest), cudaMemcpyDeviceToHost);
-    
+
     // Precompute index picker preimage: Tip5::hash_pair(root, mast_auth_paths.commit())
     buffer.index_picker_preimage = tip5_hash_fixed_host(buffer.merkle_root, commitment);
-    
+
+    // Phase buffer deferred to first mining call (~50-100ms savings in preprocess)
+    // mine_pow_with_buffer allocates when use_phase_split && vram>=23GB
+
     LOG_DEBUG("preprocess_high_vram: complete");
     return buffer;
 }
@@ -3784,28 +3879,28 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
                                                      int consensus_rule_set,
                                                      bool* cancel_flag) {
     GuesserBuffer buffer;
-    
+
     // For mainnet blocks >= 15256, we use CONSENSUS_XNT
     Digest commitment = mast_auth_paths.commit();
-    
+
     buffer.hash = commitment;
     buffer.prev_block_digest = prev_block_digest;
     buffer.consensus_rule_set = CONSENSUS_XNT;
     buffer.mast_paths = mast_auth_paths;
     buffer.num_leafs = MERKLE_NUM_LEAFS;
-    
+
     LOG_DEBUG("preprocess_low_vram: commitment computed");
-    
+
     if (cancel_flag && *cancel_flag) {
         return GuesserBuffer();
     }
-    
+
     // For LOW_VRAM mode: Store top 8 layers (256 nodes including root)
     // Tree height is 27, so we need layers 20-26 (top 8 layers)
     const size_t TOP_LAYERS = 8;
     const size_t STORED_LAYER_START = MERKLE_TREE_HEIGHT_ - TOP_LAYERS;  // Layer 20
     const size_t STORED_NODES_COUNT = (1ULL << TOP_LAYERS);  // 256 nodes
-    
+
     // Allocate buffer for top layers
     size_t internal_size = STORED_NODES_COUNT * sizeof(Digest);
     cudaError_t alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
@@ -3814,31 +3909,31 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         return GuesserBuffer();
     }
     buffer.tree_size = STORED_NODES_COUNT;
-    
+
     LOG_DEBUG("preprocess_low_vram: allocated " << (internal_size / 1024) << " KB for top " << TOP_LAYERS << " layers");
     LOG_DEBUG("preprocess_low_vram: using chunked tree construction (layers 0-19 computed and discarded, layers 20-26 stored)");
-    
+
     // Chunked tree construction: build layer-by-layer, only keeping what we need
     // Strategy: Use a sliding window of 2 layers at a time
     // For layers 0-19: compute and discard immediately
     // For layers 20-26: compute and store in our buffer
-    
+
     int threadsPerBlock = 256;
-    
+
     // Step 1: Compute leafs from commitment (needed for layer 0)
     // We'll compute leafs on-demand in chunks to save memory
     // Actually, we need all leafs to compute layer 0, so we need to store them temporarily
     // But we can use a smaller buffer and compute in batches
-    
+
     // For chunked approach: compute layer 0 in chunks, then build tree layer-by-layer
     // Layer 0 needs all leafs, so we need temporary storage for leafs
     // But we can compute them in smaller batches and build tree incrementally
-    
+
     // Actually, the most memory-efficient approach:
     // 1. Compute leafs in chunks (e.g., 1M at a time)
     // 2. For each chunk, compute the corresponding layer 0 nodes
     // 3. Build tree from layer 0 up, keeping only what we need
-    
+
     // Simpler approach for now: Compute all leafs, but use managed memory
     // Then build tree layer-by-layer, discarding lower layers as we go
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
@@ -3849,18 +3944,18 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     int device_id = 0;
     cudaError_t device_err = cudaGetDevice(&device_id);
     if (device_err == cudaSuccess) {
         maybe_prefetch_managed(d_leafs, leafs_size, device_id);
     }
-    
+
     // Compute leafs from commitment
     int numBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
     compute_buds_kernel<<<numBlocks, threadsPerBlock>>>(
         d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
-    
+
     cudaError_t sync_err = cudaDeviceSynchronize();
     if (sync_err != cudaSuccess) {
         LOG_ERROR("compute_buds_kernel sync", sync_err);
@@ -3868,7 +3963,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     // Convert buds to leafs (need temp buffer for this)
     size_t temp_leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
     Digest* d_temp_leafs = nullptr;
@@ -3879,14 +3974,14 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     if (device_err == cudaSuccess) {
         maybe_prefetch_managed(d_temp_leafs, temp_leafs_size, device_id);
     }
-    
+
     Digest* current_buds = d_leafs;
     Digest* current_leafs = d_temp_leafs;
-    
+
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
         if (cancel_flag && *cancel_flag) {
             cudaFree(d_leafs);
@@ -3894,11 +3989,11 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
             buffer.cleanup();
             return GuesserBuffer();
         }
-        
+
         int layerBlocks = (MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock;
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
-        
+
         sync_err = cudaDeviceSynchronize();
         if (sync_err != cudaSuccess) {
             LOG_ERROR("compute_leafs_from_buds_kernel sync", sync_err);
@@ -3907,10 +4002,10 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
             buffer.cleanup();
             return GuesserBuffer();
         }
-        
+
         std::swap(current_buds, current_leafs);
     }
-    
+
     // Now current_buds contains the final leafs
     // Ensure final leafs live in d_leafs (current_buds may be d_temp_leafs if NUM_BUD_LAYERS is odd)
     if (current_buds != d_leafs) {
@@ -3920,30 +4015,30 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     // Free the temp buffer - we only need d_leafs now
     cudaFree(d_temp_leafs);
     d_temp_leafs = nullptr;
-    
+
     // Step 2: Build tree layer-by-layer using chunked approach
     // We'll use a sliding window: keep current and next layer
     // For layers 0-19: compute and discard
     // For layers 20-26: compute and store
-    
+
     // Allocate buffers for sliding window (2 layers max at a time)
     // The largest layer we need to keep is layer 20 with 2^7 = 128 nodes
     // But we need to compute from layer 0 (2^26 nodes) up
     // So we need a buffer that can hold at least one full layer
-    
+
     // Strategy: Use d_leafs as layer 0, then allocate buffers for subsequent layers
     // We'll compute layer N from layer N-1, then discard layer N-1
-    
+
     // For layers 0-19: we need buffers that can hold up to 2^25 nodes (layer 1 is largest)
     // For layers 20-26: we store in our final buffer
     // Layer 0 is in d_leafs (2^26 nodes), layer 1 needs 2^25 nodes
     // After layer 1, we can free d_leafs and reuse buffers
-    
+
     const size_t MAX_INTERMEDIATE_LAYER_SIZE = 1ULL << 26;  // 2^26 nodes (layer 1 size)
     size_t intermediate_buffer_size = MAX_INTERMEDIATE_LAYER_SIZE * sizeof(Digest);
     Digest* d_layer_a = nullptr;
     Digest* d_layer_b = nullptr;
-    
+
     alloc_err = cudaMallocManaged(&d_layer_a, intermediate_buffer_size);
     if (alloc_err != cudaSuccess) {
         LOG_ERROR("cudaMallocManaged layer_a (low_vram)", alloc_err);
@@ -3951,7 +4046,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     alloc_err = cudaMallocManaged(&d_layer_b, intermediate_buffer_size);
     if (alloc_err != cudaSuccess) {
         LOG_ERROR("cudaMallocManaged layer_b (low_vram)", alloc_err);
@@ -3960,21 +4055,21 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         buffer.cleanup();
         return GuesserBuffer();
     }
-    
+
     if (device_err == cudaSuccess) {
         maybe_prefetch_managed(d_layer_a, intermediate_buffer_size, device_id);
         maybe_prefetch_managed(d_layer_b, intermediate_buffer_size, device_id);
     }
-    
+
     // Build tree from layer 0 (leafs) up to layer 26 (root)
     // Use sliding window: current_layer -> next_layer
     const Digest* current_layer = current_buds;  // Start with leafs (layer 0)
     size_t current_layer_size = MERKLE_NUM_LEAFS;
     Digest* next_layer = d_layer_a;
     bool use_layer_a = true;
-    
+
     size_t stored_offset = 0;  // Offset in our final buffer
-    
+
     for (size_t layer = 0; layer < MERKLE_TREE_HEIGHT_; ++layer) {
         if (cancel_flag && *cancel_flag) {
             cudaFree(d_leafs);
@@ -3983,14 +4078,14 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
             buffer.cleanup();
             return GuesserBuffer();
         }
-        
-        size_t next_layer_size = current_layer_size / 2;
-        
+
+        size_t next_layer_size = current_layer_size >> 1;  // /2 strength reduction
+
         // Compute next layer from current layer
         int layerBlocks = (next_layer_size + threadsPerBlock - 1) / threadsPerBlock;
         merkle_zip_kernel<<<layerBlocks, threadsPerBlock>>>(
             next_layer, current_layer, next_layer_size);
-        
+
         sync_err = cudaDeviceSynchronize();
         if (sync_err != cudaSuccess) {
             LOG_ERROR("merkle_zip_kernel sync (layer " << layer << ")", sync_err);
@@ -4000,7 +4095,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
             buffer.cleanup();
             return GuesserBuffer();
         }
-        
+
         // If this is one of the layers we need to store (20-26), copy it
         // Note: layer is the index of the PARENT layer we just computed
         // So layer 0 computes layer 1, layer 1 computes layer 2, etc.
@@ -4010,14 +4105,14 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
             Digest* dest_ptr = buffer.d_merkle_tree + stored_offset;
             cudaMemcpy(dest_ptr, next_layer, copy_size, cudaMemcpyDeviceToDevice);
             stored_offset += next_layer_size;
-            
+
             // If this is the root (last layer), copy it separately
             if (layer == MERKLE_TREE_HEIGHT_ - 1) {
                 cudaMemcpy(&buffer.merkle_root, next_layer, sizeof(Digest),
                           cudaMemcpyDeviceToHost);
             }
         }
-        
+
         // Prepare for next iteration
         // Swap buffers for next iteration
         if (layer < MERKLE_TREE_HEIGHT_ - 1) {
@@ -4026,29 +4121,29 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
                 cudaFree(d_leafs);
                 d_leafs = nullptr;  // Mark as freed
             }
-            
+
             current_layer = next_layer;
             current_layer_size = next_layer_size;
-            
+
             // Swap buffers for next iteration
             use_layer_a = !use_layer_a;
             next_layer = use_layer_a ? d_layer_a : d_layer_b;
         }
     }
-    
+
     // Free d_leafs if not already freed
     if (d_leafs != nullptr) {
         cudaFree(d_leafs);
     }
-    
+
     // Free temporary buffers
     cudaFree(d_leafs);
     cudaFree(d_layer_a);
     cudaFree(d_layer_b);
-    
+
     // Precompute index picker preimage
     buffer.index_picker_preimage = tip5_hash_fixed_host(buffer.merkle_root, commitment);
-    
+
     LOG_DEBUG("preprocess_low_vram: complete (stored " << buffer.tree_size << " nodes)");
     return buffer;
 }
@@ -4057,7 +4152,7 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     // OPTIMIZED: Reuse state array across all 63 iterations instead of recreating each time
     // This saves 62 state initializations and reduces register pressure
     uint64_t state[STATE_SIZE];
-    
+
     // First hash: hash(hash, nonce) with FixedLength domain
     // OPTIMIZATION: Inline the state setup instead of calling tip5_sponge_init + loop
     // Load hash into state[0..4]
@@ -4066,14 +4161,14 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     state[2] = hash.values[2];
     state[3] = hash.values[3];
     state[4] = hash.values[4];
-    
+
     // Load nonce into state[5..9]
     state[5] = nonce.values[0];
     state[6] = nonce.values[1];
     state[7] = nonce.values[2];
     state[8] = nonce.values[3];
     state[9] = nonce.values[4];
-    
+
     // Capacity region for FixedLength domain
     constexpr uint64_t FIXED_LEN_VAL = static_cast<uint64_t>(Domain::FixedLength);
     state[10] = FIXED_LEN_VAL;
@@ -4082,16 +4177,16 @@ __device__ void Pow_indices_device(const Digest& hash, const Digest& nonce, uint
     state[13] = FIXED_LEN_VAL;
     state[14] = FIXED_LEN_VAL;
     state[15] = FIXED_LEN_VAL;
-    
+
     tip5_permutation(state);
-    
+
     // Remaining 62 iterations: hash(state, zeros) with FixedLength domain
     // OPTIMIZATION: Use specialized permutation that exploits known right side:
     //   state[5..9]=0, state[10..15]=FIXED_LEN_VAL(=1)
     // This saves 44 field_mul_ptx per iteration by skipping x^7 for 11 elements
     // Precompute x^7(FIXED_LEN_VAL) once for all 62 iterations
     uint64_t x7_fixed = x7_computer_pipelined(FIXED_LEN_VAL);
-    
+
     #pragma unroll 2
     for (uint32_t i = 1; i < NUM_INDEX_REPETITIONS; ++i) {
         // Specialized permutation handles the known right-side values internally
@@ -4113,34 +4208,34 @@ uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, 
     // Entropy source 1: High-resolution timestamp (nanoseconds)
     auto now = std::chrono::high_resolution_clock::now();
     uint64_t timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    
+
     // Entropy source 2: Process ID (unique per miner instance)
     uint64_t process_id = static_cast<uint64_t>(getpid());
-    
+
     // Entropy source 3: Thread ID (additional randomness)
     uint64_t thread_id = static_cast<uint64_t>(pthread_self());
-    
+
     // Entropy source 4: Random device (hardware RNG if available)
     std::random_device rd;
     uint64_t hw_random = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint64_t>(rd());
-    
+
     // Entropy source 5: Memory address (ASLR provides randomness)
     uint64_t stack_addr = reinterpret_cast<uint64_t>(&now);
-    
+
     // Combine all entropy sources with XOR and mixing
     uint64_t random_seed = timestamp_ns;
     random_seed ^= process_id * 0x9e3779b97f4a7c15ULL;  // Golden ratio
     random_seed ^= thread_id * 0x85ebca6b;
     random_seed ^= hw_random;
     random_seed ^= stack_addr;
-    
+
     // Hash proposal_id (puzzle_id) to ensure different proposals get different nonce ranges
     // This ensures the same GPU mines different nonce ranges for different jobs/proposals
     uint64_t proposal_hash = 0;
     for (size_t i = 0; i < puzzle_id.length(); ++i) {
         proposal_hash = proposal_hash * 31 + (uint64_t)puzzle_id[i];
     }
-    
+
     // NEW: Use GPU UUID AND proposal_id together for hardware-unique + job-unique identification
     // GPU UUID ensures different GPUs get different ranges
     // Proposal ID ensures the same GPU gets different ranges for different jobs/proposals
@@ -4168,7 +4263,7 @@ uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, 
         gpu_proposal_combined = fallback_hash ^ (proposal_hash * 0x9e3779b97f4a7c15ULL);
         random_seed ^= gpu_proposal_combined;
     }
-    
+
 
     // Apply SplitMix64 hash mixing for better distribution
     random_seed ^= (random_seed >> 30);
@@ -4176,7 +4271,7 @@ uint64_t generate_secure_random_start(const std::string& puzzle_id, int gpu_id, 
     random_seed ^= (random_seed >> 27);
     random_seed *= 0x94d049bb133111ebULL;
     random_seed ^= (random_seed >> 31);
-    
+
     return random_seed;
 }
 
@@ -4203,7 +4298,7 @@ GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus) {
             }
         }
     }
-    
+
     // Get total miners in pool
     const char* env_total_miners = std::getenv("POOL_SIZE");
     if (env_total_miners) {
@@ -4212,7 +4307,7 @@ GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus) {
             g_total_miners = pool_val;
         }
     }
-    
+
     // Get GPUs per miner (support up to 36 GPUs per machine)
     // NOTE: This env var is OPTIONAL - if not set, uses the total_gpus parameter
     //       which should be the actual detected GPU count from the caller
@@ -4223,28 +4318,28 @@ GpuNonceRange calculate_gpu_range(int gpu_id, int total_gpus) {
             total_gpus = env_val;
         }
     }
-    
+
     GpuNonceRange range;
     range.miner_id = g_miner_id;
     range.total_miners = g_total_miners;
     range.gpu_id = gpu_id;
     range.total_gpus = total_gpus;
-    
+
     // Two-level partitioning:
     // Level 1: Divide by total miners in pool
     // Level 2: Divide miner's range by GPUs per miner
-    
+
     const uint64_t usable_bits = 62;
     const uint64_t total_space = (1ULL << usable_bits);
-    
+
     // Each miner gets: total_space / total_miners
     uint64_t miner_range_size = total_space / g_total_miners;
     uint64_t miner_range_start = miner_range_size * g_miner_id;
-    
+
     // Each GPU within miner gets: miner_range / gpus_per_miner
     range.range_size = miner_range_size / total_gpus;
     range.range_start = miner_range_start + (range.range_size * gpu_id);
-    
+
     return range;
 }
 
@@ -4256,22 +4351,22 @@ bool verify_pow_solution(const Pow& pow,
                          const Digest& commitment) {
     // Compute indices from nonce
     auto [index_a, index_b] = Pow::indices(hash, pow.nonce);
-    
+
     // Compute expected leafs from commitment
     Digest leaf_a = Pow::compute_leaf_from_commitment_host(commitment, index_a, MERKLE_NUM_LEAFS);
     Digest leaf_b = Pow::compute_leaf_from_commitment_host(commitment, index_b, MERKLE_NUM_LEAFS);
-    
+
     // Verify Merkle paths
     bool path_a_valid = Pow::verify_merkle_path_host(pow.root, index_a, pow.path_a, leaf_a);
     bool path_b_valid = Pow::verify_merkle_path_host(pow.root, index_b, pow.path_b, leaf_b);
-    
+
     if (!path_a_valid || !path_b_valid) {
         return false;
     }
-    
+
     // Compute final hash and check against target
     // (Full verification would include MAST hash computation)
-    
+
     return true;
 }
 
@@ -4279,22 +4374,22 @@ bool verify_pow_solution(const Pow& pow,
 
 PowMastPaths convertToPowMastPaths(const AuthPaths& auth_paths) {
     PowMastPaths result;
-    
+
     // Convert pow paths
     for (size_t i = 0; i < std::min(auth_paths.pow.size(), size_t(3)); ++i) {
         result.pow[i] = hex_to_digest(auth_paths.pow[i]);
     }
-    
+
     // Convert header paths
     for (size_t i = 0; i < std::min(auth_paths.header.size(), size_t(2)); ++i) {
         result.header[i] = hex_to_digest(auth_paths.header[i]);
     }
-    
+
     // Convert kernel paths
     for (size_t i = 0; i < std::min(auth_paths.kernel.size(), size_t(1)); ++i) {
         result.kernel[i] = hex_to_digest(auth_paths.kernel[i]);
     }
-    
+
     return result;
 }
 
@@ -4314,28 +4409,28 @@ std::mutex g_all_gpu_resources_mutex;
 std::string get_gpu_uuid(int device_id) {
     cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
-    
+
     if (err != cudaSuccess) {
         return "unknown";
     }
-    
+
     // Convert UUID bytes to hex string
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    
+
     for (int i = 0; i < 16; ++i) {
         oss << std::setw(2) << static_cast<int>(static_cast<unsigned char>(prop.uuid.bytes[i]));
         if (i == 3 || i == 5 || i == 7 || i == 9) {
             oss << "-";
         }
     }
-    
+
     return oss.str();
 }
 
 void broadcast_stop_to_all_gpus(int source_gpu_id, const char* reason) {
     std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
-    
+
     int stopped_count = 0;
     for (GpuResources* gpu : g_all_gpu_resources) {
         if (gpu) {
@@ -4353,7 +4448,7 @@ void broadcast_stop_to_all_gpus(int source_gpu_id, const char* reason) {
             }
         }
     }
-    
+
     if (stopped_count > 0) {
         LOG_DEBUG("[GPU " << source_gpu_id << "] " << reason
                   << " - Broadcasting stop to " << stopped_count << " GPU(s)");
@@ -4362,57 +4457,57 @@ void broadcast_stop_to_all_gpus(int source_gpu_id, const char* reason) {
 
 GpuResources* find_gpu_resources(int gpu_id) {
     std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
-    
+
     for (GpuResources* gpu : g_all_gpu_resources) {
         if (gpu && gpu->gpu_id == gpu_id) {
             return gpu;
         }
     }
-    
+
     return nullptr;
 }
 
 double get_total_hashrate() {
     std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
-    
+
     double total = 0.0;
     for (GpuResources* gpu : g_all_gpu_resources) {
         if (gpu && gpu->is_mining()) {
             total += gpu->hash_tracker.get_average();
         }
     }
-    
+
     return total;
 }
 
 uint64_t get_total_solutions_found() {
     std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
-    
+
     uint64_t total = 0;
     for (GpuResources* gpu : g_all_gpu_resources) {
         if (gpu) {
             total += gpu->solutions_found.load();
         }
     }
-    
+
     return total;
 }
 
 void cleanup_gpu_memory() {
     int device_count = 0;
     cudaError_t error = cudaGetDeviceCount(&device_count);
-    
+
     if (error != cudaSuccess || device_count == 0) {
         return;
     }
-    
+
     for (int gpu_id = 0; gpu_id < device_count; ++gpu_id) {
         cudaSetDevice(gpu_id);
         cudaDeviceSynchronize();
         cudaGetLastError();
         cudaDeviceReset();
     }
-    
+
     {
         std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
         g_all_gpu_resources.clear();
@@ -4443,16 +4538,16 @@ void GpuWorker::start() {
     // Just register with the multiplexer
     ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
     worker_handle = mux.registerWorker(gpu_id, gpu_resources);
-    
+
     if (!worker_handle) {
         std::cerr << "[GPU " << gpu_id << "] Failed to register with multiplexer" << std::endl;
         return;
     }
-    
+
     // The multiplexer will handle connection and job fetching
     // GpuWorker just needs to wait for events
     worker_running = true;
-    
+
     // Start mining thread
     mining_thread = std::thread(&GpuWorker::miningLoop, this);
 }
@@ -4462,7 +4557,7 @@ void GpuWorker::start() {
 void GpuWorker::stop() {
     worker_running = false;
     gpu_resources->gpu_stop_flag = true;
-    
+
     if (gpu_resources->event_handler) {
         gpu_resources->event_handler->shutdown();
     }
@@ -4478,24 +4573,24 @@ bool GpuWorker::initializeCuda() {
         LOG_ERROR("cudaSetDevice", err);
         return false;
     }
-    
+
     cudaDeviceProp prop;
     err = cudaGetDeviceProperties(&prop, gpu_id);
     if (err != cudaSuccess) {
         LOG_ERROR("cudaGetDeviceProperties", err);
         return false;
     }
-    
+
     gpu_resources->gpu_name = prop.name;
     gpu_resources->gpu_vram_total = prop.totalGlobalMem;
     gpu_resources->gpu_uuid = get_gpu_uuid(gpu_id);
-    
+
     // Batch size: use global override if set, otherwise auto-detect for this GPU
     const uint64_t min_batch = 1;
     gpu_resources->optimal_max_nonces = (g_batch_size > 0)
         ? std::max(g_batch_size, min_batch)
         : get_optimal_batch_size(gpu_id);
-    
+
     return true;
 }
 
@@ -4505,7 +4600,7 @@ void GpuWorker::miningLoop() {
         MiningEvent event;
         bool has_event = gpu_resources->event_handler->waitForEvent(
             event, std::chrono::milliseconds(100));
-        
+
         if (has_event) {
             switch (event.type) {
                 case EventType::NEW_PUZZLE:
@@ -4526,13 +4621,13 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
         std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Empty puzzle data" << Color::RESET << std::endl;
         return;
     }
-    
+
     PowPuzzle puzzle = parsePowPuzzle(event.data);
     if (!puzzle.is_valid()) {
         std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Invalid puzzle from parsePowPuzzle" << Color::RESET << std::endl;
         return;
     }
-    
+
     // Parse and store the template for this proposal
     json template_response = json::parse(event.data);
     json template_obj;
@@ -4541,13 +4636,13 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
     } else if (template_response.contains("template")) {
         template_obj = template_response["template"];
     }
-    
+
     Digest prev_block = hex_to_digest(puzzle.prev_block);
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     Digest commitment = mast_paths.commit();
     Digest original_target = hex_to_digest(puzzle.threshold);
     Digest effective_target = g_test_mode ? make_target_easier(original_target, 100000) : original_target;
-    
+
     // Check for duplicate (solo mode only)
     {
         std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
@@ -4556,7 +4651,7 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
             return;
         }
     }
-    
+
     // Check if we can reuse existing buffer (XNT uses commitment only)
     bool need_preprocess = true;
     bool have_existing_buffer = false;
@@ -4571,7 +4666,7 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
                     break;
                 }
             }
-            
+
             bool prev_block_match = true;
             if (puzzle.consensus_rule_set != CONSENSUS_XNT) {
                 for (int i = 0; i < DIGEST_LEN; ++i) {
@@ -4588,25 +4683,25 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
                 gpu_resources->buffer->prev_block_digest = prev_block;
                 gpu_resources->cached_mast_paths = mast_paths;
                 gpu_resources->cached_commitment = commitment;
-                std::cout << "[GPU " << gpu_id << "] " << Color::GREEN 
+                std::cout << "[GPU " << gpu_id << "] " << Color::GREEN
                           << "Reusing cached buffer" << Color::RESET << std::endl;
             }
         }
     }
-    
+
     if (need_preprocess) {
         if (have_existing_buffer) {
             // ---- P2.7: Async preprocessing ----
             // We have a valid old buffer — launch preprocessing in background and
             // continue mining the OLD puzzle. The mining loop will swap buffers when done.
-            
+
             // Wait for any prior async preprocessing to finish first
             if (gpu_resources->async_preprocess_thread.joinable()) {
                 gpu_resources->async_preprocess_thread.join();
             }
             gpu_resources->async_preprocess_done = false;
             gpu_resources->async_preprocess_running = true;
-            
+
             // Store new puzzle metadata (will be applied on buffer swap)
             {
                 std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
@@ -4618,7 +4713,7 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
                 gpu_resources->pending_mast_paths = mast_paths;
                 gpu_resources->pending_commitment = commitment;
             }
-            
+
             // Launch background preprocessing thread
             int bg_gpu_id = gpu_id;
             int bg_consensus = puzzle.consensus_rule_set;
@@ -4630,29 +4725,29 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
                         gpu_resources->async_preprocess_running = false;
                         return;
                     }
-                    
+
                     auto start = std::chrono::steady_clock::now();
                     auto new_buffer = Pow::preprocess(mast_paths, prev_block, bg_consensus, nullptr);
                     auto end = std::chrono::steady_clock::now();
                     double elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() / 1000.0;
-                    
+
                     if (new_buffer.is_valid()) {
                         gpu_resources->pending_buffer = std::make_unique<GuesserBuffer>(std::move(new_buffer));
                         gpu_resources->async_preprocess_done = true;
-                        std::cout << "[GPU " << bg_gpu_id << "] " << Color::GREEN 
-                                  << "Async preprocessing complete" << Color::RESET 
+                        std::cout << "[GPU " << bg_gpu_id << "] " << Color::GREEN
+                                  << "Async preprocessing complete" << Color::RESET
                                   << " (" << std::fixed << std::setprecision(2) << elapsed_s << "s, mining continued)" << std::endl;
                     } else {
-                        std::cout << "[GPU " << bg_gpu_id << "] " << Color::RED 
+                        std::cout << "[GPU " << bg_gpu_id << "] " << Color::RED
                                   << "Async preprocessing failed" << Color::RESET << std::endl;
                     }
                     gpu_resources->async_preprocess_running = false;
                 }
             );
-            
-            std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+
+            std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW
                       << "Async preprocessing started (mining continues with old buffer)" << Color::RESET << std::endl;
-            
+
             // DON'T update current_* metadata yet — keep mining old puzzle.
             // The mining loop will apply pending metadata on buffer swap.
             // But we DO need to resume the mining loop, so fall through to it.
@@ -4665,28 +4760,28 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
                 gpu_resources->current_target = effective_target;
                 gpu_resources->current_real_target = original_target;
             }
-            
+
             if (g_test_mode) {
-                std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW 
+                std::cout << "[GPU " << gpu_id << "] " << Color::YELLOW
                           << "TEST MODE: Target made 100000x easier" << Color::RESET << std::endl;
             }
-            
+
             resetNonceCounter(gpu_resources, puzzle.id);
-            
+
             auto preprocess_start = std::chrono::steady_clock::now();
-            
+
             if (!preprocessPuzzle(puzzle, gpu_resources)) {
                 std::cout << "[GPU " << gpu_id << "] " << Color::RED << "Preprocessing failed" << Color::RESET << std::endl;
                 return;
             }
-            
+
             auto preprocess_end = std::chrono::steady_clock::now();
             auto preprocess_duration = std::chrono::duration_cast<std::chrono::milliseconds>(preprocess_end - preprocess_start).count();
             double preprocess_seconds = preprocess_duration / 1000.0;
-            
-            std::cout << "[GPU " << gpu_id << "] " << Color::GREEN << "Finished preprocessing" << Color::RESET 
+
+            std::cout << "[GPU " << gpu_id << "] " << Color::GREEN << "Finished preprocessing" << Color::RESET
                       << " (" << std::fixed << std::setprecision(2) << preprocess_seconds << "s)" << std::endl;
-            
+
             {
                 std::lock_guard<std::mutex> lock(gpu_resources->state_mutex);
                 gpu_resources->cached_prev_block = prev_block;
@@ -4705,15 +4800,15 @@ void GpuWorker::handleNewPuzzle(const MiningEvent& event) {
         }
         resetNonceCounter(gpu_resources, puzzle.id);
     }
-    
+
     gpu_resources->update_job_received();
     gpu_resources->set_paused(false);
-    
+
     std::string short_id = puzzle.id.length() > 20 ? puzzle.id.substr(0, 12) + "..." + puzzle.id.substr(puzzle.id.length() - 8) : puzzle.id;
-    std::cout << "[GPU " << gpu_id << "] " << Color::CYAN << Color::BOLD 
-              << "New job received" << Color::RESET 
+    std::cout << "[GPU " << gpu_id << "] " << Color::CYAN << Color::BOLD
+              << "New job received" << Color::RESET
               << " | Template ID: " << Color::CYAN << short_id << Color::RESET << std::endl;
-    
+
     // Run the continuous mining loop
     continuousMiningLoop(gpu_resources, this);
 }
@@ -4723,7 +4818,7 @@ std::future<bool> GpuWorker::submitSolution(
     const Pow& pow_solution,
     const Digest& solution_hash,
     const json& template_obj) {
-    
+
     ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
     return mux.submitSolution(gpu_id, proposal_id, pow_solution, solution_hash, template_obj);
 }
@@ -4754,12 +4849,12 @@ MultiGpuManager::~MultiGpuManager() {
 bool MultiGpuManager::detectAndInitGpus() {
     int device_count = 0;
     cudaError_t error = cudaGetDeviceCount(&device_count);
-    
+
     if (error != cudaSuccess || device_count == 0) {
         std::cerr << "No CUDA devices found" << std::endl;
         return false;
     }
-    
+
     // Determine which GPUs to use
     if (single_gpu_id >= 0) {
         // Single GPU mode
@@ -4774,61 +4869,61 @@ bool MultiGpuManager::detectAndInitGpus() {
             gpu_ids.push_back(i);
         }
     }
-    
+
     for (int gpu_id : gpu_ids) {
         if (!initializeGpu(gpu_id)) {
             std::cerr << "Failed to initialize GPU " << gpu_id << std::endl;
             continue;
         }
     }
-    
+
     g_total_gpu_count = static_cast<int>(gpu_resources.size());
-    
+
     {
         std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
         for (auto& res : gpu_resources) {
             g_all_gpu_resources.push_back(res.get());
         }
     }
-    
+
     return !gpu_resources.empty();
 }
 
 bool MultiGpuManager::initializeGpu(int device_id) {
     auto gpu_res = std::make_unique<GpuResources>(device_id);
-    
+
     cudaDeviceProp prop;
     cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
     if (err != cudaSuccess) {
         return false;
     }
-    
+
     size_t vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
     if (vram_gb < 6) {
         LOG_DEBUG("GPU " << device_id << " has insufficient VRAM (" << vram_gb << " GB)");
         return false;
     }
-    
+
     gpu_res->gpu_name = prop.name;
     gpu_res->gpu_vram_total = prop.totalGlobalMem;
     gpu_res->gpu_uuid = get_gpu_uuid(device_id);
-    
+
     // Batch size: use global override if set, otherwise auto-detect for this GPU
     const uint64_t min_batch = 1;
     gpu_res->optimal_max_nonces = (g_batch_size > 0)
         ? std::max(g_batch_size, min_batch)
         : get_optimal_batch_size(device_id);
     gpu_res->mining_mode = mining_mode;
-    
+
     // Create GpuWorker (uses shared connection through multiplexer)
     auto worker = std::make_unique<GpuWorker>(device_id, gpu_res.get());
-    
+
     gpu_resources.push_back(std::move(gpu_res));
     workers.push_back(std::move(worker));
-    
-    std::cout << "Initialized GPU " << device_id << ": " << prop.name 
+
+    std::cout << "Initialized GPU " << device_id << ": " << prop.name
               << " (" << vram_gb << " GB)" << std::endl;
-    
+
     return true;
 }
 
@@ -4837,14 +4932,14 @@ void MultiGpuManager::startAll() {
         std::cerr << "No GPUs initialized" << std::endl;
         return;
     }
-    
+
     // Initialize the connection multiplexer first
     ConnectionMultiplexer& mux = ConnectionMultiplexer::getInstance();
     if (!mux.initialize(endpoint, g_miner_wallet_address, stratum_password)) {
         std::cerr << "Failed to initialize connection multiplexer" << std::endl;
         return;
     }
-    
+
     // Start GPU worker threads
     for (size_t i = 0; i < workers.size(); ++i) {
         gpu_threads.emplace_back(&MultiGpuManager::gpuWorkerThread, this, i);
@@ -4852,7 +4947,7 @@ void MultiGpuManager::startAll() {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
-    
+
     for (auto& thread : gpu_threads) {
         if (thread.joinable()) {
             thread.join();
@@ -4862,22 +4957,22 @@ void MultiGpuManager::startAll() {
 
 void MultiGpuManager::stopAll() {
     stop_mining = true;
-    
+
     // Stop workers first
     for (auto& worker : workers) {
         worker->stop();
     }
-    
+
     // Wait for threads
     for (auto& thread : gpu_threads) {
         if (thread.joinable()) {
             thread.join();
         }
     }
-    
+
     // Shutdown multiplexer after workers are done
     ConnectionMultiplexer::destroyInstance();
-    
+
     for (auto& res : gpu_resources) {
         // Join async preprocessing thread before cleaning up buffers
         if (res->async_preprocess_thread.joinable()) {
@@ -4892,7 +4987,7 @@ void MultiGpuManager::stopAll() {
             res->buffer.reset();
         }
     }
-    
+
     {
         std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
         g_all_gpu_resources.clear();
@@ -4907,7 +5002,7 @@ GpuResources* MultiGpuManager::getGpuResources(size_t index) {
 void MultiGpuManager::gpuWorkerThread(size_t index) {
     if (index >= workers.size()) return;
     workers[index]->start();
-    
+
     // Wait for the worker to finish (blocks until mining stops)
     while (!stop_mining && workers[index]->isRunning()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -4919,20 +5014,20 @@ void startUnifiedMining(
     int specific_gpu,
     MiningMode mode,
     const std::string& stratum_pass) {
-    
+
     MultiGpuManager manager(endpoint, specific_gpu, mode, stratum_pass);
-    
+
     if (!manager.detectAndInitGpus()) {
         std::cerr << "Failed to initialize GPUs" << std::endl;
         return;
     }
-    
+
     try {
         manager.startAll();
     } catch (const std::exception& e) {
         std::cerr << "Mining error: " << e.what() << std::endl;
     }
-    
+
     cleanup_gpu_memory();
 }
 
@@ -4953,10 +5048,10 @@ void startUnifiedMining(
 
 bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     if (!gpu_res || !worker) return false;
-    
+
     auto last_status_time = std::chrono::steady_clock::now();
     const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
-    
+
     // Default: sync mode. Set XNT_ASYNC_MINING=1 to use async double-buffered mode.
     bool use_async = false;
     if (const char* env = std::getenv("XNT_ASYNC_MINING"); env && env[0] == '1') {
@@ -4965,18 +5060,18 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
     if (!use_async) {
         return continuousMiningLoopSync(gpu_res, worker);
     }
-    
+
     // Initialize double-buffered miner (async x2 mode)
     if (!gpu_res->async_miner) {
         gpu_res->async_miner = std::make_unique<DoubleBufferedMiner>();
     }
-    
+
     DoubleBufferedMiner& miner = *gpu_res->async_miner;
     if (!miner.initialize()) {
         std::cerr << "[GPU " << gpu_res->gpu_id << "] Failed to initialize async miner, falling back to sync" << std::endl;
         return continuousMiningLoopSync(gpu_res, worker);
     }
-    
+
     // Track batch info for each slot
     struct BatchInfo {
         std::string proposal_id;
@@ -4987,11 +5082,11 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         bool pending_result;  // True if kernel launched and result not yet processed
     };
     BatchInfo batch_info[2] = {};
-    
+
     // Pipeline state
     int active_slot = 0;  // Which slot to use for NEXT launch
     int batches_in_flight = 0;
-    
+
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
         // Check for new events
         if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
@@ -5003,7 +5098,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             }
             break;
         }
-        
+
         // ---- P2.7: Check if async preprocessing completed → swap buffers ----
         if (gpu_res->async_preprocess_done.load(std::memory_order_acquire)) {
             // Drain in-flight mining batches before swapping (they reference old buffer)
@@ -5017,7 +5112,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 }
             }
             batches_in_flight = 0;
-            
+
             // Swap buffer and apply pending puzzle metadata
             gpu_res->buffer = std::move(gpu_res->pending_buffer);
             {
@@ -5030,27 +5125,27 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 gpu_res->cached_mast_paths = gpu_res->pending_mast_paths;
                 gpu_res->cached_commitment = gpu_res->pending_commitment;
             }
-            
+
             // Reset nonce counter for new puzzle and force re-init of GPU constants
             resetNonceCounter(gpu_res, gpu_res->pending_proposal_id);
             gpu_res->buffer->gpu_range_initialized = false;
-            
+
             gpu_res->async_preprocess_done.store(false, std::memory_order_release);
-            
+
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD
                       << "Buffer swapped — now mining new template" << Color::RESET << std::endl;
         }
-        
+
         if (gpu_res->gpu_pause_flag) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+
         if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
             gpu_res->set_paused(true);
             continue;
         }
-        
+
         std::string proposal_id;
         json template_for_this_batch;
         {
@@ -5058,12 +5153,12 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             proposal_id = gpu_res->current_proposal_id;
             template_for_this_batch = gpu_res->current_template;
         }
-        
+
         if (proposal_id.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+
         // Check template staleness
         if (!template_for_this_batch.is_null() && !template_for_this_batch.empty()) {
             auto& multiplexer = ConnectionMultiplexer::getInstance();
@@ -5076,56 +5171,56 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                     }
                 }
                 batches_in_flight = 0;
-                
+
                 std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW
                           << "Template stale, pausing..." << Color::RESET << std::endl;
                 gpu_res->set_paused(true);
-                
+
                 while (!stop_mining && !gpu_res->gpu_stop_flag && gpu_res->gpu_pause_flag) {
                     if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
-                
+
                 if (!stop_mining && !gpu_res->gpu_stop_flag) {
                     gpu_res->set_paused(false);
                 }
                 continue;
             }
         }
-        
+
         // =====================================================================
         // STEP 1: Check if CURRENT slot's previous batch is complete (non-blocking)
         // =====================================================================
         AsyncMiningSlot* pslot = &miner.slots[active_slot];
         BatchInfo& current_batch_info = batch_info[active_slot];
-        
+
         if (current_batch_info.pending_result) {
             // Check if this slot's kernel is done (NON-BLOCKING)
             cudaError_t status = cudaEventQuery(pslot->completion_event);
-            
+
             if (status == cudaSuccess) {
                 // Kernel completed! Process result
                 auto now = std::chrono::high_resolution_clock::now();
                 auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - current_batch_info.start_time).count();
-                
+
                 gpu_res->total_nonces_tested.fetch_add(current_batch_info.batch_size);
                 batches_in_flight--;
-                
+
                 if (duration_ms > 0) {
                     double hashrate_ms = static_cast<double>(current_batch_info.batch_size) / duration_ms;
                     gpu_res->hash_tracker.add(hashrate_ms);
                 }
-                
+
                 // Check for solution (pinned memory was async copied)
                 int solution_found = *pslot->h_solution_found_pinned;
-                
+
                 if (solution_found) {
                     gpu_res->solutions_found++;
-                    
+
                     // Retrieve solution data
                     MiningSolution solution;
-                    cudaMemcpy(&solution.pow.nonce, pslot->d_solution_nonce_digest, 
+                    cudaMemcpy(&solution.pow.nonce, pslot->d_solution_nonce_digest,
                                sizeof(Digest), cudaMemcpyDeviceToHost);
                     cudaMemcpy(solution.pow.path_a, pslot->d_solution_path_a,
                                MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
@@ -5134,40 +5229,40 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                     cudaMemcpy(&solution.kernel_final_hash, pslot->d_solution_final_hash,
                                sizeof(Digest), cudaMemcpyDeviceToHost);
                     solution.pow.root = gpu_res->buffer->merkle_root;
-                    
+
                     // Check if proposal still current
                     std::string current_proposal_id;
                     {
                         std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
                         current_proposal_id = gpu_res->current_proposal_id;
                     }
-                    
+
                     if (current_proposal_id != current_batch_info.proposal_id) {
-                        std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
+                        std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW
                                   << "Solution discarded - template changed" << Color::RESET << std::endl;
                     } else {
                         const char* target = gpu_res->is_stratum_mode() ? "pool" : "node";
                         std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
-                                  << "*** SOLUTION FOUND! ***" << Color::RESET 
+                                  << "*** SOLUTION FOUND! ***" << Color::RESET
                                   << " Submitting to " << target << "..." << std::endl;
-                        
+
                         PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
                         Digest solution_hash = mast_paths.fast_mast_hash(solution.pow);
-                        
+
                         // Submit asynchronously
                         auto future = worker->submitSolution(
                             current_batch_info.proposal_id,
                             solution.pow,
                             solution_hash,
                             current_batch_info.template_obj);
-                        
+
                         // Non-blocking check with short timeout
                         if (future.wait_for(std::chrono::seconds(30)) == std::future_status::ready) {
                             bool accepted = future.get();
                             if (accepted) {
                                 gpu_res->solutions_accepted++;
                                 const char* msg = gpu_res->is_stratum_mode() ? "SHARE ACCEPTED" : "BLOCK ACCEPTED";
-                                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
+                                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD
                                           << "*** " << msg << "! ***" << Color::RESET << std::endl;
                             } else {
                                 gpu_res->solutions_rejected++;
@@ -5177,15 +5272,15 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                         }
                     }
                 }
-                
+
                 current_batch_info.pending_result = false;
                 pslot->kernel_launched = false;
-                
+
             } else if (status == cudaErrorNotReady) {
                 // Kernel still running - switch to other slot and continue
                 // DON'T BLOCK! Just use the other slot
                 active_slot = 1 - active_slot;
-                
+
                 // If other slot also busy, we need to wait for one
                 if (batch_info[active_slot].pending_result) {
                     cudaError_t other_status = cudaEventQuery(miner.slots[active_slot].completion_event);
@@ -5199,7 +5294,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 continue;
             }
         }
-        
+
         // =====================================================================
         // STEP 2: Launch new batch on current slot (non-blocking)
         // =====================================================================
@@ -5208,17 +5303,17 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
             target = gpu_res->current_target;
         }
-        
+
         uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
-        
+
         do { *miner.slots[active_slot].h_solution_found_pinned = 0; } while (0);
         cudaMemsetAsync(miner.slots[active_slot].d_solution_found, 0, sizeof(int), miner.slots[active_slot].stream);
-        
+
         int threads_per_block, blocks_per_grid;
         int gpu_id;
         cudaGetDevice(&gpu_id);
         calculate_mining_launch_config(gpu_res->optimal_max_nonces, threads_per_block, blocks_per_grid, gpu_id);
-        
+
         if (!gpu_res->buffer->gpu_range_initialized) {
             int actual_gpu_count = g_total_gpu_count.load();
             GpuNonceRange gpu_range = calculate_gpu_range(gpu_id, actual_gpu_count);
@@ -5227,10 +5322,38 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
             gpu_res->buffer->gpu_range_initialized = true;
         }
-        
+
         MiningKernelType kernel_type = select_mining_kernel(gpu_id);
-        
-        if (kernel_type == MiningKernelType::HIGH_VRAM) {
+        bool use_phase_split = (kernel_type == MiningKernelType::HIGH_VRAM) && gpu_res->buffer->d_phase_indices;
+        if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '0') use_phase_split = false;
+
+        if (kernel_type == MiningKernelType::HIGH_VRAM && use_phase_split) {
+            uint64_t chunk = std::min(gpu_res->optimal_max_nonces, gpu_res->buffer->d_phase_indices_capacity);
+            Phase1Params p1;
+            p1.index_picker_preimage = gpu_res->buffer->index_picker_preimage;
+            p1.start_nonce = start_nonce;
+            p1.num_nonces = chunk;
+            mining_kernel_phase1_high_vram<<<blocks_per_grid, threads_per_block, 0, miner.slots[active_slot].stream>>>(
+                p1, gpu_res->buffer->d_phase_indices);
+            Phase2Params p2;
+            p2.d_leafs = gpu_res->buffer->d_leafs;
+            p2.d_internal_nodes = gpu_res->buffer->d_merkle_tree;
+            p2.merkle_root = gpu_res->buffer->merkle_root;
+            p2.num_leafs = gpu_res->buffer->num_leafs;
+            p2.merkle_height = MERKLE_TREE_HEIGHT_;
+            p2.target = target;
+            p2.mast_paths = gpu_res->buffer->mast_paths;
+            p2.start_nonce = start_nonce;
+            p2.num_nonces = chunk;
+            mining_kernel_phase2_high_vram<<<blocks_per_grid, threads_per_block, 0, miner.slots[active_slot].stream>>>(
+                p2, gpu_res->buffer->d_phase_indices,
+                miner.slots[active_slot].d_solution_nonce,
+                miner.slots[active_slot].d_solution_found,
+                miner.slots[active_slot].d_solution_path_a,
+                miner.slots[active_slot].d_solution_path_b,
+                miner.slots[active_slot].d_solution_nonce_digest,
+                miner.slots[active_slot].d_solution_final_hash);
+        } else if (kernel_type == MiningKernelType::HIGH_VRAM) {
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, miner.slots[active_slot].stream>>>(
                 gpu_res->buffer->d_leafs,
                 gpu_res->buffer->d_merkle_tree,
@@ -5270,13 +5393,13 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 miner.slots[active_slot].d_solution_nonce_digest,
                 miner.slots[active_slot].d_solution_final_hash);
         }
-        
+
         mining_kernel_finalize<<<1, 1, 0, miner.slots[active_slot].stream>>>(miner.slots[active_slot].d_solution_found);
-        
+
         cudaMemcpyAsync(miner.slots[active_slot].h_solution_found_pinned, miner.slots[active_slot].d_solution_found,
                         sizeof(int), cudaMemcpyDeviceToHost, miner.slots[active_slot].stream);
         cudaEventRecord(miner.slots[active_slot].completion_event, miner.slots[active_slot].stream);
-        
+
         current_batch_info.proposal_id = proposal_id;
         current_batch_info.template_obj = template_for_this_batch;
         current_batch_info.start_nonce = start_nonce;
@@ -5286,7 +5409,7 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
         miner.slots[active_slot].kernel_launched = true;
         batches_in_flight++;
         active_slot = 1 - active_slot;
-        
+
         // =====================================================================
         // STEP 3: Status update (non-blocking)
         // =====================================================================
@@ -5295,26 +5418,26 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
             double avg_hashrate = gpu_res->hash_tracker.get_average();
             double hashrate_hps = avg_hashrate * 1000.0;
             std::string hashrate_str = format_hashrate(hashrate_hps);
-            
-            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
-                      << "Mining (async x2)..." << Color::RESET 
+
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN
+                      << "Mining (async x2)..." << Color::RESET
                       << " | Rate: " << Color::YELLOW << hashrate_str << Color::RESET
                       << " | Nonces: " << gpu_res->total_nonces_tested.load()
-                      << " | " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET 
-                      << "/" << Color::RED << gpu_res->solutions_rejected.load() << Color::RESET 
+                      << " | " << Color::GREEN << gpu_res->solutions_accepted.load() << Color::RESET
+                      << "/" << Color::RED << gpu_res->solutions_rejected.load() << Color::RESET
                       << std::endl;
-            
+
             last_status_time = now;
         }
     }
-    
+
     // Cleanup: drain pipeline
     for (int i = 0; i < 2; i++) {
         if (batch_info[i].pending_result) {
             cudaStreamSynchronize(miner.slots[i].stream);
         }
     }
-    
+
     return true;
 }
 
@@ -5325,15 +5448,15 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
 
 bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
     if (!gpu_res || !worker) return false;
-    
+
     auto last_status_time = std::chrono::steady_clock::now();
     const auto STATUS_UPDATE_INTERVAL = std::chrono::seconds(5);
-    
+
     while (!stop_mining && !gpu_res->gpu_stop_flag) {
         if (gpu_res->event_handler && gpu_res->event_handler->hasEvents()) {
             break;
         }
-        
+
         // ---- P2.7: Check if async preprocessing completed → swap buffers (sync loop) ----
         if (gpu_res->async_preprocess_done.load(std::memory_order_acquire)) {
             gpu_res->buffer = std::move(gpu_res->pending_buffer);
@@ -5350,21 +5473,21 @@ bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
             resetNonceCounter(gpu_res, gpu_res->pending_proposal_id);
             gpu_res->buffer->gpu_range_initialized = false;
             gpu_res->async_preprocess_done.store(false, std::memory_order_release);
-            
+
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD
                       << "Buffer swapped — now mining new template" << Color::RESET << std::endl;
         }
-        
+
         if (gpu_res->gpu_pause_flag) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+
         if (!gpu_res->buffer || !gpu_res->buffer->is_valid()) {
             gpu_res->set_paused(true);
             continue;
         }
-        
+
         std::string proposal_id;
         json template_for_this_batch;
         {
@@ -5372,12 +5495,12 @@ bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
             proposal_id = gpu_res->current_proposal_id;
             template_for_this_batch = gpu_res->current_template;
         }
-        
+
         if (proposal_id.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+
         auto start_time = std::chrono::high_resolution_clock::now();
         uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
         Digest target;
@@ -5385,7 +5508,7 @@ bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
             std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
             target = gpu_res->current_target;
         }
-        
+
         auto result = mine_pow_with_buffer(
             *gpu_res->buffer,
             target,
@@ -5395,87 +5518,87 @@ bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
             gpu_res->buffer->consensus_rule_set,
             nullptr
         );
-        
+
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        
+
         gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
-        
+
         if (duration_ms > 0) {
             double hashrate_ms = static_cast<double>(gpu_res->optimal_max_nonces) / duration_ms;
             gpu_res->hash_tracker.add(hashrate_ms);
         }
-        
+
         auto now = std::chrono::steady_clock::now();
         if (now - last_status_time >= STATUS_UPDATE_INTERVAL) {
             double avg_hashrate = gpu_res->hash_tracker.get_average();
             double hashrate_hps = avg_hashrate * 1000.0;
             std::string hashrate_str = format_hashrate(hashrate_hps);
-            
+
             uint64_t total_nonces = gpu_res->total_nonces_tested.load();
             uint64_t accepted = gpu_res->solutions_accepted.load();
             uint64_t rejected = gpu_res->solutions_rejected.load();
-            
-            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN 
-                      << "Mining (sync)..." << Color::RESET 
+
+            std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN
+                      << "Mining (sync)..." << Color::RESET
                       << " | Hash Rate: " << Color::YELLOW << hashrate_str << Color::RESET
                       << " | Nonces: " << total_nonces
-                      << " | " << Color::GREEN << accepted << Color::RESET 
-                      << " / " << Color::RED << rejected << Color::RESET 
+                      << " | " << Color::GREEN << accepted << Color::RESET
+                      << " / " << Color::RED << rejected << Color::RESET
                       << " (success / reject)" << std::endl;
-            
+
             last_status_time = now;
         }
-        
+
         if (result.has_value()) {
             gpu_res->solutions_found++;
-            
+
             std::string current_proposal_id;
             {
                 std::lock_guard<std::mutex> lock(gpu_res->state_mutex);
                 current_proposal_id = gpu_res->current_proposal_id;
             }
-            
+
             if (current_proposal_id != proposal_id) {
-                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW 
+                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW
                           << "Solution discarded - template changed" << Color::RESET << std::endl;
                 continue;
             }
-            
+
             const char* submit_target = gpu_res->is_stratum_mode() ? "pool" : "node";
             std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::YELLOW << Color::BOLD
-                      << "*** SOLUTION FOUND! ***" << Color::RESET 
+                      << "*** SOLUTION FOUND! ***" << Color::RESET
                       << " Submitting to " << submit_target << "..." << std::endl;
-            
+
             PowMastPaths mast_paths = gpu_res->buffer->mast_paths;
             Digest solution_hash = mast_paths.fast_mast_hash(result.value().pow);
-            
+
             auto future = worker->submitSolution(
                 proposal_id,
                 result.value().pow,
                 solution_hash,
                 template_for_this_batch);
-            
+
             if (future.wait_for(std::chrono::seconds(30)) == std::future_status::ready) {
                 bool accepted = future.get();
                 if (accepted) {
                     gpu_res->solutions_accepted++;
                     const char* msg = gpu_res->is_stratum_mode() ? "SHARE ACCEPTED" : "BLOCK ACCEPTED";
-                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD 
-                              << "*** " << msg << "! ***" << Color::RESET 
-                              << " | Total: " << Color::GREEN << gpu_res->solutions_accepted.load() 
+                    std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::GREEN << Color::BOLD
+                              << "*** " << msg << "! ***" << Color::RESET
+                              << " | Total: " << Color::GREEN << gpu_res->solutions_accepted.load()
                               << Color::RESET << std::endl;
                 } else {
                     gpu_res->solutions_rejected++;
                 }
             } else {
                 gpu_res->solutions_rejected++;
-                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED 
+                std::cout << "[GPU " << gpu_res->gpu_id << "] " << Color::RED
                           << "Submission timed out" << Color::RESET << std::endl;
             }
         }
     }
-    
+
     return true;
 }
 
@@ -5485,22 +5608,22 @@ bool continuousMiningLoopSync(GpuResources* gpu_res, GpuWorker* worker) {
 
 bool preprocessPuzzle(const PowPuzzle& puzzle, GpuResources* gpu_res) {
     if (!gpu_res) return false;
-    
+
     cudaError_t err = cudaSetDevice(gpu_res->gpu_id);
     if (err != cudaSuccess) {
         LOG_ERROR("cudaSetDevice in preprocess", err);
         return false;
     }
-    
+
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     Digest prev_block = hex_to_digest(puzzle.prev_block);
     auto buffer = Pow::preprocess(mast_paths, prev_block, puzzle.consensus_rule_set, nullptr);
-    
+
     if (!buffer.is_valid()) {
         LOG_DEBUG("[GPU " << gpu_res->gpu_id << "] Preprocessing failed");
         return false;
     }
-    
+
     gpu_res->buffer = std::make_unique<GuesserBuffer>(std::move(buffer));
     return true;
 }
@@ -5509,17 +5632,17 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
     if (!gpu_res || !gpu_res->buffer || !gpu_res->buffer->is_valid()) {
         return false;
     }
-    
+
     cudaError_t err = cudaSetDevice(gpu_res->gpu_id);
     if (err != cudaSuccess) {
         return false;
     }
-    
+
     Digest original_target = hex_to_digest(puzzle.threshold);
     Digest target = g_test_mode ? make_target_easier(original_target, 100000) : original_target;
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     uint64_t start_nonce = getNextNonceRange(gpu_res, gpu_res->optimal_max_nonces);
-    
+
     auto result = mine_pow_with_buffer(
         *gpu_res->buffer,
         target,
@@ -5529,10 +5652,10 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
         puzzle.consensus_rule_set,
         nullptr
     );
-    
+
     // Update nonce counter
     gpu_res->total_nonces_tested.fetch_add(gpu_res->optimal_max_nonces);
-    
+
     return result.has_value();
 }
 
@@ -5542,21 +5665,21 @@ bool minePuzzleWithCuda(const PowPuzzle& puzzle, GpuResources* gpu_res) {
 
 uint64_t getNextNonceRange(GpuResources* gpu_res, uint64_t batch_size) {
     if (!gpu_res) return 0;
-    
+
     uint64_t current = gpu_res->gpu_puzzle_nonce_counter.fetch_add(batch_size);
     return gpu_res->gpu_puzzle_random_start + current;
 }
 
 void resetNonceCounter(GpuResources* gpu_res, const std::string& puzzle_id) {
     if (!gpu_res) return;
-    
+
     // Generate new random start for this puzzle
     uint64_t random_start = generate_secure_random_start(
         puzzle_id,
         gpu_res->gpu_id,
         gpu_res->gpu_uuid
     );
-    
+
     gpu_res->gpu_puzzle_random_start = random_start;
     gpu_res->gpu_puzzle_nonce_counter = 0;
 }
@@ -5569,7 +5692,7 @@ void signal_handler(int signal) {
     if (signal == SIGINT) {
         std::cout << "\n\nReceived interrupt signal, shutting down..." << std::endl;
         stop_mining = true;
-        
+
         std::lock_guard<std::mutex> lock(g_all_gpu_resources_mutex);
         for (GpuResources* gpu : g_all_gpu_resources) {
             if (gpu && gpu->event_handler) {
@@ -5593,27 +5716,27 @@ bool verifySolution(
     const PowPuzzle& puzzle,
     const Digest& commitment,
     const Digest& target) {
-    
+
     auto [index_a, index_b] = Pow::indices(commitment, pow.nonce);
     Digest leaf_a = Pow::compute_leaf_from_commitment_host(commitment, index_a, MERKLE_NUM_LEAFS);
     Digest leaf_b = Pow::compute_leaf_from_commitment_host(commitment, index_b, MERKLE_NUM_LEAFS);
-    
+
     bool path_a_valid = Pow::verify_merkle_path_host(pow.root, index_a, pow.path_a, leaf_a);
     bool path_b_valid = Pow::verify_merkle_path_host(pow.root, index_b, pow.path_b, leaf_b);
-    
+
     if (!path_a_valid || !path_b_valid) {
         LOG_DEBUG("Merkle path verification failed");
         return false;
     }
-    
+
     PowMastPaths mast_paths = convertToPowMastPaths(puzzle.auth_paths);
     Digest final_hash = mast_paths.fast_mast_hash(pow);
-    
+
     if (!digest_less_than_or_equal(final_hash, target)) {
         LOG_DEBUG("Hash does not meet target");
         return false;
     }
-    
+
     return true;
 }
 
@@ -8759,10 +8882,15 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     auto gpu_res = std::make_unique<GpuResources>(device_id);
     gpu_res->mining_mode = MiningMode::Solo;
     
+    std::cout << "Preprocessing (buds, leafs, Merkle tree)..." << std::flush;
+    auto preprocess_start = std::chrono::steady_clock::now();
     if (!preprocessPuzzle(puzzle, gpu_res.get())) {
-        std::cerr << Color::RED << "Failed to initialize GPU resources" << Color::RESET << std::endl;
+        std::cerr << Color::RED << "\nFailed to initialize GPU resources" << Color::RESET << std::endl;
         return;
     }
+    auto preprocess_end = std::chrono::steady_clock::now();
+    double preprocess_sec = std::chrono::duration<double>(preprocess_end - preprocess_start).count();
+    std::cout << " " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
     
     // Batch size: use global override if set, otherwise auto-detect for this GPU
     const uint64_t min_batch = 1;
@@ -9180,6 +9308,7 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     double total_hash_rate = (measured_nonces / 1000000.0) / (total_elapsed / 1000.0);
     
     std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
+    std::cout << "  Preprocessing: " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
     std::cout << "  Total Nonces:  " << measured_nonces << std::endl;
     std::cout << "  Total Batches: " << measured_batch_count << std::endl;
     if (warmup_batches > 0) {
@@ -9269,10 +9398,15 @@ void runBenchmarkBlocksSweep(const std::string& endpoint, int gpu_id) {
     
     auto gpu_res = std::make_unique<GpuResources>(device_id);
     gpu_res->mining_mode = MiningMode::Solo;
+    std::cout << "Preprocessing (buds, leafs, Merkle tree)..." << std::flush;
+    auto preprocess_start = std::chrono::steady_clock::now();
     if (!preprocessPuzzle(puzzle, gpu_res.get())) {
-        std::cerr << Color::RED << "Failed to initialize GPU" << Color::RESET << std::endl;
+        std::cerr << Color::RED << "\nFailed to initialize GPU" << Color::RESET << std::endl;
         return;
     }
+    auto preprocess_end = std::chrono::steady_clock::now();
+    double preprocess_sec = std::chrono::duration<double>(preprocess_end - preprocess_start).count();
+    std::cout << " " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
     
     if (g_batch_size > 0) {
         gpu_res->optimal_max_nonces = std::max(g_batch_size, uint64_t(1));
@@ -9347,7 +9481,8 @@ void runBenchmarkBlocksSweep(const std::string& endpoint, int gpu_id) {
     }
     
     std::cout << std::endl;
-    std::cout << Color::BOLD << "Best: " << best_blocks << " blocks @ " << std::fixed << std::setprecision(2) 
+    std::cout << "  Preprocessing: " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
+    std::cout << Color::BOLD << "  Best: " << best_blocks << " blocks @ " << std::setprecision(2)
               << best_mhps << " MH/s" << Color::RESET << std::endl;
     std::cout << "  Use: --blocks " << best_blocks << " or XNT_BLOCKS_PER_GRID=" << best_blocks << std::endl;
     std::cout << std::endl;

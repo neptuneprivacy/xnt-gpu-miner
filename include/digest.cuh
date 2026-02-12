@@ -6,47 +6,47 @@
 struct alignas(8) Digest {
     uint64_t values[DIGEST_LEN];
     
-    __device__ __host__ __forceinline__ Digest() {
+    __device__ __host__ Digest() {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             values[i] = 0;
         }
     }
     
-    __device__ __host__ __forceinline__ static Digest from_u64(uint64_t val) {
+    __device__ __host__ static Digest from_u64(uint64_t val) {
         Digest d;
         d.values[0] = val;
         return d;
     }
     
-    __device__ __host__ __forceinline__ static Digest default_digest() {
+    __device__ __host__ static Digest default_digest() {
         return Digest();
     }
     
-    __device__ __host__ __forceinline__ bool operator==(const Digest& other) const {
+    __device__ __host__ bool operator==(const Digest& other) const {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             if (values[i] != other.values[i]) return false;
         }
         return true;
     }
     
-    __device__ __host__ __forceinline__ bool operator!=(const Digest& other) const {
+    __device__ __host__ bool operator!=(const Digest& other) const {
         return !(*this == other);
     }
     
-    __device__ __host__ __forceinline__ bool is_zero() const {
+    __device__ __host__ bool is_zero() const {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             if (values[i] != 0) return false;
         }
         return true;
     }
     
-    __device__ __host__ __forceinline__ void from_array(const uint64_t* arr) {
+    __device__ __host__ void from_array(const uint64_t* arr) {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             values[i] = arr[i];
         }
     }
     
-    __device__ __host__ __forceinline__ void to_array(uint64_t* arr) const {
+    __device__ __host__ void to_array(uint64_t* arr) const {
         for (int i = 0; i < DIGEST_LEN; ++i) {
             arr[i] = values[i];
         }
@@ -70,7 +70,7 @@ Digest parse_digest_string(const std::string& str);
 bool digest_less_than_or_equal(const Digest& a, const Digest& b);
 Digest make_target_easier(const Digest& target, uint64_t factor);
 
-__host__ __forceinline__ int digest_compare_host(const Digest& a, const Digest& b) {
+__host__ inline int digest_compare_host(const Digest& a, const Digest& b) {
     for (int i = DIGEST_LEN - 1; i >= 0; --i) {
         if (a.values[i] < b.values[i]) return -1;
         if (a.values[i] > b.values[i]) return 1;
@@ -128,7 +128,7 @@ __device__ __forceinline__ bool digest_less_equal_ptx(const Digest& a, const Dig
     return result != 0;
 }
 
-__device__ __host__ __forceinline__ int digest_compare(const Digest& a, const Digest& b) {
+__device__ __host__ __inline__ int digest_compare(const Digest& a, const Digest& b) {
     for (int i = DIGEST_LEN - 1; i >= 0; --i) {
         if (a.values[i] < b.values[i]) return -1;
         if (a.values[i] > b.values[i]) return 1;
@@ -136,7 +136,7 @@ __device__ __host__ __forceinline__ int digest_compare(const Digest& a, const Di
     return 0;
 }
 
-__host__ __device__ __forceinline__ Digest digest_right_shift(const Digest& d, int bits) {
+__host__ __device__ __inline__ Digest digest_right_shift(const Digest& d, int bits) {
     Digest result;
     if (bits >= 64 * DIGEST_LEN) return result;
     
@@ -155,7 +155,7 @@ __host__ __device__ __forceinline__ Digest digest_right_shift(const Digest& d, i
     return result;
 }
 
-__device__ __forceinline__ Digest tip5_hash_fixed_right_zero_device(const Digest& left) {
+__device__ __inline__ Digest tip5_hash_fixed_right_zero_device(const Digest& left) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::FixedLength);
     
@@ -175,7 +175,7 @@ __device__ __forceinline__ Digest tip5_hash_fixed_right_zero_device(const Digest
     return result;
 }
 
-__device__ __forceinline__ Digest tip5_hash_varlen_len5_device(const Digest& in) {
+__device__ __inline__ Digest tip5_hash_varlen_len5_device(const Digest& in) {
     uint64_t state[STATE_SIZE];
     tip5_sponge_init(state, Domain::VariableLength);
     // absorb 5 words
