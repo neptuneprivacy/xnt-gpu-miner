@@ -8,8 +8,8 @@ struct PowMastPaths;
 struct Digest;
 
 constexpr int MINING_THREADS_PER_BLOCK = 256;
-constexpr int PREPROCESSING_THREADS_PER_BLOCK = 512;
-constexpr int MERKLE_THREADS_PER_BLOCK = 512;
+constexpr int PREPROCESSING_THREADS_PER_BLOCK = 1024;  // Max threads for aggressive preprocessing
+constexpr int MERKLE_THREADS_PER_BLOCK = 1024;          // Max threads for tree building
 constexpr int MAX_GRID_DIM_X = 65535;
 
 __global__ void __launch_bounds__(256, 2) parallel_mining_kernel_high_vram(

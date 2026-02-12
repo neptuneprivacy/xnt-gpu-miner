@@ -1063,7 +1063,7 @@ std::vector<Digest> MTree::path(size_t index) const {
 
 // ===== GPU PREPROCESSING KERNELS =====
 
-__global__ void __launch_bounds__(512) bitreverse_swap_leafs_kernel(
+__global__ void __launch_bounds__(1024) bitreverse_swap_leafs_kernel(
     Digest* __restrict__ leafs,
     size_t num_leafs,
     uint32_t log2_n
@@ -1138,7 +1138,7 @@ __global__ void __launch_bounds__(256) build_layer1_from_layer0_on_demand_kernel
     internal_nodes[write_idx] = tip5_hash_fixed_device(layer0_node_a, layer0_node_b);
 }
 
-__global__ void __launch_bounds__(512) build_layer0_from_commitment_kernel(
+__global__ void __launch_bounds__(1024) build_layer0_from_commitment_kernel(
     Digest* __restrict__ internal_nodes,
     size_t height,
     size_t num_leafs,
@@ -1159,7 +1159,7 @@ __global__ void __launch_bounds__(512) build_layer0_from_commitment_kernel(
     internal_nodes[range_layer_0_start + idx] = tip5_hash_fixed_device(leaf_a, leaf_b);
 }
 
-__global__ void __launch_bounds__(512) compute_buds_kernel(
+__global__ void __launch_bounds__(1024) compute_buds_kernel(
     Digest* __restrict__ buds,
     const Digest commitment,
     size_t segment_len,
@@ -1209,9 +1209,11 @@ __global__ void __launch_bounds__(512) compute_buds_kernel(
         hash.values[3] = state[3];
         hash.values[4] = state[4];
         
-        // Remaining 31 rounds
-        for (size_t round = 1; round < BUDDING_ROUNDS; ++round) {
-            // Setup state for next hash: hash(previous_result, [global_idx, 0, 0, 0, round])
+        // OPTIMIZATION: Unroll remaining 31 rounds in batches of 4 for better performance
+        // Unrolling reduces loop overhead and allows better instruction scheduling
+        #pragma unroll 7
+        for (size_t round_batch = 1; round_batch < BUDDING_ROUNDS; round_batch += 4) {
+            // Round 1 of batch
             state[0] = hash.values[0];
             state[1] = hash.values[1];
             state[2] = hash.values[2];
@@ -1221,28 +1223,75 @@ __global__ void __launch_bounds__(512) compute_buds_kernel(
             state[6] = 0;
             state[7] = 0;
             state[8] = 0;
-            state[9] = round;
-            // Capacity stays the same (FIXED_LEN_VAL)
-            
+            state[9] = round_batch;
             tip5_permutation(state);
-            
-            // Extract result
             hash.values[0] = state[0];
             hash.values[1] = state[1];
             hash.values[2] = state[2];
             hash.values[3] = state[3];
             hash.values[4] = state[4];
+            
+            // Round 2 of batch
+            if (round_batch + 1 < BUDDING_ROUNDS) {
+                state[0] = hash.values[0];
+                state[1] = hash.values[1];
+                state[2] = hash.values[2];
+                state[3] = hash.values[3];
+                state[4] = hash.values[4];
+                state[5] = global_idx;
+                state[9] = round_batch + 1;
+                tip5_permutation(state);
+                hash.values[0] = state[0];
+                hash.values[1] = state[1];
+                hash.values[2] = state[2];
+                hash.values[3] = state[3];
+                hash.values[4] = state[4];
+            }
+            
+            // Round 3 of batch
+            if (round_batch + 2 < BUDDING_ROUNDS) {
+                state[0] = hash.values[0];
+                state[1] = hash.values[1];
+                state[2] = hash.values[2];
+                state[3] = hash.values[3];
+                state[4] = hash.values[4];
+                state[5] = global_idx;
+                state[9] = round_batch + 2;
+                tip5_permutation(state);
+                hash.values[0] = state[0];
+                hash.values[1] = state[1];
+                hash.values[2] = state[2];
+                hash.values[3] = state[3];
+                hash.values[4] = state[4];
+            }
+            
+            // Round 4 of batch
+            if (round_batch + 3 < BUDDING_ROUNDS) {
+                state[0] = hash.values[0];
+                state[1] = hash.values[1];
+                state[2] = hash.values[2];
+                state[3] = hash.values[3];
+                state[4] = hash.values[4];
+                state[5] = global_idx;
+                state[9] = round_batch + 3;
+                tip5_permutation(state);
+                hash.values[0] = state[0];
+                hash.values[1] = state[1];
+                hash.values[2] = state[2];
+                hash.values[3] = state[3];
+                hash.values[4] = state[4];
+            }
         }
         
         buds[global_idx] = hash;
     }
 }
 
-__global__ void __launch_bounds__(512) compute_leafs_from_buds_kernel(
+__global__ void __launch_bounds__(1024) compute_leafs_from_buds_kernel(
     Digest* __restrict__ leafs, 
     const Digest* __restrict__ buds, 
     size_t num_leafs, size_t layer) {
-    // OPTIMIZATION: Use grid-stride loop and improve memory access patterns
+    // OPTIMIZATION: Use grid-stride loop with read-only cache for better memory access
     // Fast 32-bit path when safe
     if (num_leafs <= 0xFFFFFFFFu && layer < 32) {
         uint32_t idx32 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1251,11 +1300,12 @@ __global__ void __launch_bounds__(512) compute_leafs_from_buds_kernel(
         uint32_t layer_stride = (1u << static_cast<unsigned int>(layer));
         uint32_t mask = n32 - 1u;
         
+        #pragma unroll 2
         for (uint32_t i = idx32; i < n32; i += stride_step) {
             uint32_t buddy32 = (i + layer_stride) & mask;
-            // Load both buds before hashing for better memory access
-            Digest bud_a = buds[i];
-            Digest bud_b = buds[buddy32];
+            // Use read-only cache for better memory bandwidth
+            Digest bud_a = __ldg(&buds[i]);
+            Digest bud_b = __ldg(&buds[buddy32]);
             leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
         }
     } else {
@@ -1264,42 +1314,45 @@ __global__ void __launch_bounds__(512) compute_leafs_from_buds_kernel(
         size_t layer_stride = (1ULL << layer);
         size_t mask = num_leafs - 1ULL; // num_leafs is power-of-two
         
+        #pragma unroll 2
         for (size_t i = idx; i < num_leafs; i += stride_step) {
             size_t buddy_index = (i + layer_stride) & mask;
-            Digest bud_a = buds[i];
-            Digest bud_b = buds[buddy_index];
+            Digest bud_a = __ldg(&buds[i]);
+            Digest bud_b = __ldg(&buds[buddy_index]);
             leafs[i] = tip5_hash_fixed_device(bud_a, bud_b);
         }
     }
 }
 
-__global__ void __launch_bounds__(512) merkle_zip_kernel(
+__global__ void __launch_bounds__(1024) merkle_zip_kernel(
     Digest* __restrict__ parents, 
     const Digest* __restrict__ children, 
     size_t count) {
-    // OPTIMIZATION: Use grid-stride loop for better occupancy and coalescing
-    // This allows the kernel to handle any count without multiple launches
-    // and ensures coalesced memory access patterns
+    // OPTIMIZATION: Use grid-stride loop with aggressive unrolling for better ILP
+    // Process multiple elements per iteration to maximize memory throughput
     if (count <= 0xFFFFFFFFu) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         uint32_t stride = gridDim.x * blockDim.x;
         uint32_t count32 = static_cast<uint32_t>(count);
         
+        // Process 2 elements per iteration for better instruction-level parallelism
+        #pragma unroll 2
         for (uint32_t i = idx; i < count32; i += stride) {
-            // Load two consecutive children (better cache locality)
             uint32_t child_idx = 2 * i;
-            Digest left = children[child_idx];
-            Digest right = children[child_idx + 1];
+            // Prefetch pattern - load children with better coalescing
+            Digest left = __ldg(&children[child_idx]);
+            Digest right = __ldg(&children[child_idx + 1]);
             parents[i] = tip5_hash_fixed_device(left, right);
         }
     } else {
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         size_t stride = gridDim.x * blockDim.x;
         
+        #pragma unroll 2
         for (size_t i = idx; i < count; i += stride) {
             size_t child_idx = 2 * i;
-            Digest left = children[child_idx];
-            Digest right = children[child_idx + 1];
+            Digest left = __ldg(&children[child_idx]);
+            Digest right = __ldg(&children[child_idx + 1]);
             parents[i] = tip5_hash_fixed_device(left, right);
         }
     }
@@ -2734,38 +2787,8 @@ __device__ Digest PowMastPaths::commit_device() const {
 }
 
 namespace {
-constexpr size_t kPrefetchChunkBytes = 256ULL * 1024ULL * 1024ULL;
-
-void maybe_prefetch_managed(void* ptr, size_t bytes, int device_id) {
-    const char* env = std::getenv("XNT_PREFETCH_MANAGED");
-    if (!env || env[0] != '1') {
-        return;
-    }
-    if (!ptr || bytes == 0) {
-        return;
-    }
-
-    size_t offset = 0;
-    while (offset < bytes) {
-        size_t chunk = std::min(kPrefetchChunkBytes, bytes - offset);
-        // CUDA 12.0+ uses cudaMemLocation struct, older versions use int
-        // Use the struct version for CUDA 12.0+ compatibility
-        cudaMemLocation location;
-        location.type = cudaMemLocationTypeDevice;
-        location.id = device_id;
-        cudaError_t err = cudaMemPrefetchAsync(
-            static_cast<char*>(ptr) + offset, chunk, location, 0);
-        if (err != cudaSuccess) {
-            LOG_ERROR("cudaMemPrefetchAsync (managed)", err);
-            break;
-        }
-        offset += chunk;
-    }
-    cudaError_t sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        LOG_ERROR("cudaDeviceSynchronize (managed prefetch)", sync_err);
-    }
-}
+// Removed unused maybe_prefetch_managed function - no longer needed since we use
+// regular device memory instead of managed memory for better performance
 } // namespace
 
 __host__ Digest PowMastPaths::commit() const {
@@ -3716,10 +3739,22 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         return GuesserBuffer();
     }
     
-    int threadsPerBlock = 512;
-    // OPTIMIZATION: Limit grid size for better occupancy and reduced launch overhead
-    // Use smaller grid with grid-stride loops in kernels
+    int threadsPerBlock = 1024;
+    // OPTIMIZATION: Use larger grid for maximum SM utilization
+    // Grid-stride loops handle the work efficiently
     int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+    // For very large problems, still cap at MAX_GRID_DIM_X but ensure we have enough blocks
+    // to saturate all SMs (typically want 2-4 blocks per SM)
+    numBlocks = std::max(numBlocks, 8192);  // Minimum 8K blocks for good SM saturation
+    
+    // OPTIMIZATION: Set L2 cache persistence for read-heavy operations
+    // This keeps frequently accessed data in L2 cache for better performance
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, 0);
+    size_t l2_cache_size = deviceProp.l2CacheSize;
+    if (l2_cache_size > 0) {
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2_cache_size);
+    }
     
     // Step 1: Compute buds
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
@@ -3741,6 +3776,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
     
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
         int layerBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        layerBlocks = std::max(layerBlocks, 8192);
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
         std::swap(current_buds, current_leafs);
@@ -3808,6 +3844,19 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
         Digest* parent_layer = buffer.d_merkle_tree + write_offset;
         
         int layerBlocks = std::min((int)((parent_count + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        layerBlocks = std::max(layerBlocks, 4096);  // Ensure good SM utilization even for smaller layers
+        
+        // Hint to cache current layer in L2 for reading
+        if (layer > 0) {
+            cudaStreamAttrValue stream_attribute;
+            stream_attribute.accessPolicyWindow.base_ptr = (void*)current_layer;
+            stream_attribute.accessPolicyWindow.num_bytes = current_count * sizeof(Digest);
+            stream_attribute.accessPolicyWindow.hitRatio = 1.0f;
+            stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(pp_stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+        }
+        
         merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             parent_layer, current_layer, parent_count);
         
@@ -3893,7 +3942,10 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         return GuesserBuffer();
     }
     
-    int threadsPerBlock = 512;
+    int threadsPerBlock = 1024;
+    
+    // OPTIMIZATION: Use aggressive grid configuration for LOW_VRAM mode
+    // This is critical since we're memory-bound in this mode
     
     // Step 1: Allocate leafs buffer using regular device memory (faster than managed memory)
     size_t leafs_size = MERKLE_NUM_LEAFS * sizeof(Digest);
@@ -3908,6 +3960,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     
     // Compute buds (all kernels use the same stream for in-order execution)
     int numBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+    numBlocks = std::max(numBlocks, 8192);  // Aggressive grid for compute-heavy bud kernel
     compute_buds_kernel<<<numBlocks, threadsPerBlock, 0, pp_stream>>>(
         d_leafs, commitment, MERKLE_NUM_LEAFS, 0);
     
@@ -3929,6 +3982,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
     // Convert buds to leafs (all on same stream, no sync needed between kernels)
     for (size_t layer = 0; layer < NUM_BUD_LAYERS; ++layer) {
         int layerBlocks = std::min((int)((MERKLE_NUM_LEAFS + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        layerBlocks = std::max(layerBlocks, 8192);
         compute_leafs_from_buds_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             current_leafs, current_buds, MERKLE_NUM_LEAFS, layer);
         std::swap(current_buds, current_leafs);
@@ -3987,6 +4041,7 @@ __host__ GuesserBuffer Pow::preprocess_gpu_low_vram(const PowMastPaths& mast_aut
         
         // Compute next layer (all kernels on same stream, no sync needed)
         int layerBlocks = std::min((int)((next_layer_size + threadsPerBlock - 1) / threadsPerBlock), MAX_GRID_DIM_X);
+        layerBlocks = std::max(layerBlocks, 2048);  // Ensure good utilization even for smaller layers
         merkle_zip_kernel<<<layerBlocks, threadsPerBlock, 0, pp_stream>>>(
             next_layer, current_layer, next_layer_size);
         
