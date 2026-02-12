@@ -1,8 +1,5 @@
-// ============================================================================
-// xnt-miner-unity.cu — Single file: all source inlined (no separate .cu includes)
-//
-// Build: make unity
-// ============================================================================
+// xnt-miner-unity.cu — Single file: all source inlined
+// Auto-generated from src/*.cu — do not edit
 
 #define XNT_UNITY_BUILD 1
 
@@ -7754,7 +7751,11 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                     bool is_new_template = false;
                     {
                         std::lock_guard<std::mutex> lock(job_mutex);
-                        if (!template_id.empty() && template_id != last_template_id) {
+                        // When composing, also process same template_id to allow second-proposal count
+                        bool template_changed = !template_id.empty() && template_id != last_template_id;
+                        bool composing_same_template = composing_new_block.load() && !template_id.empty() 
+                            && template_id == last_template_id && proposals_seen_for_tip.load() == 1;
+                        if (template_changed || composing_same_template) {
                             // Verify prev_block matches tip
                             std::string prev_block;
                             if (metadata.contains("prevBlock")) {
@@ -7766,20 +7767,43 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                             std::string tip_digest = client->getTipDigest();
 
                             if (prev_block.empty() || prev_block == tip_digest) {
-                                // If prev_block matches tip, the proposal is valid - start mining immediately
+                                // After tip change, wait for second proposal with same prev_block
+                                // First proposal often causes InvalidBlock errors (fixed in 503af36, dfffca9)
                                 bool should_resume = true;
                                 bool is_composing = composing_new_block.load();
                                 
                                 if (is_composing) {
-                                    // First valid proposal after tip change - start mining immediately
-                                    composing_new_block.store(false);
-                                    recovery_mode.store(false);
-                                    proposals_seen_for_tip.store(0);
-                                    first_proposal_prev_block.clear();
-                                    std::cout << "[JobBroadcaster] " << Color::GREEN 
-                                              << "Valid proposal received (prev_block matches tip), resuming mining" 
-                                              << Color::RESET << std::endl;
-                                    should_resume = true;
+                                    int count = proposals_seen_for_tip.fetch_add(1) + 1;
+                                    
+                                    if (count == 1) {
+                                        // First proposal - record prev_block but don't resume yet
+                                        first_proposal_prev_block = prev_block;
+                                        should_resume = false;
+                                        bool in_recovery = recovery_mode.load();
+                                        std::cout << "[JobBroadcaster] " << Color::YELLOW 
+                                                  << "First proposal received (prev_block: " 
+                                                  << prev_block.substr(0, 16) << "...), waiting for second..."
+                                                  << (in_recovery ? " (recovery mode)" : "")
+                                                  << Color::RESET << std::endl;
+                                    } else if (count == 2 && prev_block == first_proposal_prev_block) {
+                                        // Second proposal with same prev_block - safe to resume
+                                        composing_new_block.store(false);
+                                        recovery_mode.store(false);
+                                        std::cout << "[JobBroadcaster] " << Color::GREEN 
+                                                  << "Stable proposal confirmed (2nd with same prev_block), resuming mining" 
+                                                  << Color::RESET << std::endl;
+                                        should_resume = true;
+                                    } else if (count >= 2 && prev_block != first_proposal_prev_block) {
+                                        // Prev_block changed, reset counter
+                                        proposals_seen_for_tip.store(1);
+                                        first_proposal_prev_block = prev_block;
+                                        should_resume = false;
+                                        std::cout << "[JobBroadcaster] " << Color::YELLOW 
+                                                  << "Prev_block changed, resetting proposal count" 
+                                                  << Color::RESET << std::endl;
+                                    } else {
+                                        should_resume = false;
+                                    }
                                 }
 
                                 // Always update template_id and tip tracking
@@ -7794,8 +7818,6 @@ void ConnectionMultiplexer::jobBroadcasterLoop() {
                                         stats.last_job_time = std::chrono::steady_clock::now();
                                     }
                                 }
-                                // If not resuming (first proposal after tip change), don't set is_new_template
-                                // This prevents broadcasting until we have a stable proposal
                             }
                         }
                     }
@@ -8209,10 +8231,31 @@ void ConnectionMultiplexer::tipMonitorLoop() {
             }
             
             if (tip_changed) {
-                // Set composing flag - we're waiting for a valid new proposal
-                composing_new_block.store(true);
-                proposals_seen_for_tip.store(0);
-                first_proposal_prev_block.clear();
+                // Check if we're waiting for second proposal and new tip matches prev_block (dfffca9)
+                bool should_reset = true;
+                {
+                    std::lock_guard<std::mutex> lock(job_mutex);
+                    int current_count = proposals_seen_for_tip.load();
+                    if (current_count == 1 && !first_proposal_prev_block.empty()) {
+                        if (new_tip == first_proposal_prev_block) {
+                            // New tip matches the prev_block we're waiting for - keep waiting for second
+                            should_reset = false;
+                            std::cout << "[TipMonitor] " << Color::YELLOW 
+                                      << "New block matches waiting prev_block, continuing to wait for second proposal..." 
+                                      << Color::RESET << std::endl;
+                        } else {
+                            std::cout << "[TipMonitor] " << Color::YELLOW 
+                                      << "Prev_block changed, resetting proposal wait..." 
+                                      << Color::RESET << std::endl;
+                        }
+                    }
+                }
+                
+                if (should_reset) {
+                    composing_new_block.store(true);
+                    proposals_seen_for_tip.store(0);
+                    first_proposal_prev_block.clear();
+                }
                 
                 // Immediately pause all workers - their templates are now stale
                 {
@@ -8227,15 +8270,16 @@ void ConnectionMultiplexer::tipMonitorLoop() {
                     }
                 }
                 
-                // Clear the last template ID to force immediate fetch
-                {
+                if (should_reset) {
                     std::lock_guard<std::mutex> lock(job_mutex);
                     last_template_id.clear();
                 }
                 
-                std::cout << "[TipMonitor] " << Color::YELLOW 
-                          << "Node composing new block, waiting for valid proposal..." 
-                          << Color::RESET << std::endl;
+                if (should_reset) {
+                    std::cout << "[TipMonitor] " << Color::YELLOW 
+                              << "Node composing new block, waiting for stable proposal..." 
+                              << Color::RESET << std::endl;
+                }
                 
                 // Don't fetch here - let jobBroadcasterLoop handle it with retries
                 // This ensures we wait until a valid proposal is ready
