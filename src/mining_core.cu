@@ -1542,7 +1542,7 @@ bool GuesserBuffer::ensure_mining_resources() {
             texture_bound = true;
             LOG_DEBUG("Texture memory bound for merkle tree (" << (tree_size * sizeof(Digest) / (1024*1024)) << " MB)");
         } else {
-            LOG_WARN("Failed to bind texture memory (continuing without): " << cudaGetErrorString(err));
+            std::cerr << "[WARNING] Failed to bind texture memory: " << cudaGetErrorString(err) << " (continuing without)" << std::endl;
             tex_merkle_tree = 0;
         }
     }
@@ -1555,7 +1555,7 @@ bool GuesserBuffer::ensure_mining_resources() {
             d_phase_indices_capacity = EXPANDED_CAPACITY;
             LOG_DEBUG("Allocated expanded phase indices buffer: " << (EXPANDED_CAPACITY * 16 / (1024*1024)) << " MB");
         } else {
-            LOG_WARN("Failed to allocate expanded phase buffer, will use standard size");
+            std::cerr << "[WARNING] Failed to allocate expanded phase buffer: " << cudaGetErrorString(err) << " (will use standard size)" << std::endl;
         }
     }
 
