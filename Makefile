@@ -70,13 +70,21 @@ MODULAR_SRCS = src/common.cu \
                src/connection_multiplexer.cu \
                src/main.cu
 
-.PHONY: all clean modular test-rpc help rebuild
+.PHONY: all clean modular unity test-rpc help rebuild
 
-# Default: build from modular sources
-all: modular
+# Default: unity build (single TU for max performance)
+all: unity
 
-# Build from modular sources
-modular: $(TARGET)
+# Unity build: single translation unit, best runtime performance
+# Use: make unity  or  make BUILD_UNITY=1
+BUILD_UNITY ?= 0
+unity:
+	$(MAKE) BUILD_UNITY=1 $(TARGET)
+	@echo "Built $(TARGET) (unity - single TU)"
+
+# Build from modular sources (faster incremental compile)
+modular:
+	$(MAKE) BUILD_UNITY=0 $(TARGET)
 
 # Clean rebuild — runs clean first, then build. Safe with -j (uses recursive make).
 rebuild:
@@ -86,14 +94,51 @@ rebuild:
 # Object files for separable compilation
 OBJS = $(MODULAR_SRCS:.cu=.o)
 DEVICE_LINK_OBJ = device_link.o
+UNITY_SRC = xnt-miner-unity.cu
 
-# Link: DLTO link-time optimization when available, else device-link
+# Regenerate xnt-miner-unity.cu from src/*.cu when any source changes
+$(UNITY_SRC): $(MODULAR_SRCS)
+	@echo "Regenerating $(UNITY_SRC)..."
+	@echo '// xnt-miner-unity.cu — Single file: all source inlined' > $@
+	@echo '// Auto-generated from src/*.cu — do not edit' >> $@
+	@echo '' >> $@
+	@echo '#define XNT_UNITY_BUILD 1' >> $@
+	@echo '' >> $@
+	@echo '// --- common.cu ---' >> $@
+	@cat src/common.cu >> $@
+	@echo '' >> $@
+	@echo '// --- mining_core.cu ---' >> $@
+	@cat src/mining_core.cu >> $@
+	@echo '' >> $@
+	@echo '// --- rpc_client.cu ---' >> $@
+	@cat src/rpc_client.cu >> $@
+	@echo '' >> $@
+	@echo '// --- stratum_client.cu ---' >> $@
+	@cat src/stratum_client.cu >> $@
+	@echo '' >> $@
+	@echo '// --- network.cu ---' >> $@
+	@cat src/network.cu >> $@
+	@echo '' >> $@
+	@echo '// --- connection_multiplexer.cu ---' >> $@
+	@cat src/connection_multiplexer.cu >> $@
+	@echo '' >> $@
+	@echo '// --- main.cu ---' >> $@
+	@cat src/main.cu >> $@
+	@echo "Done."
+
+# Unity build: single TU (conditional)
+ifeq ($(BUILD_UNITY),1)
+$(TARGET): $(UNITY_SRC)
+	$(NVCC) $(NVCC_FLAGS) $(INCLUDES) -I. -o $@ $(UNITY_SRC) $(LIBS)
+# Modular build: link object files
+else
 $(TARGET): $(OBJS)
 ifdef DLTO
 	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(LIBS)
 else
 	$(NVCC) $(NVCC_FLAGS) -dlink -o $(DEVICE_LINK_OBJ) $(OBJS)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $(OBJS) $(DEVICE_LINK_OBJ) $(LIBS)
+endif
 endif
 
 # Compile each .cu file to .o with device code (separable compilation)
@@ -116,16 +161,19 @@ help:
 	@echo "XNT Miner Build System"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all        - Build from modular sources (default)"
-	@echo "  modular    - Build from modular src/ files"
+	@echo "  all        - Unity build (default, max performance)"
+	@echo "  unity      - Single TU build (best runtime performance)"
+	@echo "  modular    - Modular build (faster incremental compile)"
 	@echo "  rebuild    - Clean + build (safe, sequential)"
 	@echo "  clean      - Remove build artifacts"
 	@echo "  help       - Show this help"
 	@echo ""
 	@echo ""
 	@echo "Examples:"
-	@echo "  make                          # Release build"
-	@echo "  make rebuild ARCH=sm_89       # Clean rebuild for 4090"
+	@echo "  make                          # Unity build (default)"
+	@echo "  make unity ARCH=sm_89        # Unity for 4090 only"
+	@echo "  make modular                  # Modular (faster incremental)"
+	@echo "  make rebuild ARCH=sm_89      # Clean rebuild for 4090"
 	@echo "  make clean && make ARCH=sm_89 # Same (sequential)"
 	@echo "  make MAX_REG_COUNT=48 # Build with max 48 registers (higher occupancy)"
 	@echo "  make MAX_REG_COUNT=80 # Build with max 80 registers (if 64 causes spilling)"

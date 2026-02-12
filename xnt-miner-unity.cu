@@ -1,4 +1,32 @@
 // ============================================================================
+// xnt-miner-unity.cu — Single file: all source inlined (no separate .cu includes)
+//
+// Build: make unity
+// ============================================================================
+
+#define XNT_UNITY_BUILD 1
+
+// --- common.cu ---
+#include "common.cuh"
+
+std::atomic<bool> stop_mining{false};
+
+std::string g_miner_wallet_address = "";
+std::string g_miner_worker_name = "";
+std::atomic<int> g_total_gpu_count{1};
+int g_gpu_device_id = -1;
+bool g_test_mode = false;
+bool g_benchmark_mode = false;
+int g_fetch_interval_sec = 5;
+
+std::mutex g_log_mutex;
+
+// Tuning parameters (optimized defaults)
+int g_block_size = 256;              // Threads per block (optimal for LUT loading)
+uint64_t g_batch_size = DEFAULT_BATCH_SIZE;  // Mining + benchmark default (0 = auto)
+
+// --- mining_core.cu ---
+// ============================================================================
 // mining_core.cu — Unity build for all mining-critical CUDA code.
 //
 // Contains tip5, digest, kernels, and pow/merkle inlined below into a single TU.
@@ -5334,4 +5362,3769 @@ bool verifySolution(
     }
     
     return true;
+}
+
+// --- rpc_client.cu ---
+#include "rpc_client.cuh"
+#include "network.cuh"
+#include "pow.cuh"
+#include "digest.cuh"
+#include <sstream>
+#include <fstream>
+#include <algorithm>
+
+static bool http_post(const std::string& url,
+                     const std::string& body,
+                     const std::string& auth_header,
+                     std::string& response,
+                     int timeout_sec) {
+    std::string protocol, host, path;
+    int port = 80;
+    
+    size_t protocol_end = url.find("://");
+    if (protocol_end == std::string::npos) {
+        return false;
+    }
+    protocol = url.substr(0, protocol_end);
+    std::string rest = url.substr(protocol_end + 3);
+    
+    if (protocol == "https") {
+        return false;
+    }
+    
+    size_t path_start = rest.find('/');
+    if (path_start != std::string::npos) {
+        host = rest.substr(0, path_start);
+        path = rest.substr(path_start);
+    } else {
+        host = rest;
+        path = "/";
+    }
+    
+    size_t port_start = host.find(':');
+    if (port_start != std::string::npos) {
+        try {
+            port = std::stoi(host.substr(port_start + 1));
+            host = host.substr(0, port_start);
+        } catch (...) {
+            return false;
+        }
+    }
+    
+    socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET_VALUE) {
+        return false;
+    }
+    
+    struct hostent* host_entry = gethostbyname(host.c_str());
+    if (!host_entry) {
+        close(sock);
+        return false;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    memcpy(&server_addr.sin_addr, host_entry->h_addr, host_entry->h_length);
+    
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR_VALUE) {
+        close(sock);
+        return false;
+    }
+    
+    #ifdef _WIN32
+        DWORD timeout = timeout_sec * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+    #else
+        struct timeval tv;
+        tv.tv_sec = timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    #endif
+    
+    std::ostringstream request;
+    request << "POST " << path << " HTTP/1.1\r\n";
+    request << "Host: " << host << ":" << port << "\r\n";
+    request << "Content-Type: application/json\r\n";
+    request << "Content-Length: " << body.length() << "\r\n";
+    if (!auth_header.empty()) {
+        request << "Authorization: " << auth_header << "\r\n";
+    }
+    request << "Connection: close\r\n";
+    request << "\r\n";
+    request << body;
+    
+    std::string request_str = request.str();
+    
+    if (send(sock, request_str.c_str(), request_str.length(), 0) == SOCKET_ERROR_VALUE) {
+        close(sock);
+        return false;
+    }
+    
+    response.clear();
+    char buffer[4096];
+    ssize_t received;
+    while ((received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[received] = '\0';
+        response += buffer;
+        
+        // Check if we've received the complete response
+        size_t header_end = response.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            // Headers received, check Content-Length
+            std::string headers = response.substr(0, header_end);
+            size_t content_length_pos = headers.find("Content-Length:");
+            if (content_length_pos != std::string::npos) {
+                size_t len_start = content_length_pos + 15;
+                while (len_start < headers.length() && headers[len_start] == ' ') len_start++;
+                size_t len_end = len_start;
+                while (len_end < headers.length() && headers[len_end] >= '0' && headers[len_end] <= '9') len_end++;
+                if (len_end > len_start) {
+                    try {
+                        int content_length = std::stoi(headers.substr(len_start, len_end - len_start));
+                        size_t body_start = header_end + 4;
+                        if (response.length() - body_start >= static_cast<size_t>(content_length)) {
+                            break; // Received complete response
+                        }
+                    } catch (...) {
+                        // If parsing fails, continue reading
+                    }
+                }
+            }
+        }
+    }
+    
+    // recv returns 0 when connection is closed (normal)
+    // recv returns -1 on error (timeout or other error)
+    if (received < 0) {
+        close(sock);
+        return false;
+    }
+    
+    close(sock);
+    
+    size_t header_end = response.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return false;
+    }
+    
+    size_t status_line_end = response.find("\r\n");
+    if (status_line_end == std::string::npos) {
+        return false;
+    }
+    
+    std::string status_line = response.substr(0, status_line_end);
+    
+    if (status_line.find("HTTP/1.1 200") == std::string::npos &&
+        status_line.find("HTTP/1.0 200") == std::string::npos) {
+        return false;
+    }
+    
+    response = response.substr(header_end + 4);
+    
+    return true;
+}
+
+// Base64 encode (simple implementation)
+static std::string base64_encode_simple(const std::string& input) {
+    const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    int val = 0, valb = -6;
+    
+    for (unsigned char c : input) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            encoded.push_back(base64_chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    
+    if (valb > -6) {
+        encoded.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    }
+    
+    while (encoded.size() % 4) {
+        encoded.push_back('=');
+    }
+    
+    return encoded;
+}
+
+XntRpcClient::XntRpcClient(const RpcConfig& cfg)
+    : config(cfg)
+    , request_id_counter(1)
+    , last_error(RpcError::None)
+    , last_error_message("") {
+}
+
+XntRpcClient::XntRpcClient(const std::string& url,
+                           const std::string& user,
+                           const std::string& password)
+    : config()
+    , request_id_counter(1)
+    , last_error(RpcError::None)
+    , last_error_message("") {
+    config.url = url;
+    config.user = user;
+    config.password = password;
+}
+
+bool XntRpcClient::make_rpc_request(const std::string& method,
+                                   const json& params,
+                                   json& response) {
+    std::lock_guard<std::mutex> lock(rpc_mutex);
+    
+    json request;
+    request["jsonrpc"] = "2.0";
+    request["method"] = method;
+    request["params"] = params;
+    request["id"] = request_id_counter.fetch_add(1);
+    
+    std::string request_body = request.dump();
+    std::string auth_header = build_auth_header();
+    std::string http_response;
+    
+    if (!http_post(config.url, request_body, auth_header, http_response, config.timeout_sec)) {
+        last_error = RpcError::ConnectionFailed;
+        last_error_message = "HTTP request failed";
+        return false;
+    }
+    
+    try {
+        response = json::parse(http_response);
+        
+        if (response.contains("error")) {
+            last_error = parse_rpc_error(response);
+            last_error_message = get_error_message(response);
+            return false;
+        }
+        
+        last_error = RpcError::None;
+        last_error_message = "";
+        return true;
+    } catch (const std::exception& e) {
+        last_error = RpcError::InvalidResponse;
+        last_error_message = std::string("JSON parse error: ") + e.what();
+        return false;
+    }
+}
+
+std::string XntRpcClient::build_auth_header() const {
+    if (!config.user.empty() && !config.password.empty()) {
+        std::string credentials = config.user + ":" + config.password;
+        return "Basic " + base64_encode_simple(credentials);
+    }
+    
+    if (!config.cookie_file.empty()) {
+        std::string cookie = load_cookie();
+        if (!cookie.empty()) {
+            return "Cookie: " + cookie;
+        }
+    }
+    
+    return "";
+}
+
+std::string XntRpcClient::load_cookie() const {
+    if (config.cookie_file.empty()) {
+        return "";
+    }
+    
+    std::ifstream file(config.cookie_file);
+    if (!file.is_open()) {
+        return "";
+    }
+    
+    std::string cookie;
+    std::getline(file, cookie);
+    return cookie;
+}
+
+RpcError XntRpcClient::parse_rpc_error(const json& response) const {
+    if (!response.contains("error")) {
+        return RpcError::None;
+    }
+    
+    json error = response["error"];
+    std::string message = (error.contains("message") && !error["message"].is_null()) 
+        ? error.value("message", "") : "";
+    
+    if (message.find("InvalidBlock") != std::string::npos) {
+        return RpcError::InvalidBlock;
+    } else if (message.find("InsufficientWork") != std::string::npos) {
+        return RpcError::InsufficientWork;
+    } else if (message.find("Authentication") != std::string::npos ||
+               message.find("Unauthorized") != std::string::npos) {
+        return RpcError::AuthenticationFailed;
+    }
+    
+    return RpcError::Unknown;
+}
+
+std::string XntRpcClient::get_error_message(const json& response) const {
+    if (!response.contains("error")) {
+        return "";
+    }
+    
+    json error = response["error"];
+    return (error.contains("message") && !error["message"].is_null())
+        ? error.value("message", "Unknown error") : "Unknown error";
+}
+
+json XntRpcClient::getBlockTemplate(const std::string& guesser_address) {
+    json params = json::array();
+    params.push_back(guesser_address);
+    
+    json response;
+    if (make_rpc_request("mining_getBlockTemplate", params, response)) {
+        return response;
+    }
+    
+    return json();
+}
+
+json XntRpcClient::submitBlock(const json& template_obj, const json& pow) {
+    // JSON-RPC server expects params as an array: [template, pow]
+    json params = json::array();
+    params.push_back(template_obj);
+    params.push_back(pow);
+    
+    json response;
+    make_rpc_request("mining_submitBlock", params, response);
+    
+    // Return response even if it contains an error, so caller can extract error details
+    return response;
+}
+
+uint64_t XntRpcClient::getChainHeight() {
+    json params = json::array();
+    json response;
+    
+    if (make_rpc_request("chain_height", params, response)) {
+        if (response.contains("result") && response["result"].contains("height")) {
+            return response["result"]["height"].get<uint64_t>();
+        }
+    }
+    
+    return 0;
+}
+
+std::string XntRpcClient::getTipDigest() {
+    json params = json::array();
+    json response;
+    
+    if (make_rpc_request("chain_tipDigest", params, response)) {
+        if (response.contains("result") && response["result"].contains("digest")) {
+            return response["result"]["digest"].get<std::string>();
+        }
+    }
+    
+    return "";
+}
+
+json XntRpcClient::getTipHeader() {
+    json params = json::array();
+    json response;
+    
+    if (make_rpc_request("chain_tipHeader", params, response)) {
+        return response;
+    }
+    
+    return json();
+}
+
+bool XntRpcClient::testConnection() {
+    json params = json::array();
+    json response;
+    
+    return make_rpc_request("chain_height", params, response);
+}
+
+// Track last logged proposal ID to avoid duplicate logs
+static std::string g_last_logged_proposal_id;
+static bool g_null_template_logged = false;
+
+PowPuzzle parseRpcTemplate(const json& template_response) {
+    PowPuzzle puzzle;
+    
+    try {
+        if (!template_response.contains("result")) {
+            return puzzle;
+        }
+        
+        json result = template_response["result"];
+        if (!result.contains("template") || result["template"].is_null()) {
+            // Only log null template once to avoid spam
+            if (!g_null_template_logged) {
+                std::cout << "[RPC] " << Color::YELLOW << "Template is null (node may be syncing)" << Color::RESET << std::endl;
+                g_null_template_logged = true;
+            }
+            return puzzle;
+        }
+        // Reset null template flag when we get a valid template
+        if (g_null_template_logged) {
+            g_null_template_logged = false;
+        }
+        
+        json template_obj = result["template"];
+        if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+            return puzzle;
+        }
+        
+        // Match Rust structure: RpcBlockTemplateMetadata
+        // Fields: digest, prev_block, threshold, total_guesser_reward, pow_mast_paths
+        json metadata = template_obj["metadata"];
+        
+        // Handle both snake_case (pow_mast_paths) and camelCase (powMastPaths)
+        json pow_mast_paths;
+        if (metadata.contains("pow_mast_paths") && !metadata["pow_mast_paths"].is_null()) {
+            pow_mast_paths = metadata["pow_mast_paths"];
+        } else if (metadata.contains("powMastPaths") && !metadata["powMastPaths"].is_null()) {
+            pow_mast_paths = metadata["powMastPaths"];
+        } else {
+            return puzzle;
+        }
+        
+        // Extract proposal/template ID (digest field)
+        // This is the unique identifier for this block template
+        if (metadata.contains("digest") && !metadata["digest"].is_null()) {
+            puzzle.id = metadata.value("digest", "");
+        } else {
+            // If digest is missing, template is invalid
+            return puzzle;
+        }
+        // Extract threshold (target digest for PoW solution)
+        if (metadata.contains("threshold") && !metadata["threshold"].is_null()) {
+            puzzle.threshold = metadata.value("threshold", "");
+        } else {
+            // Threshold is required for mining
+            return puzzle;
+        }
+        // Handle both snake_case (total_guesser_reward) and camelCase (totalGuesserReward)
+        if (metadata.contains("total_guesser_reward") && !metadata["total_guesser_reward"].is_null()) {
+            puzzle.total_guesser_reward = metadata.value("total_guesser_reward", "");
+        } else if (metadata.contains("totalGuesserReward") && !metadata["totalGuesserReward"].is_null()) {
+            puzzle.total_guesser_reward = metadata.value("totalGuesserReward", "");
+        }
+        // Handle both snake_case (prev_block) and camelCase (prevBlock)
+        if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+            puzzle.prev_block = metadata.value("prev_block", "");
+        } else if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+            puzzle.prev_block = metadata.value("prevBlock", "");
+        }
+        
+        if (pow_mast_paths.contains("pow") && pow_mast_paths["pow"].is_array()) {
+            for (const auto& path : pow_mast_paths["pow"]) {
+                if (path.is_string()) {
+                    puzzle.auth_paths.pow.push_back(path.get<std::string>());
+                } else if (path.is_array()) {
+                    std::ostringstream hex;
+                    for (const auto& limb : path) {
+                        if (limb.is_number()) {
+                            hex << std::hex << limb.get<uint64_t>();
+                        }
+                    }
+                    puzzle.auth_paths.pow.push_back(hex.str());
+                }
+            }
+        }
+        
+        if (pow_mast_paths.contains("header") && pow_mast_paths["header"].is_array()) {
+            for (const auto& path : pow_mast_paths["header"]) {
+                if (path.is_string()) {
+                    puzzle.auth_paths.header.push_back(path.get<std::string>());
+                } else if (path.is_array()) {
+                    std::ostringstream hex;
+                    for (const auto& limb : path) {
+                        if (limb.is_number()) {
+                            hex << std::hex << limb.get<uint64_t>();
+                        }
+                    }
+                    puzzle.auth_paths.header.push_back(hex.str());
+                }
+            }
+        }
+        
+        if (pow_mast_paths.contains("kernel") && pow_mast_paths["kernel"].is_array()) {
+            for (const auto& path : pow_mast_paths["kernel"]) {
+                if (path.is_string()) {
+                    puzzle.auth_paths.kernel.push_back(path.get<std::string>());
+                } else if (path.is_array()) {
+                    std::ostringstream hex;
+                    for (const auto& limb : path) {
+                        if (limb.is_number()) {
+                            hex << std::hex << limb.get<uint64_t>();
+                        }
+                    }
+                    puzzle.auth_paths.kernel.push_back(hex.str());
+                }
+            }
+        }
+        
+        // For mainnet blocks >= 15256, we use CONSENSUS_XNT
+        // Since current block height is > 15256, always use XNT consensus
+        puzzle.consensus_rule_set = CONSENSUS_XNT;
+        
+        // Only log when we get a NEW block proposal (different proposal ID)
+        // This matches the Rust RpcBlockTemplateMetadata structure
+        if (puzzle.id != g_last_logged_proposal_id && !puzzle.id.empty()) {
+            g_last_logged_proposal_id = puzzle.id;
+            
+            std::string short_id = puzzle.id.length() > 20 
+                ? puzzle.id.substr(0, 12) + "..." + puzzle.id.substr(puzzle.id.length() - 8) 
+                : puzzle.id;
+            
+            std::cout << "[RPC] " << Color::GREEN << Color::BOLD << "✓ Block proposal received" << Color::RESET << std::endl
+                      << "  Proposal ID: " << Color::CYAN << short_id << Color::RESET << std::endl
+                      << "  Threshold: " << puzzle.threshold.substr(0, 16) << "..." << std::endl
+                      << "  Prev Block: " << (puzzle.prev_block.length() > 16 ? puzzle.prev_block.substr(0, 16) + "..." : puzzle.prev_block) << std::endl;
+            // Only show reward in solo mode (pool mode doesn't include reward)
+            if (!puzzle.total_guesser_reward.empty()) {
+                std::cout << "  Reward: " << format_reward_xnt(puzzle.total_guesser_reward) << std::endl;
+            }
+        }
+        
+    } catch (const std::exception& e) {
+        std::cout << "[RPC] " << Color::RED << "✗ Failed to parse block proposal: " << e.what() << Color::RESET << std::endl;
+        LOG_DEBUG("Failed to parse RPC template: " << e.what());
+    }
+    
+    return puzzle;
+}
+
+json powToRpcFormat(const Pow& pow_solution, const Digest& solution_hash) {
+    json pow_json;
+
+    // Digests are serialized as hex strings in the JSON-RPC API
+    // Use pow_solution.root (the Merkle root) not solution_hash (the final block hash)
+    pow_json["root"] = digest_to_hex(pow_solution.root);
+
+    pow_json["pathA"] = json::array();
+    for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        pow_json["pathA"].push_back(digest_to_hex(pow_solution.path_a[i]));
+    }
+
+    pow_json["pathB"] = json::array();
+    for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        pow_json["pathB"].push_back(digest_to_hex(pow_solution.path_b[i]));
+    }
+
+    pow_json["nonce"] = digest_to_hex(pow_solution.nonce);
+
+    return pow_json;
+}
+
+// --- stratum_client.cu ---
+#include "stratum_client.cuh"
+#include "pow.cuh"
+#include "digest.cuh"
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
+// OpenSSL includes
+#ifndef _WIN32
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#else
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#endif
+
+// Parse stratum URL into host and port
+bool parse_stratum_url(const std::string& url, std::string& host, int& port, bool& use_ssl) {
+    std::string work_url = url;
+    use_ssl = false;
+    
+    // Remove protocol prefix
+    const std::vector<std::string> prefixes = {
+        "stratum+ssl://", "stratum+tcp://", "stratum://", "tcp://"
+    };
+    
+    for (const auto& prefix : prefixes) {
+        if (work_url.find(prefix) == 0) {
+            work_url = work_url.substr(prefix.length());
+            if (prefix == "stratum+ssl://") {
+                use_ssl = true;
+            }
+            break;
+        }
+    }
+    
+    // Parse host:port
+    size_t port_pos = work_url.rfind(':');
+    if (port_pos != std::string::npos) {
+        host = work_url.substr(0, port_pos);
+        try {
+            port = std::stoi(work_url.substr(port_pos + 1));
+        } catch (...) {
+            return false;
+        }
+    } else {
+        host = work_url;
+        port = 3333;  // Default stratum port
+    }
+    
+    return !host.empty() && port > 0 && port <= 65535;
+}
+
+StratumClient::StratumClient(const StratumConfig& cfg)
+    : config(cfg)
+    , sock(INVALID_SOCKET_VALUE)
+    , use_ssl(false)
+    , ssl_ctx(nullptr)
+    , ssl(nullptr) {
+    platform_socket_init();
+    // Initialize OpenSSL
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    use_ssl = config.use_ssl;
+}
+
+StratumClient::StratumClient(const std::string& url, const std::string& address,
+                             const std::string& worker_name,
+                             const std::string& password)
+    : sock(INVALID_SOCKET_VALUE)
+    , use_ssl(false)
+    , ssl_ctx(nullptr)
+    , ssl(nullptr) {
+    platform_socket_init();
+    // Initialize OpenSSL
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+    
+    bool url_use_ssl = false;
+    if (!parse_stratum_url(url, config.host, config.port, url_use_ssl)) {
+        config.host = "127.0.0.1";
+        config.port = 3333;
+    }
+    use_ssl = url_use_ssl;
+    config.use_ssl = url_use_ssl;
+    
+    config.address = address;
+    config.name = worker_name;
+    config.password = password;
+}
+
+StratumClient::~StratumClient() {
+    disconnect();
+    cleanup_ssl();
+    platform_socket_cleanup();
+}
+
+bool StratumClient::connect_tcp() {
+    if (sock != INVALID_SOCKET_VALUE) {
+        disconnect_tcp();
+    }
+    
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET_VALUE) {
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to create socket";
+        return false;
+    }
+    
+    // Resolve hostname
+    struct hostent* host_entry = gethostbyname(config.host.c_str());
+    if (!host_entry) {
+        close(sock);
+        sock = INVALID_SOCKET_VALUE;
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to resolve hostname: " + config.host;
+        return false;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(config.port);
+    memcpy(&server_addr.sin_addr, host_entry->h_addr, host_entry->h_length);
+    
+    // Set connection timeout
+    #ifdef _WIN32
+        DWORD timeout = config.connect_timeout_sec * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+    #else
+        struct timeval tv;
+        tv.tv_sec = config.connect_timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    #endif
+    
+    if (::connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR_VALUE) {
+        close(sock);
+        sock = INVALID_SOCKET_VALUE;
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to connect to " + config.host + ":" + std::to_string(config.port);
+        return false;
+    }
+    
+    // Set read timeout for normal operation
+    #ifdef _WIN32
+        timeout = config.read_timeout_sec * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    #else
+        tv.tv_sec = config.read_timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    #endif
+    
+    // Initialize SSL if needed
+    if (use_ssl) {
+        if (!init_ssl()) {
+            disconnect_tcp();
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+bool StratumClient::init_ssl() {
+    if (!use_ssl) return true;
+    
+    // Create SSL context
+    const SSL_METHOD* method = TLS_client_method();
+    ssl_ctx = SSL_CTX_new(method);
+    if (!ssl_ctx) {
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to create SSL context";
+        return false;
+    }
+    
+    // Set options
+    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+    SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+    
+    // Create SSL object
+    ssl = SSL_new(ssl_ctx);
+    if (!ssl) {
+        cleanup_ssl();
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to create SSL object";
+        return false;
+    }
+    
+    // Attach socket to SSL
+    if (SSL_set_fd(ssl, sock) != 1) {
+        cleanup_ssl();
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = "Failed to set SSL file descriptor";
+        return false;
+    }
+    
+    // Set SNI for virtual-hosted TLS endpoints
+    SSL_set_tlsext_host_name(ssl, config.host.c_str());
+    SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
+    
+    // Perform SSL handshake
+    int ssl_result = SSL_connect(ssl);
+    if (ssl_result != 1) {
+        int ssl_error = SSL_get_error(ssl, ssl_result);
+        std::string error_msg = "SSL handshake failed: ";
+        char error_buf[256];
+        ERR_error_string_n(ERR_get_error(), error_buf, sizeof(error_buf));
+        error_msg += error_buf;
+        
+        cleanup_ssl();
+        last_error = StratumError::ConnectionFailed;
+        last_error_message = error_msg;
+        return false;
+    }
+    
+    std::cout << "[Pool] " << Color::GREEN << "SSL/TLS connection established" << Color::RESET << std::endl;
+    return true;
+}
+
+void StratumClient::cleanup_ssl() {
+    if (ssl) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        ssl = nullptr;
+    }
+    if (ssl_ctx) {
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = nullptr;
+    }
+}
+
+void StratumClient::disconnect_tcp() {
+    if (use_ssl && ssl) {
+        SSL_shutdown(ssl);
+    }
+    
+    if (sock != INVALID_SOCKET_VALUE) {
+        #ifdef _WIN32
+            shutdown(sock, SD_BOTH);
+        #else
+            shutdown(sock, SHUT_RDWR);
+        #endif
+        close(sock);
+        sock = INVALID_SOCKET_VALUE;
+    }
+}
+
+bool StratumClient::send_line(const std::string& line) {
+    if (sock == INVALID_SOCKET_VALUE) {
+        return false;
+    }
+    
+    std::string msg = line;
+    if (msg.empty() || msg.back() != '\n') {
+        msg += '\n';
+    }
+    
+    size_t total_sent = 0;
+    while (total_sent < msg.length()) {
+        ssize_t sent;
+        if (use_ssl && ssl) {
+            sent = SSL_write(ssl, msg.c_str() + total_sent, msg.length() - total_sent);
+            if (sent <= 0) {
+                int ssl_error = SSL_get_error(ssl, sent);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    continue;  // Retry
+                }
+                last_error = StratumError::ConnectionLost;
+                last_error_message = "SSL write failed";
+                return false;
+            }
+        } else {
+            sent = send(sock, msg.c_str() + total_sent, msg.length() - total_sent, 0);
+            if (sent <= 0) {
+                last_error = StratumError::ConnectionLost;
+                last_error_message = "Failed to send data";
+                return false;
+            }
+        }
+        total_sent += sent;
+    }
+    
+    return true;
+}
+
+bool StratumClient::send_json(const json& message) {
+    return send_line(message.dump());
+}
+
+std::string StratumClient::read_line(int timeout_ms) {
+    if (sock == INVALID_SOCKET_VALUE) {
+        std::cerr << "[Pool] read_line: invalid socket" << std::endl;
+        return "";
+    }
+    
+    // Set timeout on the underlying socket (for non-SSL recv)
+    #ifdef _WIN32
+        DWORD timeout = timeout_ms;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    #else
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    #endif
+    
+    std::string line;
+    char c;
+    int bytes_received = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    
+    while (true) {
+        // Check timeout
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        if (elapsed > timeout_ms) {
+            std::cerr << "[Pool] read_line: timeout after " << elapsed << "ms, received " << bytes_received << " bytes" << std::endl;
+            break;
+        }
+        
+        ssize_t received;
+        if (use_ssl && ssl) {
+            // For SSL, we need to handle non-blocking differently
+            received = SSL_read(ssl, &c, 1);
+            if (received <= 0) {
+                int ssl_error = SSL_get_error(ssl, received);
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    // Would block, sleep briefly and retry
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                    // Connection closed cleanly
+                    std::cerr << "[Pool] read_line: SSL connection closed" << std::endl;
+                    connected = false;
+                    break;
+                }
+                // Other SSL error
+                char err_buf[256];
+                ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+                std::cerr << "[Pool] read_line: SSL error " << ssl_error << ": " << err_buf << std::endl;
+                break;
+            }
+        } else {
+            received = recv(sock, &c, 1, 0);
+            if (received <= 0) {
+                if (received == 0) {
+                    // Connection closed by peer
+                    std::cerr << "[Pool] read_line: connection closed by peer" << std::endl;
+                    connected = false;
+                }
+                #ifndef _WIN32
+                else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Timeout - return what we have
+                    break;
+                }
+                #endif
+                break;
+            }
+        }
+        
+        bytes_received++;
+        
+        if (c == '\n') {
+            break;
+        }
+        
+        if (c != '\r') {
+            line += c;
+        }
+    }
+    
+    return line;
+}
+
+bool StratumClient::connect() {
+    if (connected.load()) {
+        return true;
+    }
+    
+    std::cout << "[Pool] Connecting to " << config.host << ":" << config.port << "..." << std::endl;
+    
+    if (!connect_tcp()) {
+        std::cout << "[Pool] " << Color::RED << "Connection failed: " << last_error_message << Color::RESET << std::endl;
+        return false;
+    }
+    
+    connected = true;
+    std::cout << "[Pool] " << Color::GREEN << "TCP connection established" << Color::RESET << std::endl;
+    
+    // Perform login
+    if (!do_login()) {
+        std::cout << "[Pool] " << Color::RED << "Login failed: " << last_error_message << Color::RESET << std::endl;
+        disconnect();
+        return false;
+    }
+    
+    std::cout << "[Pool] " << Color::GREEN << "Successfully logged in as worker " << worker_id << Color::RESET << std::endl;
+    
+    // Start receive thread
+    running = true;
+    receive_thread = std::thread(&StratumClient::receive_loop, this);
+    
+    // Start keepalive thread
+    keepalive_thread = std::thread(&StratumClient::keepalive_loop, this);
+    
+    return true;
+}
+
+void StratumClient::disconnect() {
+    running = false;
+    connected = false;
+    logged_in = false;
+    
+    disconnect_tcp();
+    
+    // Wake up any waiting threads
+    job_cv.notify_all();
+    
+    if (receive_thread.joinable()) {
+        receive_thread.join();
+    }
+    
+    if (keepalive_thread.joinable()) {
+        keepalive_thread.join();
+    }
+    
+    // Clear job queue
+    {
+        std::lock_guard<std::mutex> lock(job_mutex);
+        while (!job_queue.empty()) {
+            job_queue.pop();
+        }
+    }
+    
+    // Clear pending requests
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        pending_requests.clear();
+    }
+    
+    worker_id = 0;
+}
+
+bool StratumClient::is_connected() const {
+    return connected.load() && logged_in.load();
+}
+
+bool StratumClient::do_login() {
+    // Build login request matching pool protocol:
+    // JsonRequest { id: Option<u64>, request: Request::Login { name, address, password, agent } }
+    // Serializes to: { "id": N, "method": "login", "params": { "name": "...", "address": "...", "password": "...", "agent": "..." } }
+    // Note: No "jsonrpc" field - this is NOT standard JSON-RPC 2.0
+    
+    json params;
+    params["name"] = config.name;
+    params["address"] = config.address;
+    if (!config.password.empty()) {
+        params["password"] = config.password;
+    }
+    params["agent"] = config.agent;
+    
+    json request;
+    request["id"] = request_id_counter++;
+    request["method"] = "login";
+    request["params"] = params;
+    
+    std::string request_str = request.dump();
+    std::cout << "[Pool] Sending login: " << request_str << std::endl;
+    
+    if (!send_json(request)) {
+        last_error = StratumError::AuthenticationFailed;
+        last_error_message = "Failed to send login request";
+        return false;
+    }
+    
+    // Wait for response with longer timeout (60 seconds)
+    std::string line = read_line(60000);
+    if (line.empty()) {
+        last_error = StratumError::Timeout;
+        last_error_message = "Timeout waiting for login response";
+        return false;
+    }
+    
+    std::cout << "[Pool] Received: " << (line.length() > 500 ? line.substr(0, 500) + "..." : line) << std::endl;
+    
+    try {
+        json response = json::parse(line);
+        
+        // Check for JSON-RPC error
+        if (response.contains("error") && !response["error"].is_null()) {
+            last_error = StratumError::AuthenticationFailed;
+            auto& err = response["error"];
+            if (err.is_object() && err.contains("message")) {
+                last_error_message = err["message"].get<std::string>();
+            } else if (err.is_string()) {
+                last_error_message = err.get<std::string>();
+            } else {
+                last_error_message = response.dump();
+            }
+            return false;
+        }
+        
+        // Parse login response: { "id": N, "jsonrpc": "2.0", "result": { "id": worker_id, "job": {...} } }
+        if (response.contains("result")) {
+            json result = response["result"];
+            
+            // Handle case where result might be nested or direct
+            if (result.is_object()) {
+                // Get worker ID
+                if (result.contains("id") && result["id"].is_number()) {
+                    worker_id = result["id"].get<size_t>();
+                } else {
+                    // Some pools might not return worker id, use 0
+                    worker_id = 0;
+                }
+                
+                logged_in = true;
+                std::cout << "[Pool] Logged in as: " << config.name << " (address: " << config.address.substr(0, 20) << "...)" << std::endl;
+                std::cout << "[Pool] Worker ID: " << worker_id << std::endl;
+                
+                // Check for initial job in login response
+                if (result.contains("job") && !result["job"].is_null()) {
+                    StratumJob job = parse_job_notification(result["job"]);
+                    if (job.is_valid()) {
+                        std::lock_guard<std::mutex> lock(current_job_mutex);
+                        current_job = job;
+                        
+                        {
+                            std::lock_guard<std::mutex> job_lock(job_mutex);
+                            job_queue.push(job);
+                        }
+                        job_cv.notify_one();
+                        
+                        std::cout << "[Pool] Received initial job: " << job.job_id.substr(0, 16) << "..." << std::endl;
+                    }
+                }
+                
+                return true;
+            }
+        }
+        
+        last_error = StratumError::InvalidResponse;
+        last_error_message = "Invalid login response: " + response.dump().substr(0, 200);
+        return false;
+        
+    } catch (const std::exception& e) {
+        last_error = StratumError::InvalidResponse;
+        last_error_message = std::string("Failed to parse response: ") + e.what() + " - Raw: " + line.substr(0, 200);
+        return false;
+    }
+}
+
+bool StratumClient::send_keepalive() {
+    // Build keepalive request matching pool protocol:
+    // Request::Keepalived {} -> { "method": "keepalived", "params": {} }
+    // Note: keepalived is a notification, no id needed
+    json request;
+    request["method"] = "keepalived";
+    request["params"] = json::object();
+    
+    return send_json(request);
+}
+
+void StratumClient::keepalive_loop() {
+    while (running.load() && connected.load()) {
+        // Sleep for keepalive interval
+        for (int i = 0; i < config.keepalive_interval_sec && running.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        if (!running.load() || !connected.load()) {
+            break;
+        }
+        
+        if (!send_keepalive()) {
+            std::cerr << "[Pool] Failed to send keepalive" << std::endl;
+        }
+    }
+}
+
+void StratumClient::receive_loop() {
+    while (running.load() && connected.load()) {
+        std::string line = read_line(5000);  // 5 second timeout for polling
+        
+        if (line.empty()) {
+            if (!running.load()) break;
+            continue;
+        }
+        
+        try {
+            json message = json::parse(line);
+            handle_message(message);
+        } catch (const std::exception& e) {
+            std::cerr << "[Pool] Failed to parse message: " << e.what() << std::endl;
+        }
+    }
+}
+
+void StratumClient::handle_message(const json& message) {
+    // Check if this is a notification (no id) or a response (has id)
+    if (!message.contains("id") || message["id"].is_null()) {
+        // Notification from pool (job, pause, etc.)
+        if (message.contains("method")) {
+            std::string method = message["method"].get<std::string>();
+            json params = message.value("params", json::object());
+            handle_notification(method, params);
+        }
+    } else {
+        // Response to a request
+        uint64_t id = message["id"].get<uint64_t>();
+        json result = message.value("result", json());
+        json error = message.value("error", json());
+        handle_response(id, result, error);
+    }
+}
+
+void StratumClient::handle_notification(const std::string& method, const json& params) {
+    // Pool schema notifications: job, pause
+    if (method == "job") {
+        // Job notification: { "method": "job", "params": { "id": "...", "paths": {...}, "difficulty": "..." } }
+        StratumJob job = parse_job_notification(params);
+        if (job.is_valid()) {
+            // Update current job
+            {
+                std::lock_guard<std::mutex> lock(current_job_mutex);
+                current_job = job;
+            }
+            
+            // Add to queue (new jobs always replace old ones)
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                // Clear old jobs on new job
+                while (!job_queue.empty()) {
+                    job_queue.pop();
+                }
+                job_queue.push(job);
+            }
+            job_cv.notify_one();
+            
+            std::string short_id = job.job_id.length() > 20 
+                ? job.job_id.substr(0, 12) + "..." + job.job_id.substr(job.job_id.length() - 8)
+                : job.job_id;
+            std::cout << "[Pool] " << Color::CYAN << Color::BOLD 
+                      << "New job received" << Color::RESET 
+                      << " | Job ID: " << short_id 
+                      << " | Difficulty: " << job.difficulty << std::endl;
+        }
+    } else if (method == "pause") {
+        // Pause notification: stop mining temporarily
+        std::cout << "[Pool] " << Color::YELLOW << "Mining paused by pool" << Color::RESET << std::endl;
+        // Clear job queue to stop mining
+        {
+            std::lock_guard<std::mutex> lock(job_mutex);
+            while (!job_queue.empty()) {
+                job_queue.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(current_job_mutex);
+            current_job = StratumJob();  // Invalidate current job
+        }
+    } else {
+        std::cout << "[Pool] Unknown notification: " << method << std::endl;
+    }
+}
+
+void StratumClient::handle_response(uint64_t id, const json& result, const json& error) {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    auto it = pending_requests.find(id);
+    if (it != pending_requests.end()) {
+        json response;
+        response["result"] = result;
+        response["error"] = error;
+        it->second.set_value(response);
+        pending_requests.erase(it);
+    }
+}
+
+StratumJob StratumClient::parse_job_notification(const json& params) {
+    StratumJob job;
+    
+    // Pool protocol Job format:
+    // {
+    //   "id": "digest_hex_string",
+    //   "paths": {
+    //     "pow": { "kernel_body": [...], "type_scripts": [...], "kernel": [...] },
+    //     "header": { "body": [...], "appendix": [...] },
+    //     "kernel": [...]
+    //   },
+    //   "difficulty": "string"
+    // }
+    
+    try {
+        if (!params.is_object()) {
+            std::cerr << "[Pool] Job params is not an object" << std::endl;
+            return job;
+        }
+        
+        // Job ID (digest as hex string)
+        if (params.contains("id")) {
+            if (params["id"].is_string()) {
+                job.job_id = params["id"].get<std::string>();
+            } else if (params["id"].is_array()) {
+                // Handle Digest as array of u64 values - convert to hex
+                std::stringstream ss;
+                for (const auto& val : params["id"]) {
+                    if (val.is_number()) {
+                        ss << std::hex << std::setfill('0') << std::setw(16) << val.get<uint64_t>();
+                    }
+                }
+                job.job_id = ss.str();
+            }
+        }
+        
+        // Difficulty (pool difficulty - easier than RPC threshold for share validation)
+        if (params.contains("difficulty") && params["difficulty"].is_string()) {
+            job.difficulty = params["difficulty"].get<std::string>();
+        }
+        
+        // PowMastPaths structure
+        if (params.contains("paths") && params["paths"].is_object()) {
+            const auto& paths = params["paths"];
+            
+            // Parse pow paths: { "kernel_body": [...], "type_scripts": [...], "kernel": [...] }
+            if (paths.contains("pow") && paths["pow"].is_object()) {
+                const auto& pow = paths["pow"];
+                
+                if (pow.contains("kernel_body") && pow["kernel_body"].is_array()) {
+                    for (const auto& item : pow["kernel_body"]) {
+                        if (item.is_string()) {
+                            job.paths.pow_kernel_body.push_back(item.get<std::string>());
+                        }
+                    }
+                }
+                if (pow.contains("type_scripts") && pow["type_scripts"].is_array()) {
+                    for (const auto& item : pow["type_scripts"]) {
+                        if (item.is_string()) {
+                            job.paths.pow_type_scripts.push_back(item.get<std::string>());
+                        }
+                    }
+                }
+                if (pow.contains("kernel") && pow["kernel"].is_array()) {
+                    for (const auto& item : pow["kernel"]) {
+                        if (item.is_string()) {
+                            job.paths.pow_kernel.push_back(item.get<std::string>());
+                        }
+                    }
+                }
+            }
+            
+            // Parse header paths: { "body": [...], "appendix": [...] }
+            if (paths.contains("header") && paths["header"].is_object()) {
+                const auto& header = paths["header"];
+                
+                if (header.contains("body") && header["body"].is_array()) {
+                    for (const auto& item : header["body"]) {
+                        if (item.is_string()) {
+                            job.paths.header_body.push_back(item.get<std::string>());
+                        }
+                    }
+                }
+                if (header.contains("appendix") && header["appendix"].is_array()) {
+                    for (const auto& item : header["appendix"]) {
+                        if (item.is_string()) {
+                            job.paths.header_appendix.push_back(item.get<std::string>());
+                        }
+                    }
+                }
+            }
+            
+            // Parse kernel paths (direct array)
+            if (paths.contains("kernel") && paths["kernel"].is_array()) {
+                for (const auto& item : paths["kernel"]) {
+                    if (item.is_string()) {
+                        job.paths.kernel.push_back(item.get<std::string>());
+                    }
+                }
+            }
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[Pool] Failed to parse job notification: " << e.what() << std::endl;
+        return StratumJob();
+    }
+    
+    return job;
+}
+
+json StratumClient::getBlockTemplate() {
+    // Return the current job as a JSON template compatible with mining code
+    std::lock_guard<std::mutex> lock(current_job_mutex);
+    
+    if (!current_job.is_valid()) {
+        return json();
+    }
+    
+    // Build a template response that matches the expected format
+    json template_obj;
+    json metadata;
+    
+            metadata["digest"] = current_job.job_id;
+            metadata["threshold"] = current_job.difficulty;  // Pool difficulty (for share validation)
+            // Note: No total_guesser_reward in pool mode
+            
+            // Build pow_mast_paths from pool paths structure
+    json pow_mast_paths;
+    
+    // Combine pow paths into single array for legacy format
+    json pow_paths = json::array();
+    for (const auto& p : current_job.paths.pow_kernel_body) pow_paths.push_back(p);
+    for (const auto& p : current_job.paths.pow_type_scripts) pow_paths.push_back(p);
+    for (const auto& p : current_job.paths.pow_kernel) pow_paths.push_back(p);
+    pow_mast_paths["pow"] = pow_paths;
+    
+    // Combine header paths
+    json header_paths = json::array();
+    for (const auto& p : current_job.paths.header_body) header_paths.push_back(p);
+    for (const auto& p : current_job.paths.header_appendix) header_paths.push_back(p);
+    pow_mast_paths["header"] = header_paths;
+    
+    // Kernel paths
+    pow_mast_paths["kernel"] = current_job.paths.kernel;
+    
+    metadata["pow_mast_paths"] = pow_mast_paths;
+    
+    template_obj["metadata"] = metadata;
+    template_obj["block"] = json::object();
+    
+    json result;
+    result["template"] = template_obj;
+    
+    json response;
+    response["result"] = result;
+    
+    return response;
+}
+
+json StratumClient::getBlockTemplate(const std::string& wallet_address) {
+    (void)wallet_address;  // Stratum uses address from login, ignore parameter
+    return getBlockTemplate();
+}
+
+bool StratumClient::wait_for_job(json& job, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(job_mutex);
+    
+    if (job_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {
+        return !job_queue.empty() || !running.load();
+    })) {
+        if (!job_queue.empty()) {
+            StratumJob stratum_job = job_queue.front();
+            job_queue.pop();
+            
+            // Convert to JSON format compatible with mining controller
+            PowPuzzle puzzle = stratum_job.to_pow_puzzle();
+            
+            // Build response matching expected format
+            json template_obj;
+            json metadata;
+            
+            metadata["digest"] = puzzle.id;
+            metadata["threshold"] = puzzle.threshold;  // Pool difficulty (for share validation)
+            // Note: No total_guesser_reward in pool mode
+            
+            json pow_mast_paths;
+            pow_mast_paths["pow"] = puzzle.auth_paths.pow;
+            pow_mast_paths["header"] = puzzle.auth_paths.header;
+            pow_mast_paths["kernel"] = puzzle.auth_paths.kernel;
+            metadata["pow_mast_paths"] = pow_mast_paths;
+            
+            template_obj["metadata"] = metadata;
+            template_obj["block"] = json::object();
+            
+            json result;
+            result["template"] = template_obj;
+            
+            job["result"] = result;
+            
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+bool StratumClient::submit_solution(
+    const std::string& proposal_id,
+    const Pow& pow_solution,
+    const Digest& solution_hash,
+    const json& template_obj) {
+    
+    (void)template_obj;  // Not used in pool submission
+    (void)solution_hash; // Not needed in pool schema
+    
+    if (!is_connected()) {
+        std::cout << "[Pool] " << Color::RED << "Cannot submit - not connected" << Color::RESET << std::endl;
+        return false;
+    }
+    
+    shares_submitted++;
+    
+    // Build submit request matching pool schema:
+    // { "id": N, "method": "submit", "params": { "worker": worker_id, "id": job_id, "pow": BlockPow } }
+    //
+    // BlockPow structure (from neptune-cash):
+    // {
+    //   "nonce": [u64; 5],           // Digest as array
+    //   "root": [u64; 5],            // Digest as array  
+    //   "authentication_path_a": [[u64; 5]; 25],  // Array of Digests
+    //   "authentication_path_b": [[u64; 5]; 25]   // Array of Digests
+    // }
+    
+    // Build BlockPow object
+    json pow_obj;
+    
+    // Nonce as array of 5 u64 values
+    json nonce_arr = json::array();
+    for (int i = 0; i < 5; ++i) {
+        nonce_arr.push_back(pow_solution.nonce.values[i]);
+    }
+    pow_obj["nonce"] = nonce_arr;
+    
+    // Root as array of 5 u64 values
+    json root_arr = json::array();
+    for (int i = 0; i < 5; ++i) {
+        root_arr.push_back(pow_solution.root.values[i]);
+    }
+    pow_obj["root"] = root_arr;
+    
+    // Path A - array of MERKLE_TREE_HEIGHT_ digests
+    // Match BlockPow serialization (authentication_path_a / authentication_path_b)
+    json path_a = json::array();
+    for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        json digest_arr = json::array();
+        for (int j = 0; j < 5; ++j) {
+            digest_arr.push_back(pow_solution.path_a[i].values[j]);
+        }
+        path_a.push_back(digest_arr);
+    }
+    pow_obj["authentication_path_a"] = path_a;
+    
+    // Path B - array of MERKLE_TREE_HEIGHT_ digests
+    json path_b = json::array();
+    for (size_t i = 0; i < MERKLE_TREE_HEIGHT_; ++i) {
+        json digest_arr = json::array();
+        for (int j = 0; j < 5; ++j) {
+            digest_arr.push_back(pow_solution.path_b[i].values[j]);
+        }
+        path_b.push_back(digest_arr);
+    }
+    pow_obj["authentication_path_b"] = path_b;
+    
+    // Build params object
+    json params;
+    params["worker"] = worker_id;
+    params["id"] = proposal_id;
+    params["pow"] = pow_obj;
+    
+    json request;
+    uint64_t req_id = request_id_counter++;
+    request["id"] = req_id;
+    request["method"] = "submit";
+    request["params"] = params;
+    
+    // Create promise for response
+    std::promise<json> response_promise;
+    std::future<json> response_future = response_promise.get_future();
+    
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        pending_requests[req_id] = std::move(response_promise);
+    }
+    
+    if (!send_json(request)) {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        pending_requests.erase(req_id);
+        std::cout << "[Pool] " << Color::RED << "Failed to send submit request" << Color::RESET << std::endl;
+        shares_rejected++;
+        return false;
+    }
+    
+    // Wait for response with timeout
+    if (response_future.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        pending_requests.erase(req_id);
+        std::cout << "[Pool] " << Color::RED << "Timeout waiting for submit response" << Color::RESET << std::endl;
+        shares_rejected++;
+        return false;
+    }
+    
+    json response = response_future.get();
+    
+    // Check for JSON-RPC error
+    if (response.contains("error") && !response["error"].is_null()) {
+        shares_rejected++;
+        std::string error_msg = "Unknown error";
+        auto& err = response["error"];
+        if (err.is_object() && err.contains("message")) {
+            error_msg = err["message"].get<std::string>();
+        } else if (err.is_string()) {
+            error_msg = err.get<std::string>();
+        }
+        std::cout << "[Pool] " << Color::RED << "Share rejected: " << error_msg << Color::RESET << std::endl;
+        return false;
+    }
+    
+    // Pool schema submit response: { "result": { "success": true } }
+    if (response.contains("result") && response["result"].is_object()) {
+        auto& result = response["result"];
+        if (result.contains("success") && result["success"].is_boolean() && result["success"].get<bool>()) {
+            shares_accepted++;
+            std::cout << "[Pool] " << Color::GREEN << Color::BOLD 
+                      << "Share accepted!" << Color::RESET 
+                      << " (" << shares_accepted.load() << "/" << shares_submitted.load() << ")" << std::endl;
+            return true;
+        }
+    }
+    
+    shares_rejected++;
+    std::cout << "[Pool] " << Color::RED << "Share rejected (unknown reason)" << Color::RESET << std::endl;
+    return false;
+}
+
+// --- network.cu ---
+#include "network.cuh"
+#include "rpc_client.cuh"
+#include "stratum_client.cuh"
+#include "pow.cuh"
+#include "digest.cuh"
+#include "common.cuh"
+
+NeptuneCudaMinerClient::NeptuneCudaMinerClient(
+    const std::string& rpc_url,
+    const std::string& wallet_addr)
+    : rpc_url(rpc_url)
+    , has_last_template(false)
+    , wallet_address(wallet_addr) {
+    RpcConfig config;
+    config.url = rpc_url;
+    config.timeout_sec = 30;
+    config.poll_interval_sec = g_fetch_interval_sec;
+    rpc_client = std::make_unique<XntRpcClient>(config);
+}
+
+NeptuneCudaMinerClient::~NeptuneCudaMinerClient() {
+}
+
+bool NeptuneCudaMinerClient::connect_to_node() {
+    if (!rpc_client) {
+        return false;
+    }
+    return rpc_client->testConnection();
+}
+
+bool NeptuneCudaMinerClient::is_connected() const {
+    if (!rpc_client) {
+        return false;
+    }
+    
+    return rpc_client->testConnection();
+}
+
+json NeptuneCudaMinerClient::getBlockTemplate() {
+    if (!rpc_client || wallet_address.empty()) {
+        return json();
+    }
+    
+    return rpc_client->getBlockTemplate(wallet_address);
+}
+
+bool NeptuneCudaMinerClient::submit_solution(
+    const std::string& proposal_id,
+    const Pow& pow_solution,
+    const Digest& solution_hash,
+    const json& template_obj) {
+    
+    if (!rpc_client) {
+        return false;
+    }
+    
+    if (template_obj.is_null() || template_obj.empty()) {
+        std::cout << "[SUBMIT] ERROR: No template provided for proposal " << proposal_id << std::endl;
+        return false;
+    }
+    std::string tip_digest = rpc_client->getTipDigest();
+    
+    // Check if template is stale
+    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+        json metadata = template_obj["metadata"];
+        std::string prev_block;
+        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+            prev_block = metadata.value("prevBlock", "");
+        } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+            prev_block = metadata.value("prev_block", "");
+        }
+
+        if (!prev_block.empty() && tip_digest != prev_block) {
+            std::string short_prev = prev_block.length() > 20 ? prev_block.substr(0, 12) + "..." + prev_block.substr(prev_block.length() - 8) : prev_block;
+            std::string short_tip = tip_digest.length() > 20 ? tip_digest.substr(0, 12) + "..." + tip_digest.substr(tip_digest.length() - 8) : tip_digest;
+            std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: Template stale (prev_block=" << short_prev << " != tip=" << short_tip << ")" << Color::RESET << std::endl;
+            return false;
+        }
+    }
+    
+    // Extract the block from template (RpcBlockTemplate has "block" and "metadata" fields)
+    // SubmitBlockRequest expects: { template: RpcBlock, pow: RpcBlockPow }
+    if (!template_obj.contains("block") || template_obj["block"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Template missing 'block' field" << std::endl;
+        return false;
+    }
+    
+    json block_obj = template_obj["block"];
+    
+    // Ensure block has kernel.appendix with required structure
+    // RpcBlockAppendix is serialized as an array of RpcClaim objects
+    if (!block_obj.contains("kernel") || block_obj["kernel"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Block missing 'kernel' field" << std::endl;
+        return false;
+    }
+    
+    json kernel_obj = block_obj["kernel"];
+    
+    // Debug: Log the kernel structure
+    bool has_appendix = kernel_obj.contains("appendix") && !kernel_obj["appendix"].is_null();
+    if (has_appendix && kernel_obj["appendix"].is_array()) {
+        LOG_DEBUG("[SUBMIT] kernel.appendix has " << kernel_obj["appendix"].size() << " claims");
+    } else {
+        std::cout << "[SUBMIT] " << Color::YELLOW << "WARNING: Block kernel missing valid 'appendix' - template may be incomplete" << Color::RESET << std::endl;
+        // Don't override with empty array - the node requires the proper appendix claims
+    }
+    
+    json pow_json = powToRpcFormat(pow_solution, solution_hash);
+    
+    json response = rpc_client->submitBlock(block_obj, pow_json);
+    
+    if (!response.empty() && response.contains("result")) {
+        if (response["result"].is_boolean()) {
+            bool success = response["result"].get<bool>();
+            if (!success) {
+                std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: Block rejected" << Color::RESET << std::endl;
+            }
+            return success;
+        }
+        if (response["result"].contains("success")) {
+            bool success = response["result"]["success"].get<bool>();
+            if (!success) {
+                std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: Block rejected" << Color::RESET << std::endl;
+            }
+            return success;
+        }
+        return true;
+    }
+    
+    if (response.contains("error") && !response["error"].is_null()) {
+        json error = response["error"];
+        std::string error_reason = "Unknown error";
+        
+        // Extract exact error reason from error data
+        if (error.contains("data") && !error["data"].is_null()) {
+            json error_data = error["data"];
+            if (error_data.is_object() && !error_data.empty()) {
+                // Get the first value from the error data object
+                auto it = error_data.begin();
+                if (it != error_data.end() && it.value().is_string()) {
+                    error_reason = it.value().get<std::string>();
+                } else if (it != error_data.end()) {
+                    error_reason = it.value().dump();
+                }
+            } else if (error_data.is_string()) {
+                error_reason = error_data.get<std::string>();
+            }
+        } else if (error.contains("message") && !error["message"].is_null()) {
+            error_reason = error.value("message", "Unknown error");
+        }
+        
+        std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: " << error_reason << Color::RESET << std::endl;
+    } else {
+        std::cout << "[SUBMIT] " << Color::RED << "✗ REJECTED: No response from server" << Color::RESET << std::endl;
+    }
+    
+    return false;
+}
+
+void NeptuneCudaMinerClient::cache_puzzle(const json& template_obj) {
+    last_template = template_obj;
+    has_last_template = true;
+}
+
+PowPuzzle parsePowPuzzle(const std::string& jsonStr) {
+    try {
+        json j = json::parse(jsonStr);
+        if (j.contains("result") && j["result"].contains("template")) {
+            return parseRpcTemplate(j);
+        }
+        return parseRpcTemplate(j);
+    } catch (const std::exception& e) {
+        LOG_DEBUG("Failed to parse puzzle JSON: " << e.what());
+        return PowPuzzle();
+    }
+}
+
+// ===== UnifiedMinerClient Implementation =====
+
+UnifiedMinerClient::UnifiedMinerClient(
+    const std::string& endpoint,
+    const std::string& wallet_addr,
+    const std::string& stratum_pass)
+    : endpoint(endpoint)
+    , wallet_address(wallet_addr)
+    , stratum_password(stratum_pass) {
+    mode = detect_mining_mode(endpoint);
+}
+
+bool UnifiedMinerClient::initialize() {
+    if (client) {
+        return true;  // Already initialized
+    }
+    
+    if (mode == MiningMode::Stratum) {
+        // Create stratum client
+        std::string host;
+        int port;
+        bool use_ssl = false;
+        if (!parse_stratum_url(endpoint, host, port, use_ssl)) {
+            std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
+            return false;
+        }
+        
+        StratumConfig config;
+        config.host = host;
+        config.port = port;
+        config.use_ssl = use_ssl;
+        config.address = wallet_address;
+        config.name = g_miner_worker_name.empty() ? "xnt-miner" : g_miner_worker_name;
+        config.password = stratum_password;
+        
+        client = std::make_unique<StratumClient>(config);
+        
+        std::cout << "Initialized stratum client for " << host << ":" << port << std::endl;
+    } else {
+        // Create solo (HTTP RPC) client
+        client = std::make_unique<NeptuneCudaMinerClient>(endpoint, wallet_address);
+        std::cout << "Initialized solo mining client for " << endpoint << std::endl;
+    }
+    
+    return client != nullptr;
+}
+
+
+
+// --- connection_multiplexer.cu ---
+#include "connection_multiplexer.cuh"
+#include "rpc_client.cuh"
+#include "stratum_client.cuh"
+#include "network.cuh"
+#include "mining.cuh"
+#include "pow.cuh"
+#include "digest.cuh"
+#include "common.cuh"
+#include <algorithm>
+
+// ============================================================================
+// Singleton Instance
+// ============================================================================
+
+std::unique_ptr<ConnectionMultiplexer> ConnectionMultiplexer::instance = nullptr;
+std::mutex ConnectionMultiplexer::instance_mutex;
+
+ConnectionMultiplexer& ConnectionMultiplexer::getInstance() {
+    std::lock_guard<std::mutex> lock(instance_mutex);
+    if (!instance) {
+        instance = std::unique_ptr<ConnectionMultiplexer>(new ConnectionMultiplexer());
+    }
+    return *instance;
+}
+
+void ConnectionMultiplexer::destroyInstance() {
+    std::lock_guard<std::mutex> lock(instance_mutex);
+    if (instance) {
+        instance->shutdown();
+        instance.reset();
+    }
+}
+
+// ============================================================================
+// SoloMiningClient Implementation
+// ============================================================================
+
+SoloMiningClient::SoloMiningClient(const std::string& url)
+    : rpc_url(url) {
+    RpcConfig config;
+    config.url = url;
+    config.timeout_sec = 30;
+    config.poll_interval_sec = g_fetch_interval_sec;
+    rpc_client = std::make_unique<XntRpcClient>(config);
+}
+
+SoloMiningClient::~SoloMiningClient() {
+    disconnect();
+}
+
+bool SoloMiningClient::connect() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    if (!rpc_client) {
+        return false;
+    }
+    bool result = rpc_client->testConnection();
+    connected.store(result);
+    return result;
+}
+
+void SoloMiningClient::disconnect() {
+    connected.store(false);
+}
+
+bool SoloMiningClient::is_connected() const {
+    return connected.load();
+}
+
+// reconnect() is now implemented inline in the header
+
+json SoloMiningClient::getBlockTemplate() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    if (!rpc_client) {
+        return json();
+    }
+    return rpc_client->getBlockTemplate("");
+}
+
+json SoloMiningClient::getBlockTemplate(const std::string& wallet_address) {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    if (!rpc_client || wallet_address.empty()) {
+        return json();
+    }
+    return rpc_client->getBlockTemplate(wallet_address);
+}
+
+bool SoloMiningClient::submitSolution(
+    const std::string& proposal_id,
+    const Pow& pow_solution,
+    const Digest& solution_hash,
+    const json& template_obj) {
+    
+    std::lock_guard<std::mutex> lock(client_mutex);
+    
+    if (!rpc_client) {
+        return false;
+    }
+    
+    if (template_obj.is_null() || template_obj.empty()) {
+        std::cout << "[SUBMIT] ERROR: No template provided for proposal " << proposal_id << std::endl;
+        return false;
+    }
+    
+    // Check if template is stale by comparing prev_block with current tip
+    std::string tip_digest = rpc_client->getTipDigest();
+    
+    std::string prev_block;
+    if (template_obj.contains("metadata") && !template_obj["metadata"].is_null()) {
+        json metadata = template_obj["metadata"];
+        if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+            prev_block = metadata.value("prevBlock", "");
+        } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+            prev_block = metadata.value("prev_block", "");
+        }
+    }
+
+    if (!prev_block.empty() && tip_digest != prev_block) {
+        std::cout << "[SUBMIT] " << Color::RED << "STALE: Template stale (new block arrived)" << Color::RESET << std::endl;
+        return false;
+    }
+    
+    // Extract the block from template
+    if (!template_obj.contains("block") || template_obj["block"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Template missing 'block' field" << std::endl;
+        return false;
+    }
+    
+    json block_obj = template_obj["block"];
+    
+    if (!block_obj.contains("kernel") || block_obj["kernel"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Block missing 'kernel' field" << std::endl;
+        return false;
+    }
+
+    json kernel_obj = block_obj["kernel"];
+    if (!kernel_obj.contains("appendix") || kernel_obj["appendix"].is_null()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel missing 'appendix' field" << std::endl;
+        return false;
+    }
+    if (!kernel_obj["appendix"].is_array()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel 'appendix' is not an array" << std::endl;
+        return false;
+    }
+    if (kernel_obj["appendix"].empty()) {
+        std::cout << "[SUBMIT] ERROR: Block kernel 'appendix' is empty" << std::endl;
+        return false;
+    }
+    
+    json pow_json = powToRpcFormat(pow_solution, solution_hash);
+    
+    json response = rpc_client->submitBlock(block_obj, pow_json);
+    
+    if (!response.empty() && response.contains("result")) {
+        if (response["result"].is_boolean()) {
+            bool success = response["result"].get<bool>();
+            if (!success) {
+                std::cout << "[SUBMIT] " << Color::RED << "REJECTED: Block rejected" << Color::RESET << std::endl;
+            }
+            return success;
+        }
+        if (response["result"].contains("success")) {
+            bool success = response["result"]["success"].get<bool>();
+            if (!success) {
+                std::cout << "[SUBMIT] " << Color::RED << "REJECTED: Block rejected" << Color::RESET << std::endl;
+            }
+            return success;
+        }
+        return true;
+    }
+    
+    if (response.contains("error") && !response["error"].is_null()) {
+        json error = response["error"];
+        std::string error_reason = "Unknown error";
+        
+        if (error.contains("data") && !error["data"].is_null()) {
+            json error_data = error["data"];
+            if (error_data.is_object() && !error_data.empty()) {
+                auto it = error_data.begin();
+                if (it != error_data.end() && it.value().is_string()) {
+                    error_reason = it.value().get<std::string>();
+                } else if (it != error_data.end()) {
+                    error_reason = it.value().dump();
+                }
+            } else if (error_data.is_string()) {
+                error_reason = error_data.get<std::string>();
+            }
+        } else if (error.contains("message") && !error["message"].is_null()) {
+            error_reason = error.value("message", "Unknown error");
+        }
+        
+        std::cout << "[SUBMIT] " << Color::RED << "REJECTED: " << error_reason << Color::RESET << std::endl;
+        
+        // Store error reason for InvalidBlock detection
+        {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            last_error_reason = error_reason;
+        }
+    } else {
+        std::cout << "[SUBMIT] " << Color::RED << "REJECTED: No response from server" << Color::RESET << std::endl;
+    }
+    
+    return false;
+}
+
+std::string SoloMiningClient::getTipDigest() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    if (!rpc_client) {
+        return "";
+    }
+    return rpc_client->getTipDigest();
+}
+
+std::string SoloMiningClient::getLastError() const {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    return last_error_reason;
+}
+
+uint64_t SoloMiningClient::getChainHeight() {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    if (!rpc_client) {
+        return 0;
+    }
+    return rpc_client->getChainHeight();
+}
+
+// ============================================================================
+// ConnectionMultiplexer Implementation
+// ============================================================================
+
+ConnectionMultiplexer::ConnectionMultiplexer() {
+    stats.last_job_time = std::chrono::steady_clock::now();
+    stats.last_submission_time = std::chrono::steady_clock::now();
+}
+
+ConnectionMultiplexer::~ConnectionMultiplexer() {
+    shutdown();
+}
+
+bool ConnectionMultiplexer::initialize(const std::string& ep, const std::string& wallet, 
+                                       const std::string& stratum_password) {
+    if (initialized.load()) {
+        return true;
+    }
+    
+    endpoint = ep;
+    wallet_address = wallet;
+    
+    // Detect mining mode from endpoint URL
+    MiningMode mode = detect_mining_mode(endpoint);
+    mining_mode = mode;
+    
+    // Create the appropriate mining client based on mode
+    if (mode == MiningMode::Stratum) {
+        std::string host;
+        int port;
+        bool use_ssl = false;
+        if (parse_stratum_url(endpoint, host, port, use_ssl)) {
+            StratumConfig config;
+            config.host = host;
+            config.port = port;
+            config.use_ssl = use_ssl;
+            config.address = wallet_address;
+            config.name = g_miner_worker_name.empty() ? "xnt-miner" : g_miner_worker_name;
+            config.password = stratum_password;
+            config.agent = "xnt-gpu-miner/1.0";
+            client = std::make_unique<StratumClient>(config);
+            std::cout << "Attempting to connect to stratum server at " << endpoint << "..." << std::endl;
+        } else {
+            std::cerr << Color::RED << "Invalid stratum URL: " << endpoint << Color::RESET << std::endl;
+            return false;
+        }
+    } else {
+        client = std::make_unique<SoloMiningClient>(endpoint);
+        std::cout << "Attempting to connect to RPC server at " << endpoint << "..." << std::endl;
+    }
+    
+    // Initial connection attempt
+    int retry_count = 0;
+    bool conn_success = false;
+    
+    while (!conn_success && !stop_mining && retry_count < 10) {
+        if (client->connect()) {
+            conn_success = true;
+            const char* server_type = (mining_mode == MiningMode::Stratum) ? "stratum server" : "RPC server";
+            std::cout << Color::GREEN << "Successfully connected to " << server_type << "!" << Color::RESET << std::endl;
+            break;
+        }
+        
+        retry_count++;
+        std::cout << "Connection attempt " << retry_count << " failed, retrying in 10 seconds..." << std::endl;
+        
+        for (int i = 0; i < 10 && !stop_mining; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+    
+    if (!conn_success) {
+        std::cout << Color::RED << "Failed to connect to RPC server after " << retry_count << " attempts" << Color::RESET << std::endl;
+        return false;
+    }
+    
+    connected.store(true);
+    running.store(true);
+    initialized.store(true);
+    
+    // Start worker threads
+    job_broadcaster_thread = std::thread(&ConnectionMultiplexer::jobBroadcasterLoop, this);
+    solution_submitter_thread = std::thread(&ConnectionMultiplexer::solutionSubmitterLoop, this);
+    health_monitor_thread = std::thread(&ConnectionMultiplexer::healthMonitorLoop, this);
+    
+    // Start tip monitor for solo mode (fast stale detection)
+    if (mining_mode == MiningMode::Solo) {
+        tip_monitor_thread = std::thread(&ConnectionMultiplexer::tipMonitorLoop, this);
+    }
+    
+    std::cout << Color::GREEN << "Connection multiplexer started" << Color::RESET << std::endl;
+    
+    return true;
+}
+
+void ConnectionMultiplexer::shutdown() {
+    if (!initialized.load()) {
+        return;
+    }
+    
+    running.store(false);
+    connected.store(false);
+    
+    // Wake up the solution submitter
+    submission_cv.notify_all();
+    
+    // Wait for threads to finish
+    if (job_broadcaster_thread.joinable()) {
+        job_broadcaster_thread.join();
+    }
+    if (solution_submitter_thread.joinable()) {
+        solution_submitter_thread.join();
+    }
+    if (health_monitor_thread.joinable()) {
+        health_monitor_thread.join();
+    }
+    if (tip_monitor_thread.joinable()) {
+        tip_monitor_thread.join();
+    }
+    
+    // Clear workers
+    {
+        std::unique_lock<std::shared_mutex> lock(workers_mutex);
+        workers.clear();
+    }
+    
+    // Clear submission queue
+    {
+        std::lock_guard<std::mutex> lock(submission_mutex);
+        while (!submission_queue.empty()) {
+            auto& submission = submission_queue.front();
+            submission->result_promise->set_value(false);
+            submission_queue.pop();
+        }
+    }
+    
+    client.reset();
+    initialized.store(false);
+    
+    std::cout << "[Multiplexer] Shutdown complete" << std::endl;
+}
+
+GpuWorkerHandle* ConnectionMultiplexer::registerWorker(int gpu_id, GpuResources* resources) {
+    std::unique_lock<std::shared_mutex> lock(workers_mutex);
+    
+    if (!resources->event_handler) {
+        resources->event_handler = std::make_unique<EventHandler>();
+    }
+    auto handle = std::make_unique<GpuWorkerHandle>(gpu_id, resources);
+    GpuWorkerHandle* ptr = handle.get();
+    workers.push_back(std::move(handle));
+    
+    std::cout << "[Multiplexer] Registered GPU " << gpu_id << " worker" << std::endl;
+    
+    return ptr;
+}
+
+void ConnectionMultiplexer::unregisterWorker(GpuWorkerHandle* handle) {
+    if (!handle) return;
+    
+    // Save GPU ID before erasing (handle will be deleted by unique_ptr)
+    int gpu_id = handle->gpu_id;
+    
+    std::unique_lock<std::shared_mutex> lock(workers_mutex);
+    
+    handle->active = false;
+    
+    workers.erase(
+        std::remove_if(workers.begin(), workers.end(),
+            [handle](const std::unique_ptr<GpuWorkerHandle>& h) {
+                return h.get() == handle;
+            }),
+        workers.end());
+    
+    std::cout << "[Multiplexer] Unregistered GPU " << gpu_id << " worker" << std::endl;
+}
+
+size_t ConnectionMultiplexer::getActiveWorkerCount() const {
+    std::shared_lock<std::shared_mutex> lock(workers_mutex);
+    size_t count = 0;
+    for (const auto& w : workers) {
+        if (w && w->active) {
+            count++;
+        }
+    }
+    return count;
+}
+
+std::future<bool> ConnectionMultiplexer::submitSolution(
+    int gpu_id,
+    const std::string& proposal_id,
+    const Pow& pow_solution,
+    const Digest& solution_hash,
+    const json& template_obj) {
+    
+    auto submission = std::make_unique<SolutionSubmission>(
+        gpu_id, proposal_id, pow_solution, solution_hash, template_obj);
+    
+    auto future = submission->result_promise->get_future();
+    
+    {
+        std::lock_guard<std::mutex> lock(submission_mutex);
+        submission_queue.push(std::move(submission));
+    }
+    submission_cv.notify_one();
+    
+    // Update worker stats
+    {
+        std::shared_lock<std::shared_mutex> lock(workers_mutex);
+        for (const auto& worker : workers) {
+            if (worker && worker->gpu_id == gpu_id) {
+                worker->submissions_queued++;
+                break;
+            }
+        }
+    }
+    
+    return future;
+}
+
+bool ConnectionMultiplexer::isConnected() const {
+    return connected.load() && client && client->is_connected();
+}
+
+bool ConnectionMultiplexer::isTemplateStale(const json& template_obj) const {
+    if (!client || !client->is_connected()) {
+        return false; // Can't check if not connected
+    }
+    
+    if (template_obj.is_null() || template_obj.empty()) {
+        return false; // Empty template, can't determine staleness
+    }
+    
+    if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+        return false; // No metadata, can't check
+    }
+    
+    json metadata = template_obj["metadata"];
+    std::string prev_block;
+    if (metadata.contains("prevBlock") && !metadata["prevBlock"].is_null()) {
+        prev_block = metadata.value("prevBlock", "");
+    } else if (metadata.contains("prev_block") && !metadata["prev_block"].is_null()) {
+        prev_block = metadata.value("prev_block", "");
+    }
+    
+    if (prev_block.empty()) {
+        return false; // No prev_block, can't determine staleness
+    }
+    
+    std::string tip_digest = client->getTipDigest();
+    if (tip_digest.empty()) {
+        return false; // Can't get tip, assume not stale
+    }
+    
+    return prev_block != tip_digest;
+}
+
+void ConnectionMultiplexer::updateAllWorkersConnectionState(bool is_connected) {
+    std::shared_lock<std::shared_mutex> lock(workers_mutex);
+    for (const auto& worker : workers) {
+        if (worker && worker->resources) {
+            worker->resources->gpu_node_connected = is_connected;
+        }
+    }
+}
+
+// ============================================================================
+// Thread Loops
+// ============================================================================
+
+void ConnectionMultiplexer::jobBroadcasterLoop() {
+    try {
+        LOG_DEBUG("[JobBroadcaster] Started");
+
+        auto last_poll_time = std::chrono::steady_clock::now();
+
+        // Wait for at least one worker to register
+        while (running.load()) {
+            if (getActiveWorkerCount() > 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        std::cout << "[JobBroadcaster] Block proposal fetcher started" << std::endl;
+
+        while (running.load() && !stop_mining) {
+            // Check connection
+            if (!client || !client->is_connected()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto time_since_poll = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_poll_time).count();
+
+            bool should_poll = false;
+
+            // Check if it's time to poll
+            if (time_since_poll >= g_fetch_interval_sec) {
+                should_poll = true;
+            }
+
+            // Also poll if we have no template yet or if we're composing (waiting for new proposal)
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                if (last_template_id.empty() || composing_new_block.load()) {
+                    should_poll = true;
+                }
+            }
+
+            if (should_poll) {
+                json template_response = client->getBlockTemplate(wallet_address);
+                last_poll_time = std::chrono::steady_clock::now();
+
+                if (!template_response.empty() && template_response.contains("result")) {
+                    json result = template_response["result"];
+
+                    if (!result.contains("template") || result["template"].is_null()) {
+                        // Template null - node is still composing, keep waiting
+                        if (composing_new_block.load()) {
+                            // Poll more frequently during composition
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
+                        continue;
+                    }
+
+                    json template_obj = result["template"];
+                    if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+                        // Invalid template - node still composing
+                        if (composing_new_block.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
+                        continue;
+                    }
+
+                    json metadata = template_obj["metadata"];
+                    std::string template_id = metadata.contains("digest")
+                        ? metadata.value("digest", "") : "";
+
+                    bool is_new_template = false;
+                    {
+                        std::lock_guard<std::mutex> lock(job_mutex);
+                        if (!template_id.empty() && template_id != last_template_id) {
+                            // Verify prev_block matches tip
+                            std::string prev_block;
+                            if (metadata.contains("prevBlock")) {
+                                prev_block = metadata.value("prevBlock", "");
+                            } else if (metadata.contains("prev_block")) {
+                                prev_block = metadata.value("prev_block", "");
+                            }
+
+                            std::string tip_digest = client->getTipDigest();
+
+                            if (prev_block.empty() || prev_block == tip_digest) {
+                                // If prev_block matches tip, the proposal is valid - start mining immediately
+                                bool should_resume = true;
+                                bool is_composing = composing_new_block.load();
+                                
+                                if (is_composing) {
+                                    // First valid proposal after tip change - start mining immediately
+                                    composing_new_block.store(false);
+                                    recovery_mode.store(false);
+                                    proposals_seen_for_tip.store(0);
+                                    first_proposal_prev_block.clear();
+                                    std::cout << "[JobBroadcaster] " << Color::GREEN 
+                                              << "Valid proposal received (prev_block matches tip), resuming mining" 
+                                              << Color::RESET << std::endl;
+                                    should_resume = true;
+                                }
+
+                                // Always update template_id and tip tracking
+                                last_template_id = template_id;
+                                current_tip_digest = tip_digest;
+                                
+                                if (should_resume) {
+                                    is_new_template = true;
+                                    stats.total_jobs_fetched++;
+                                    {
+                                        std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                                        stats.last_job_time = std::chrono::steady_clock::now();
+                                    }
+                                }
+                                // If not resuming (first proposal after tip change), don't set is_new_template
+                                // This prevents broadcasting until we have a stable proposal
+                            }
+                        }
+                    }
+
+                    if (is_new_template) {
+                        // Resume workers when we have a stable new proposal
+                        {
+                            std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                            for (const auto& worker : workers) {
+                                if (worker && worker->active && worker->resources) {
+                                    worker->resources->set_paused(false);
+                                }
+                            }
+                        }
+                        broadcastJobToWorkers(template_response);
+                    }
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+
+        LOG_DEBUG("[JobBroadcaster] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[JobBroadcaster] Exception: " << e.what() << std::endl;
+        running.store(false);
+        connected.store(false);
+    } catch (...) {
+        std::cerr << "[JobBroadcaster] Unknown exception" << std::endl;
+        running.store(false);
+        connected.store(false);
+    }
+}
+
+void ConnectionMultiplexer::broadcastJobToWorkers(const json& job) {
+    std::shared_lock<std::shared_mutex> lock(workers_mutex);
+    
+    std::string job_data = job.dump();
+    
+    for (const auto& worker : workers) {
+        if (worker && worker->active && worker->resources && worker->resources->event_handler) {
+            worker->resources->event_handler->postEvent(
+                EventType::NEW_PUZZLE, "", job_data);
+            worker->jobs_received++;
+        }
+    }
+    
+    stats.total_jobs_broadcast++;
+}
+
+void ConnectionMultiplexer::solutionSubmitterLoop() {
+    try {
+        LOG_DEBUG("[SolutionSubmitter] Started");
+
+        while (running.load() && !stop_mining) {
+            std::unique_ptr<SolutionSubmission> submission;
+
+            {
+                std::unique_lock<std::mutex> lock(submission_mutex);
+                submission_cv.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return !submission_queue.empty() || !running.load() || stop_mining;
+                });
+
+                if ((!running.load() || stop_mining) && submission_queue.empty()) {
+                    break;
+                }
+
+                if (!submission_queue.empty()) {
+                    submission = std::move(submission_queue.front());
+                    submission_queue.pop();
+                }
+            }
+
+            if (submission) {
+                bool result = processSubmission(*submission);
+                submission->result_promise->set_value(result);
+            }
+        }
+
+        LOG_DEBUG("[SolutionSubmitter] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[SolutionSubmitter] Exception: " << e.what() << std::endl;
+        running.store(false);
+        connected.store(false);
+    } catch (...) {
+        std::cerr << "[SolutionSubmitter] Unknown exception" << std::endl;
+        running.store(false);
+        connected.store(false);
+    }
+}
+
+bool ConnectionMultiplexer::processSubmission(SolutionSubmission& submission) {
+    if (!client || !client->is_connected()) {
+        std::cout << "[GPU " << submission.gpu_id << "] " << Color::RED 
+                  << "Cannot submit - not connected to node" << Color::RESET << std::endl;
+        return false;
+    }
+    
+    // Reject submissions during composition gap (no valid proposal exists yet)
+    if (composing_new_block.load()) {
+        std::cout << "[SUBMIT] " << Color::YELLOW
+                  << "STALE: Node composing new block, no valid proposal yet" 
+                  << Color::RESET << std::endl;
+        return false;
+    }
+    
+    stats.total_solutions_submitted++;
+    bool accepted = false;
+    bool is_invalid_block = false;  // Declare outside try block for use after catch
+    try {
+        // For solo mode, refresh the template on submission to ensure
+        // the appendix claims are current for this proposal.
+        if (mining_mode == MiningMode::Solo) {
+            json template_response = client->getBlockTemplate(wallet_address);
+            if (template_response.empty() || !template_response.contains("result")) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "No template response on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json result = template_response["result"];
+            if (!result.contains("template") || result["template"].is_null()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json template_obj = result["template"];
+            if (!template_obj.contains("metadata") || template_obj["metadata"].is_null()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template metadata missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+            json metadata = template_obj["metadata"];
+            std::string template_id = metadata.contains("digest")
+                ? metadata.value("digest", "") : "";
+
+            auto normalize_digest = [](std::string value) {
+                if (value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+                    value = value.substr(2);
+                }
+                for (auto& ch : value) {
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                }
+                return value;
+            };
+
+            if (template_id.empty()) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template digest missing on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+
+            if (normalize_digest(template_id) != normalize_digest(submission.proposal_id)) {
+                std::cout << "[SUBMIT] " << Color::YELLOW
+                          << "Template digest mismatch on refresh, dropping submission" 
+                          << Color::RESET << std::endl;
+                return false;
+            }
+
+            // Additional validation: Ensure the block body (transaction kernel) hasn't changed
+            // by comparing a hash of the transaction kernel structure
+            json fresh_block = template_obj["block"];
+            json original_block = submission.template_obj["block"];
+            
+            if (fresh_block.contains("kernel") && original_block.contains("kernel")) {
+                json fresh_kernel = fresh_block["kernel"];
+                json original_kernel = original_block["kernel"];
+                
+                // Compare transaction kernel body fields that affect the MAST hash
+                // If these differ, the appendix claims will be invalid
+                auto kernel_body_hash = [](const json& kernel) -> std::string {
+                    if (!kernel.contains("body") || kernel["body"].is_null()) {
+                        return "";
+                    }
+                    json body = kernel["body"];
+                    // Create a simple hash from key transaction kernel fields
+                    std::ostringstream oss;
+                    if (body.contains("transactionKernel")) {
+                        json tk = body["transactionKernel"];
+                        if (tk.contains("fee")) oss << tk["fee"].dump();
+                        if (tk.contains("coinbase")) oss << tk["coinbase"].dump();
+                        if (tk.contains("timestamp")) oss << tk["timestamp"].dump();
+                        if (tk.contains("mutatorSetHash")) oss << tk["mutatorSetHash"].dump();
+                    }
+                    return oss.str();
+                };
+                
+                std::string fresh_hash = kernel_body_hash(fresh_kernel);
+                std::string original_hash = kernel_body_hash(original_kernel);
+                
+                if (fresh_hash != original_hash) {
+                    std::cout << "[SUBMIT] " << Color::YELLOW
+                              << "Transaction kernel body changed on refresh, dropping submission" 
+                              << Color::RESET << std::endl;
+                    return false;
+                }
+            }
+
+            // Always use the freshly fetched template for submission
+            submission.template_obj = template_obj;
+        }
+
+        accepted = client->submitSolution(
+            submission.proposal_id,
+            submission.pow_solution,
+            submission.solution_hash,
+            submission.template_obj);
+            
+        // Check if the rejection was due to InvalidBlock
+        if (!accepted && mining_mode == MiningMode::Solo) {
+            SoloMiningClient* solo_client = dynamic_cast<SoloMiningClient*>(client.get());
+            if (solo_client) {
+                std::string error = solo_client->getLastError();
+                std::string error_lower = error;
+                std::transform(error_lower.begin(), error_lower.end(), error_lower.begin(), ::tolower);
+                if (error_lower.find("invalidblock") != std::string::npos || 
+                    error_lower.find("invalid block") != std::string::npos) {
+                    is_invalid_block = true;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Submit] Exception: " << e.what() << std::endl;
+        accepted = false;
+    } catch (...) {
+        std::cerr << "[Submit] Unknown exception" << std::endl;
+        accepted = false;
+    }
+    
+    if (accepted) {
+        stats.total_solutions_accepted++;
+        // Reset rejection counter on success
+        consecutive_rejections.store(0);
+        recovery_mode.store(false);
+    } else {
+        stats.total_solutions_rejected++;
+        
+        // Only invalidate on actual InvalidBlock errors, not InsufficientWork
+        if (is_invalid_block && !composing_new_block.load()) {
+            std::cout << "[SUBMIT] " << Color::YELLOW
+                      << "InvalidBlock error detected, invalidating template and forcing refresh" 
+                      << Color::RESET << std::endl;
+            
+            // Clear template to force immediate refresh
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                last_template_id.clear();
+            }
+            
+            // Set recovery mode - wait for second proposal (same as normal mode)
+            // First proposal after InvalidBlock is still unstable
+            recovery_mode.store(true);
+            proposals_seen_for_tip.store(0);
+            first_proposal_prev_block.clear();
+            composing_new_block.store(true);
+            
+            // Pause workers temporarily until new template arrives
+            {
+                std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                for (const auto& worker : workers) {
+                    if (worker && worker->active && worker->resources) {
+                        worker->resources->set_paused(true);
+                    }
+                }
+            }
+            
+            // Reset counter
+            consecutive_rejections.store(0);
+        } else {
+            // Reset counter on success or non-InvalidBlock errors
+            consecutive_rejections.store(0);
+        }
+    }
+    
+    {
+        std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+        stats.last_submission_time = std::chrono::steady_clock::now();
+    }
+    
+    return accepted;
+}
+
+void ConnectionMultiplexer::healthMonitorLoop() {
+    try {
+        LOG_DEBUG("[HealthMonitor] Started");
+
+        while (running.load() && !stop_mining) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            if (!running.load() || stop_mining) break;
+
+            // Check connection health
+            if (client) {
+                bool was_connected = connected.load();
+                bool is_now_connected = client->is_connected();
+
+                if (was_connected && !is_now_connected) {
+                    // Lost connection
+                    std::cout << "[HealthMonitor] " << Color::YELLOW
+                              << "Connection lost, attempting reconnection..." << Color::RESET << std::endl;
+
+                    connected.store(false);
+                    updateAllWorkersConnectionState(false);
+
+                    if (attemptReconnection()) {
+                        connected.store(true);
+                        updateAllWorkersConnectionState(true);
+                    }
+                } else if (!was_connected && is_now_connected) {
+                    // Connection restored (shouldn't happen normally)
+                    connected.store(true);
+                    updateAllWorkersConnectionState(true);
+                }
+            }
+
+            // Check for stale jobs
+            {
+                std::lock_guard<std::mutex> time_lock(stats.time_mutex);
+                auto now = std::chrono::steady_clock::now();
+                auto time_since_job = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - stats.last_job_time).count();
+
+                if (time_since_job > JOB_STALENESS_THRESHOLD_SEC && connected.load()) {
+                    LOG_DEBUG("[HealthMonitor] Jobs stale (" << time_since_job << "s), will refresh on next poll");
+                }
+            }
+        }
+
+        LOG_DEBUG("[HealthMonitor] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[HealthMonitor] Exception: " << e.what() << std::endl;
+        running.store(false);
+        connected.store(false);
+    } catch (...) {
+        std::cerr << "[HealthMonitor] Unknown exception" << std::endl;
+        running.store(false);
+        connected.store(false);
+    }
+}
+
+bool ConnectionMultiplexer::attemptReconnection() {
+    int attempt = 0;
+    
+    while (running.load() && !stop_mining && attempt < MAX_CONSECUTIVE_RECONNECTIONS) {
+        attempt++;
+        
+        int delay = std::min(MIN_RECONNECT_DELAY_SEC * (1 << (attempt - 1)), 
+                            MAX_RECONNECT_DELAY_SEC);
+        
+        std::cout << "[Multiplexer] Reconnection attempt " << attempt 
+                  << " in " << delay << "s..." << std::endl;
+        
+        for (int i = 0; i < delay && running.load() && !stop_mining; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        if (!running.load() || stop_mining) break;
+        
+        if (client && client->reconnect()) {
+            std::cout << Color::GREEN << "[Multiplexer] Reconnected successfully!" 
+                      << Color::RESET << std::endl;
+            
+            stats.reconnection_count++;
+            return true;
+        }
+    }
+    
+    std::cout << Color::RED << "[Multiplexer] Failed to reconnect after " 
+              << attempt << " attempts" << Color::RESET << std::endl;
+    return false;
+}
+
+void ConnectionMultiplexer::tipMonitorLoop() {
+    try {
+        LOG_DEBUG("[TipMonitor] Started");
+        
+        // Check tip every 500ms for fast stale detection
+        const auto TIP_CHECK_INTERVAL = std::chrono::milliseconds(500);
+        
+        while (running.load() && !stop_mining) {
+            std::this_thread::sleep_for(TIP_CHECK_INTERVAL);
+            
+            if (!client || !client->is_connected()) {
+                continue;
+            }
+            
+            // Get current tip from node
+            std::string new_tip = client->getTipDigest();
+            if (new_tip.empty()) {
+                continue;
+            }
+            
+            bool tip_changed = false;
+            {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                if (!current_tip_digest.empty() && current_tip_digest != new_tip) {
+                    tip_changed = true;
+                    std::string short_old = current_tip_digest.length() > 16 ? 
+                        current_tip_digest.substr(0, 8) + "..." + current_tip_digest.substr(current_tip_digest.length() - 8) : 
+                        current_tip_digest;
+                    std::string short_new = new_tip.length() > 16 ? 
+                        new_tip.substr(0, 8) + "..." + new_tip.substr(new_tip.length() - 8) : 
+                        new_tip;
+                    std::cout << "[TipMonitor] " << Color::YELLOW << "New block detected!" << Color::RESET
+                              << " Tip: " << short_old << " -> " << short_new << std::endl;
+                }
+                current_tip_digest = new_tip;
+            }
+            
+            if (tip_changed) {
+                // Set composing flag - we're waiting for a valid new proposal
+                composing_new_block.store(true);
+                proposals_seen_for_tip.store(0);
+                first_proposal_prev_block.clear();
+                
+                // Immediately pause all workers - their templates are now stale
+                {
+                    std::shared_lock<std::shared_mutex> lock(workers_mutex);
+                    for (const auto& worker : workers) {
+                        if (worker && worker->active && worker->resources) {
+                            worker->resources->set_paused(true);
+                            if (worker->resources->event_handler) {
+                                worker->resources->event_handler->postEvent(EventType::TIP_CHANGED);
+                            }
+                        }
+                    }
+                }
+                
+                // Clear the last template ID to force immediate fetch
+                {
+                    std::lock_guard<std::mutex> lock(job_mutex);
+                    last_template_id.clear();
+                }
+                
+                std::cout << "[TipMonitor] " << Color::YELLOW 
+                          << "Node composing new block, waiting for valid proposal..." 
+                          << Color::RESET << std::endl;
+                
+                // Don't fetch here - let jobBroadcasterLoop handle it with retries
+                // This ensures we wait until a valid proposal is ready
+            }
+        }
+        
+        LOG_DEBUG("[TipMonitor] Stopped");
+    } catch (const std::exception& e) {
+        std::cerr << "[TipMonitor] Exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[TipMonitor] Unknown exception" << std::endl;
+    }
+}
+
+// --- main.cu ---
+#include "mining.cuh"
+#include "connection_multiplexer.cuh"
+#include "mining_client.h"
+#include "network.cuh"
+#include "rpc_client.cuh"
+#include <fstream>
+#include <iomanip>
+#include <chrono>
+#include <cstdlib>
+
+void print_usage(const char* program_name) {
+    std::cerr << "\n" << Color::BOLD << "Usage:" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " [OPTIONS] -w, --wallet ADDRESS\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "Required:" << Color::RESET << std::endl;
+    std::cerr << "  -w, --wallet ADDRESS  Your Neptune wallet address\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "Solo Mining (default):" << Color::RESET << std::endl;
+    std::cerr << "  --rpc-url URL         RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
+    std::cerr << "  -H, --host HOST       RPC host" << std::endl;
+    std::cerr << "  -p, --port PORT       RPC port\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "Pool Mining (Stratum):" << Color::RESET << std::endl;
+    std::cerr << "  --stratum URL         Stratum pool URL (e.g., stratum://pool.example.com:3333)" << std::endl;
+    std::cerr << "  --stratum-pass PASS   Stratum password (default: x)" << std::endl;
+    std::cerr << "  --stratum-worker NAME Stratum worker name (default: xnt-miner)\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "General Options:" << Color::RESET << std::endl;
+    std::cerr << "  -d, --device ID       Use specific GPU device ID (default: all GPUs)" << std::endl;
+    std::cerr << "  --rpc-url URL         RPC endpoint URL (default: http://127.0.0.1:9897)" << std::endl;
+    std::cerr << "  --test-mode           Enable test mode (100,000x easier target)" << std::endl;
+    std::cerr << "  --benchmark           Run mining benchmark (saves/loads test template)" << std::endl;
+    std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
+    std::cerr << "  --batch N             Nonces per kernel (0=auto, e.g. 20000000 for 20M)" << std::endl;
+    std::cerr << "                        Or set XNT_BATCH_SIZE env for quick tuning" << std::endl;
+    std::cerr << "  -h, --help            Show this help message\n" << std::endl;
+    
+    std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
+    std::cerr << "  " << Color::DIM << "# Solo mining to local node" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam..." << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  " << Color::DIM << "# Solo mining to remote node" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --rpc-url http://192.168.1.100:9897" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  " << Color::DIM << "# Pool mining via stratum" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --stratum stratum://pool.example.com:3333" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  " << Color::DIM << "# Benchmark mining speed" << Color::RESET << std::endl;
+    std::cerr << "  " << program_name << " -w nolgam... --benchmark" << std::endl;
+    std::cerr << std::endl;
+}
+
+void print_system_info() {
+    int device_count = 0;
+    cudaError_t error = cudaGetDeviceCount(&device_count);
+    
+    if (error != cudaSuccess) {
+        std::cerr << Color::RED << "CUDA Error: " << cudaGetErrorString(error) << Color::RESET << std::endl;
+        return;
+    }
+    
+    std::cout << Color::BOLD << "System Information:" << Color::RESET << std::endl;
+    std::cout << "  CUDA Devices: " << device_count << std::endl;
+    
+    for (int i = 0; i < device_count; ++i) {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, i);
+        
+        size_t vram_gb = prop.totalGlobalMem / (1024ULL * 1024ULL * 1024ULL);
+        
+        std::cout << "  GPU " << i << ": " << prop.name 
+                  << " (" << vram_gb << " GB)" << std::endl;
+    }
+    std::cout << std::endl;
+}
+
+// ============================================================================
+// Benchmark Functions
+// ============================================================================
+// Benchmark mode allows testing mining performance without requiring an active
+// RPC connection. It saves a block template to disk and reuses it for
+// consistent performance measurements.
+
+const std::string BENCHMARK_FILE = "benchmark_template.json";
+
+/// Save a block template to disk for offline benchmark testing.
+/// 
+/// @param template_response JSON response containing the block template
+/// @return true if template was successfully saved, false otherwise
+bool saveBenchmarkTemplate(const json& template_response) {
+    std::ofstream file(BENCHMARK_FILE);
+    if (!file.is_open()) {
+        std::cerr << Color::RED << "Error: Cannot create benchmark file: " << BENCHMARK_FILE << Color::RESET << std::endl;
+        return false;
+    }
+    // Write formatted JSON (indented for readability)
+    file << std::setw(2) << template_response << std::endl;
+    file.close();
+    std::cout << Color::GREEN << "Benchmark template saved to " << BENCHMARK_FILE << Color::RESET << std::endl;
+    return true;
+}
+
+/// Load a previously saved block template from disk.
+/// 
+/// @param template_response Output parameter to receive the loaded template
+/// @return true if template was successfully loaded, false if file doesn't exist or is invalid
+bool loadBenchmarkTemplate(json& template_response) {
+    std::ifstream file(BENCHMARK_FILE);
+    if (!file.is_open()) {
+        return false;
+    }
+    try {
+        file >> template_response;
+        file.close();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << Color::RED << "Error: Invalid benchmark file: " << e.what() << Color::RESET << std::endl;
+        return false;
+    }
+}
+
+/// Run mining benchmark to measure hash rate and validate solutions.
+/// 
+/// Benchmark mode operates in two phases:
+/// 1. Template acquisition: Fetches a block template from the node (if not cached)
+/// 2. Mining loop: Mines using an easier target (100000x) to find solutions quickly
+///    and validates them using the same logic as the Rust node.
+/// 
+/// @param endpoint RPC endpoint URL (used only if template needs to be fetched)
+/// @param gpu_id GPU device ID to use for mining (-1 for auto-select)
+void runBenchmark(const std::string& endpoint, int gpu_id) {
+    std::cout << Color::BOLD << "\n=== Mining Benchmark ===" << Color::RESET << std::endl;
+    
+    json template_response;
+    bool template_exists = loadBenchmarkTemplate(template_response);
+    
+    if (!template_exists) {
+        std::cout << "Benchmark template not found. Fetching from node..." << std::endl;
+        
+        // Wallet address is required only when fetching a new template from the node.
+        // Once the template is saved, the benchmark can run offline.
+        if (g_miner_wallet_address.empty()) {
+            std::cerr << Color::RED << "Error: Wallet address is required to fetch template from node" << std::endl;
+            std::cerr << "Please provide wallet address with -w/--wallet or ensure " << BENCHMARK_FILE << " exists" << Color::RESET << std::endl;
+            return;
+        }
+        
+        // Try to fetch a template from the node
+        try {
+            XntRpcClient rpc_client(endpoint);
+            if (!rpc_client.testConnection()) {
+                std::cerr << Color::RED << "Error: Cannot connect to node at " << endpoint << std::endl;
+                std::cerr << "Please ensure the node is running or provide a valid RPC URL." << Color::RESET << std::endl;
+                return;
+            }
+            
+            template_response = rpc_client.getBlockTemplate(g_miner_wallet_address);
+            if (template_response.empty() || !template_response.contains("result")) {
+                std::cerr << Color::RED << "Error: Failed to fetch block template from node" << Color::RESET << std::endl;
+                return;
+            }
+            
+            if (!saveBenchmarkTemplate(template_response)) {
+                return;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << Color::RED << "Error fetching template: " << e.what() << Color::RESET << std::endl;
+            return;
+        }
+    } else {
+        std::cout << "Using existing benchmark template from " << BENCHMARK_FILE << std::endl;
+        std::cout << Color::GREEN << "No RPC connection required - running offline benchmark" << Color::RESET << std::endl;
+    }
+    
+    // Extract template object from JSON response (handles both RPC and direct formats)
+    json template_obj;
+    if (template_response.contains("result") && template_response["result"].contains("template")) {
+        template_obj = template_response["result"]["template"];
+    } else if (template_response.contains("template")) {
+        template_obj = template_response["template"];
+    } else {
+        std::cerr << Color::RED << "Error: Invalid template format" << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Parse the template into a PowPuzzle structure for mining
+    std::string template_json_str = template_response.dump();
+    PowPuzzle puzzle = parsePowPuzzle(template_json_str);
+    if (!puzzle.is_valid()) {
+        std::cerr << Color::RED << "Error: Invalid puzzle in template" << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Initialize GPU
+    int device_id = (gpu_id >= 0) ? gpu_id : 0;
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+        std::cerr << Color::RED << "CUDA Error: " << cudaGetErrorString(err) << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Initialize GPU resources
+    auto gpu_res = std::make_unique<GpuResources>(device_id);
+    gpu_res->mining_mode = MiningMode::Solo;
+    
+    if (!preprocessPuzzle(puzzle, gpu_res.get())) {
+        std::cerr << Color::RED << "Failed to initialize GPU resources" << Color::RESET << std::endl;
+        return;
+    }
+    
+    // Batch size: use global override if set, otherwise auto-detect for this GPU
+    const uint64_t min_batch = 1;
+    if (g_batch_size > 0) {
+        gpu_res->optimal_max_nonces = std::max(g_batch_size, min_batch);
+    } else {
+        gpu_res->optimal_max_nonces = get_optimal_batch_size(device_id);
+    }
+    
+    std::cout << "\n" << Color::BOLD << "Starting benchmark..." << Color::RESET << std::endl;
+    std::cout << "  Batch size: " << gpu_res->optimal_max_nonces << " (" << (gpu_res->optimal_max_nonces / 1000000.0) << "M)" << std::endl;
+    std::cout << "Press Ctrl+C to stop\n" << std::endl;
+    
+    // Benchmark configuration
+    int BENCHMARK_DURATION_SEC = 10;        // Total benchmark duration
+    if (const char* bench_env = std::getenv("XNT_BENCHMARK_SEC"); bench_env && bench_env[0] != '\0') {
+        int v = std::atoi(bench_env);
+        // Keep bounds sane so a typo doesn't run forever
+        if (v > 0 && v <= 600) {
+            BENCHMARK_DURATION_SEC = v;
+        }
+    }
+    // Use GPU's optimal batch size for maximum performance
+    // For RTX 5090 (256 SMs), this will be ~20M nonces, reducing kernel launch overhead
+    uint64_t NONCES_PER_BATCH = gpu_res->optimal_max_nonces;
+    
+    // Extract the original difficulty threshold from the puzzle
+    Digest original_threshold = hex_to_digest(puzzle.threshold);
+    
+    // Use a significantly easier target for benchmark mode to ensure we always
+    // find solutions for validation testing. 1M× gives ~20-30 solutions per
+    // 10-second run while keeping enough full batches for accurate sustained rate.
+    constexpr uint64_t BENCHMARK_EASY_FACTOR = 1000000ULL;  // 1 million
+    Digest test_target = make_target_easier(original_threshold, BENCHMARK_EASY_FACTOR);
+    std::string test_target_hex = digest_to_hex(test_target);
+    std::string original_threshold_hex = digest_to_hex(original_threshold);
+    
+    
+    uint64_t total_nonces = 0;        // Always increases to avoid nonce reuse
+    uint64_t measured_nonces = 0;     // Excludes warmup batches for steady-state rate
+    uint64_t solutions_found = 0;
+    uint64_t valid_solutions = 0;
+    uint64_t invalid_threshold = 0;
+    
+    const char* warmup_env = std::getenv("XNT_WARMUP_BATCHES");
+    int warmup_batches = 5;
+    if (warmup_env && warmup_env[0] != '\0') {
+        warmup_batches = std::max(0, std::atoi(warmup_env));
+    }
+    
+    auto start_time = std::chrono::steady_clock::now();
+    auto last_update = start_time;
+    uint64_t last_nonces = 0;  // Track nonces at last update for instantaneous rate calculation
+    int iteration = 0;
+    
+    install_signal_handlers();
+    
+    std::cout << "\n" << Color::BOLD << "Validation:" << Color::RESET << std::endl;
+    std::cout << "  Original Threshold: " << original_threshold_hex << std::endl;
+    std::cout << "  Test Threshold:     " << test_target_hex << " (" << BENCHMARK_EASY_FACTOR << "x easier)" << std::endl;
+    std::cout << "  Validating against:  " << Color::YELLOW << "Test Threshold (" << BENCHMARK_EASY_FACTOR << "x easier)" << Color::RESET << std::endl;
+    std::cout << "  Checking trailing zeros and threshold comparison" << std::endl;
+    std::cout << std::endl;
+    
+    // Debug: per-batch timing (disabled by default for steady performance)
+    bool debug_batch_timing = false;
+    if (const char* dbg_env = std::getenv("XNT_DEBUG_BATCH"); dbg_env && dbg_env[0] == '1') {
+        debug_batch_timing = true;
+    }
+    
+    // Async mode: use double-buffered pipelining (set XNT_ASYNC_BENCH=1)
+    bool use_async = false;
+    if (const char* async_env = std::getenv("XNT_ASYNC_BENCH"); async_env && async_env[0] == '1') {
+        use_async = true;
+        std::cout << Color::CYAN << "  Mode: ASYNC (double-buffered, 2 streams)" << Color::RESET << std::endl;
+    } else {
+        std::cout << Color::CYAN << "  Mode: SYNC (single stream)" << Color::RESET << std::endl;
+    }
+    std::cout << std::endl;
+    
+    int batch_count = 0;
+    int measured_batch_count = 0;
+    int full_batch_count = 0;
+    double full_batch_total_ms = 0.0;
+    
+    // Initialize async miner if using async mode
+    std::unique_ptr<DoubleBufferedMiner> async_miner;
+    int active_slot = 0;
+    struct AsyncBatchInfo {
+        uint64_t start_nonce;
+        std::chrono::steady_clock::time_point start_time;
+        bool pending;
+    };
+    AsyncBatchInfo async_batch_info[2] = {};
+    
+    if (use_async) {
+        async_miner = std::make_unique<DoubleBufferedMiner>();
+        if (!async_miner->initialize()) {
+            std::cerr << Color::RED << "Failed to initialize async miner" << Color::RESET << std::endl;
+            return;
+        }
+    }
+    
+    while (!stop_mining) {
+        std::optional<MiningSolution> result;
+        auto batch_start = std::chrono::steady_clock::now();
+        Digest target = test_target;
+        
+        if (use_async) {
+            // ============ ASYNC DOUBLE-BUFFERED MODE ============
+            AsyncMiningSlot& slot = async_miner->slots[active_slot];
+            AsyncBatchInfo& info = async_batch_info[active_slot];
+            
+            // Check if current slot has a pending result
+            if (info.pending) {
+                cudaError_t status = cudaEventQuery(slot.completion_event);
+                if (status == cudaSuccess) {
+                    // Kernel done - process result
+                    auto now = std::chrono::steady_clock::now();
+                    auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(now - info.start_time).count();
+                    double batch_duration_ms = duration_us / 1000.0;
+                    
+                    batch_count++;
+                    total_nonces += NONCES_PER_BATCH;
+                    
+                    const bool in_warmup = batch_count <= warmup_batches;
+                    if (!in_warmup) {
+                        measured_batch_count++;
+                        measured_nonces += NONCES_PER_BATCH;
+                        
+                        int sol_found = *slot.h_solution_found_pinned;
+                        if (!sol_found) {
+                            full_batch_count++;
+                            full_batch_total_ms += batch_duration_ms;
+                        } else {
+                            // Retrieve solution
+                            MiningSolution sol;
+                            cudaMemcpy(&sol.pow.nonce, slot.d_solution_nonce_digest, sizeof(Digest), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(sol.pow.path_a, slot.d_solution_path_a, MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(sol.pow.path_b, slot.d_solution_path_b, MERKLE_TREE_HEIGHT_ * sizeof(Digest), cudaMemcpyDeviceToHost);
+                            cudaMemcpy(&sol.kernel_final_hash, slot.d_solution_final_hash, sizeof(Digest), cudaMemcpyDeviceToHost);
+                            sol.pow.root = gpu_res->buffer->merkle_root;
+                            solutions_found++;
+                            
+                            // Validate solution
+                            bool meets_threshold = digest_less_than_or_equal(sol.kernel_final_hash, test_target);
+                            if (meets_threshold) {
+                                valid_solutions++;
+                                if (solutions_found <= 3) {
+                                    std::string hash_hex = digest_to_hex(sol.kernel_final_hash);
+                                    std::cout << "\n" << Color::GREEN << "[ASYNC VALIDATION] Valid solution found!" << Color::RESET << std::endl;
+                                    std::cout << "  Kernel final_hash: " << hash_hex << std::endl;
+                                }
+                            } else {
+                                invalid_threshold++;
+                            }
+                        }
+                    } else if (batch_count == warmup_batches) {
+                        // Reset after warmup
+                        measured_nonces = 0;
+                        measured_batch_count = 0;
+                        full_batch_count = 0;
+                        full_batch_total_ms = 0.0;
+                        solutions_found = 0;
+                        valid_solutions = 0;
+                        invalid_threshold = 0;
+                        start_time = std::chrono::steady_clock::now();
+                        last_update = start_time;
+                        last_nonces = 0;
+                    }
+                    
+                    info.pending = false;
+                } else if (status == cudaErrorNotReady) {
+                    // Switch to other slot
+                    active_slot = 1 - active_slot;
+                    if (async_batch_info[active_slot].pending) {
+                        // Both busy, wait
+                        cudaStreamSynchronize(slot.stream);
+                    }
+                    continue;
+                }
+            }
+            
+            // Launch new batch on current slot
+            *slot.h_solution_found_pinned = 0;
+            cudaMemsetAsync(slot.d_solution_found, 0, sizeof(int), slot.stream);
+            
+            int threads_per_block, blocks_per_grid;
+            calculate_mining_launch_config(NONCES_PER_BATCH, threads_per_block, blocks_per_grid, device_id);
+            
+            if (!gpu_res->buffer->gpu_range_initialized) {
+                GpuNonceRange gpu_range = calculate_gpu_range(device_id, 1);
+                cudaMemcpyToSymbol(d_gpu_range_start, &gpu_range.range_start, sizeof(uint64_t));
+                cudaMemcpyToSymbol(d_gpu_range_size, &gpu_range.range_size, sizeof(uint64_t));
+                initialize_top_tree_cache(gpu_res->buffer->d_merkle_tree, gpu_res->buffer->num_leafs);
+                gpu_res->buffer->gpu_range_initialized = true;
+            }
+            
+            parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, slot.stream>>>(
+                gpu_res->buffer->d_leafs,
+                gpu_res->buffer->d_merkle_tree,
+                gpu_res->buffer->index_picker_preimage,
+                target,
+                total_nonces,
+                NONCES_PER_BATCH,
+                gpu_res->buffer->num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                gpu_res->buffer->mast_paths,
+                gpu_res->buffer->hash,
+                gpu_res->buffer->consensus_rule_set,
+                slot.d_solution_nonce,
+                slot.d_solution_found,
+                slot.d_solution_path_a,
+                slot.d_solution_path_b,
+                slot.d_solution_nonce_digest,
+                slot.d_solution_final_hash);
+            
+            cudaMemcpyAsync(slot.h_solution_found_pinned, slot.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost, slot.stream);
+            cudaEventRecord(slot.completion_event, slot.stream);
+            
+            info.start_nonce = total_nonces;
+            info.start_time = std::chrono::steady_clock::now();
+            info.pending = true;
+            
+            active_slot = 1 - active_slot;
+            
+            // Update progress display
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
+            if (since_update >= 1000 && measured_nonces > 0) {
+                uint64_t nonces_since_update = measured_nonces - last_nonces;
+                double time_since_update_sec = since_update / 1000.0;
+                double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
+                std::cout << "\r[Benchmark ASYNC] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
+                          << hash_rate << " MH/s" << Color::RESET 
+                          << " | Nonces: " << measured_nonces 
+                          << " | Time: " << elapsed << "s" << std::flush;
+                last_update = now;
+                last_nonces = measured_nonces;
+            }
+            if (elapsed >= BENCHMARK_DURATION_SEC) break;
+        } else {
+            // ============ SYNC MODE (original) ============
+            result = mine_pow_with_buffer(
+                *gpu_res->buffer,
+                target,
+                gpu_res->buffer->mast_paths,
+                total_nonces,
+                NONCES_PER_BATCH,
+                gpu_res->buffer->consensus_rule_set,
+                nullptr
+            );
+        
+            auto batch_end = std::chrono::steady_clock::now();
+            auto batch_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(batch_end - batch_start).count();
+            double batch_duration_ms = batch_duration_us / 1000.0;
+            double batch_hashrate = (NONCES_PER_BATCH / 1000000.0) / (batch_duration_ms / 1000.0);
+            
+            batch_count++;
+            total_nonces += NONCES_PER_BATCH;
+            
+            const bool in_warmup = batch_count <= warmup_batches;
+            if (in_warmup) {
+                if (debug_batch_timing) {
+                    std::cout << "\n[DEBUG] Warmup Batch #" << batch_count 
+                              << " | Nonces: " << NONCES_PER_BATCH 
+                              << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
+                              << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
+                              << " | Solution: " << (result.has_value() ? "YES" : "NO")
+                              << std::endl;
+                }
+                
+                if (batch_count == warmup_batches) {
+                    // Reset measurement after warmup to avoid boost/thermal ramp affecting results
+                    measured_nonces = 0;
+                    measured_batch_count = 0;
+                    full_batch_count = 0;
+                    full_batch_total_ms = 0.0;
+                    solutions_found = 0;
+                    valid_solutions = 0;
+                    invalid_threshold = 0;
+                    start_time = std::chrono::steady_clock::now();
+                    last_update = start_time;
+                    last_nonces = 0;
+                }
+                continue;
+            }
+            
+            measured_batch_count++;
+            measured_nonces += NONCES_PER_BATCH;
+            
+            // Track full batches (no solution found = processed all nonces)
+            if (!result.has_value()) {
+                full_batch_count++;
+                full_batch_total_ms += batch_duration_ms;
+            }
+            
+            if (debug_batch_timing) {
+                std::cout << "\n[DEBUG] Batch #" << measured_batch_count 
+                          << " | Nonces: " << NONCES_PER_BATCH 
+                          << " | Duration: " << std::fixed << std::setprecision(2) << batch_duration_ms << " ms"
+                          << " | Rate: " << std::setprecision(2) << batch_hashrate << " MH/s"
+                          << " | Solution: " << (result.has_value() ? "YES" : "NO")
+                          << std::endl;
+            }
+            
+            // Validate any solution found by the kernel
+            if (result.has_value()) {
+                solutions_found++;
+                
+                // Extract solution components
+                const MiningSolution& mining_solution = result.value();
+                const Digest& kernel_final_hash = mining_solution.kernel_final_hash;
+                
+                // Convert to hex for display
+                std::string kernel_final_hash_hex = digest_to_hex(kernel_final_hash);
+                
+                // Validate using the kernel's final_hash (the value the kernel actually checked)
+                // This matches the Rust node's validation: final_hash <= threshold
+                bool meets_threshold = digest_less_than_or_equal(kernel_final_hash, test_target);
+                
+                // Extract trailing hex digits for display (matches the format shown in node logs)
+                std::string pow_trailing = "";
+                std::string threshold_trailing = "";
+                if (kernel_final_hash_hex.length() >= 16) {
+                    pow_trailing = kernel_final_hash_hex.substr(kernel_final_hash_hex.length() - 16);
+                }
+                if (test_target_hex.length() >= 16) {
+                    threshold_trailing = test_target_hex.substr(test_target_hex.length() - 16);
+                }
+                
+                // Validate solution: kernel_final_hash must be <= threshold
+                if (meets_threshold) {
+                    valid_solutions++;
+                    
+                    // Log first few valid solutions for verification (limit output to avoid spam)
+                    if (solutions_found <= 3) {
+                        std::cout << "\n" << Color::GREEN << "[VALIDATION] ✓ Valid solution found! (Kernel final_hash <= threshold)" << Color::RESET << std::endl;
+                        std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
+                        std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
+                        std::cout << "  Meets threshold:    " << Color::GREEN << "YES" << Color::RESET << std::endl;
+                        if (!pow_trailing.empty()) {
+                            std::cout << "  Final Hash Trailing: " << pow_trailing << std::endl;
+                        }
+                        if (!threshold_trailing.empty()) {
+                            std::cout << "  Threshold Trailing:  " << threshold_trailing << std::endl;
+                        }
+                    }
+                } else {
+                    invalid_threshold++;
+                    // Log first few invalid solutions for debugging
+                    if (solutions_found <= 3) {
+                        std::cout << "\n" << Color::YELLOW << "[VALIDATION] ✗ Solution does not meet threshold" << Color::RESET << std::endl;
+                        std::cout << "  " << Color::DIM << "Note: kernel_final_hash > threshold" << Color::RESET << std::endl;
+                        std::cout << "  Kernel final_hash: " << kernel_final_hash_hex << std::endl;
+                        std::cout << "  Test Threshold:    " << test_target_hex << std::endl;
+                        std::cout << "  Meets threshold:   " << Color::RED << "NO" << Color::RESET << std::endl;
+                        if (!pow_trailing.empty()) {
+                            std::cout << "  Final Hash Trailing: " << pow_trailing << std::endl;
+                            // Check for trailing zeros (valid solutions typically have trailing zeros,
+                            // matching the pattern shown in the Rust node's validation logs)
+                            bool has_trailing_zeros = (pow_trailing.find_first_not_of('0') == std::string::npos) || 
+                                                      (pow_trailing.back() == '0');
+                            std::cout << "  Has trailing zeros:  " << (has_trailing_zeros ? Color::GREEN : Color::RED) 
+                                      << (has_trailing_zeros ? "YES" : "NO") << Color::RESET << std::endl;
+                        }
+                        if (!threshold_trailing.empty()) {
+                            std::cout << "  Threshold Trailing:  " << threshold_trailing << std::endl;
+                        }
+                    }
+                }
+            }
+            
+            iteration++;
+            
+            // Update progress display and check if benchmark duration has elapsed
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            auto since_update = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update).count();
+            
+            // Update hash rate display every second
+            // Calculate instantaneous rate (nonces processed in last second) instead of cumulative average
+            if (since_update >= 1000) {
+                uint64_t nonces_since_update = measured_nonces - last_nonces;
+                double time_since_update_sec = since_update / 1000.0;
+                // Calculate instantaneous hash rate: nonces in last second / time elapsed
+                double hash_rate = (nonces_since_update / 1000000.0) / std::max(0.001, time_since_update_sec);
+                std::cout << "\r[Benchmark] Hash Rate: " << Color::CYAN << std::fixed << std::setprecision(2) 
+                          << hash_rate << " MH/s" << Color::RESET 
+                          << " | Nonces: " << measured_nonces 
+                          << " | Time: " << elapsed << "s" << std::flush;
+                last_update = now;
+                last_nonces = measured_nonces;  // Update tracked nonces for next calculation
+            }
+            
+            // Stop benchmark after the configured duration
+            if (elapsed >= BENCHMARK_DURATION_SEC) {
+                break;
+            }
+        } // end else (sync mode)
+    }
+    
+    // Drain any pending async batches
+    if (use_async && async_miner) {
+        for (int i = 0; i < 2; i++) {
+            if (async_batch_info[i].pending) {
+                cudaStreamSynchronize(async_miner->slots[i].stream);
+            }
+        }
+    }
+    
+    auto end_time = std::chrono::steady_clock::now();
+    auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+    double total_hash_rate = (measured_nonces / 1000000.0) / (total_elapsed / 1000.0);
+    
+    std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
+    std::cout << "  Total Nonces:  " << measured_nonces << std::endl;
+    std::cout << "  Total Batches: " << measured_batch_count << std::endl;
+    if (warmup_batches > 0) {
+        std::cout << "  Warmup Batches: " << warmup_batches << std::endl;
+    }
+    std::cout << "  Batch Size:    " << NONCES_PER_BATCH << " (" << (NONCES_PER_BATCH / 1000000.0) << "M)" << std::endl;
+    std::cout << "  Duration:      " << (total_elapsed / 1000.0) << " seconds" << std::endl;
+    if (measured_batch_count > 0) {
+        std::cout << "  Avg ms/batch:  " << std::fixed << std::setprecision(2) << (total_elapsed / (double)measured_batch_count) << " ms" << std::endl;
+    }
+    std::cout << "  Average Rate:  " << Color::GREEN << std::fixed << std::setprecision(2) 
+              << total_hash_rate << " MH/s" << Color::RESET << " (includes early exits)" << std::endl;
+    
+    // Show sustained rate from full batches only (only meaningful for sync mode)
+    if (full_batch_count > 0 && !use_async) {
+        double full_batch_avg_ms = full_batch_total_ms / full_batch_count;
+        double sustained_rate = (NONCES_PER_BATCH / 1000000.0) / (full_batch_avg_ms / 1000.0);
+        std::cout << "  " << Color::BOLD << "Sustained Rate: " << Color::YELLOW << std::setprecision(2) 
+                  << sustained_rate << " MH/s" << Color::RESET << " (full batches only, n=" << full_batch_count << ")" << std::endl;
+    } else if (use_async) {
+        // For async mode, the average rate IS the sustained rate due to double-buffering
+        std::cout << "  " << Color::BOLD << "Sustained Rate: " << Color::YELLOW << std::setprecision(2) 
+                  << total_hash_rate << " MH/s" << Color::RESET << " (async double-buffered)" << std::endl;
+    }
+    std::cout << std::endl;
+    
+    std::cout << Color::BOLD << "=== Validation Results ===" << Color::RESET << std::endl;
+    std::cout << "  Solutions Found:     " << solutions_found << std::endl;
+    std::cout << "  Valid (meets threshold): " << Color::GREEN << valid_solutions << Color::RESET << std::endl;
+    if (invalid_threshold > 0) {
+        std::cout << "  Invalid (threshold):  " << Color::YELLOW << invalid_threshold << Color::RESET << std::endl;
+        std::cout << "    (kernel_final_hash > threshold, rejected like Rust node)" << std::endl;
+    }
+    if (solutions_found > 0) {
+        double valid_rate = (valid_solutions * 100.0) / solutions_found;
+        std::cout << "  Validation Rate:     " << std::fixed << std::setprecision(1) 
+                  << valid_rate << "%" << std::endl;
+        std::cout << "\n  " << Color::DIM << "Note: Trailing zeros in hex representation indicate" << std::endl;
+        std::cout << "  the exact format used by the node for validation." << Color::RESET << std::endl;
+    }
+    std::cout << std::endl;
+    
+    // Cleanup GPU resources
+    if (gpu_res->buffer) {
+        gpu_res->buffer->cleanup();
+        gpu_res->buffer.reset();
+    }
+}
+
+int main(int argc, char* argv[]) {
+    enable_ansi_colors();
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
+    
+    // Batch size: env XNT_BATCH_SIZE as default (0=auto), --batch overrides
+    if (const char* env = std::getenv("XNT_BATCH_SIZE"); env && env[0] != '\0') {
+        try { g_batch_size = std::stoull(env); } catch (...) { /* keep default */ }
+    }
+    
+    std::string endpoint = "http://127.0.0.1:9897";
+    std::string stratum_password = "x";
+    std::string stratum_worker_name = "xnt-miner";
+    MiningMode mining_mode = MiningMode::Solo;
+    bool show_help = false;
+    
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        
+        if (arg == "--help" || arg == "-h") {
+            show_help = true;
+        } else if ((arg == "--wallet" || arg == "-w") && i + 1 < argc) {
+            g_miner_wallet_address = argv[++i];
+        } else if ((arg == "--device" || arg == "-d") && i + 1 < argc) {
+            try {
+                g_gpu_device_id = std::stoi(argv[++i]);
+                if (g_gpu_device_id < 0) {
+                    std::cerr << Color::RED << "Error: Device ID must be non-negative" << Color::RESET << std::endl;
+                    return 1;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid device ID: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
+        } else if ((arg == "--host" || arg == "-H") && i + 1 < argc) {
+            std::string host = argv[++i];
+            // Host option only applies to solo mining mode (not stratum pools)
+            if (mining_mode == MiningMode::Solo) {
+                size_t port_start = endpoint.find(":", 7);
+                if (port_start != std::string::npos) {
+                    std::string port = endpoint.substr(port_start + 1);
+                    endpoint = "http://" + host + ":" + port;
+                } else {
+                    endpoint = "http://" + host + ":9897";
+                }
+            }
+        } else if ((arg == "--port" || arg == "-p") && i + 1 < argc) {
+            try {
+                int port = std::stoi(argv[++i]);
+                if (port < 1 || port > 65535) {
+                    std::cerr << Color::RED << "Error: Port must be between 1 and 65535" << Color::RESET << std::endl;
+                    return 1;
+                }
+                // Port option only applies to solo mining mode (not stratum pools)
+                if (mining_mode == MiningMode::Solo) {
+                    size_t host_start = endpoint.find("://") + 3;
+                    size_t port_start = endpoint.find(":", host_start);
+                    if (port_start != std::string::npos) {
+                        endpoint = endpoint.substr(0, port_start + 1) + std::to_string(port);
+                    } else {
+                        endpoint = endpoint + ":" + std::to_string(port);
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid port number: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
+        } else if ((arg == "--rpc-url") && i + 1 < argc) {
+            endpoint = argv[++i];
+            mining_mode = MiningMode::Solo;  // RPC URL explicitly sets solo mining mode
+        } else if ((arg == "--stratum") && i + 1 < argc) {
+            endpoint = argv[++i];
+            mining_mode = MiningMode::Stratum;
+        } else if ((arg == "--stratum-pass") && i + 1 < argc) {
+            stratum_password = argv[++i];
+        } else if ((arg == "--stratum-worker") && i + 1 < argc) {
+            stratum_worker_name = argv[++i];
+        } else if (arg == "--test-mode") {
+            g_test_mode = true;
+        } else if (arg == "--benchmark") {
+            g_benchmark_mode = true;
+        } else if ((arg == "--fetch-interval") && i + 1 < argc) {
+            try {
+                int interval = std::stoi(argv[++i]);
+                if (interval < 1) {
+                    std::cerr << Color::RED << "Error: Fetch interval must be at least 1 second" << Color::RESET << std::endl;
+                    return 1;
+                }
+                g_fetch_interval_sec = interval;
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid fetch interval: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
+        } else if ((arg == "--batch") && i + 1 < argc) {
+            try {
+                g_batch_size = std::stoull(argv[++i]);
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid batch size: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
+        } else if (arg[0] == '-') {
+            std::cerr << Color::RED << "Error: Unknown option: " << arg << Color::RESET << std::endl;
+            std::cerr << "Use --help or -h for usage information" << std::endl;
+            return 1;
+        } else {
+            std::cerr << Color::RED << "Error: Unexpected argument: " << arg << Color::RESET << std::endl;
+            std::cerr << "Use --help or -h for usage information" << std::endl;
+            return 1;
+        }
+    }
+    
+    if (show_help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    
+    // Handle benchmark mode early (before normal mining setup)
+    // Wallet address is only required if the benchmark template doesn't exist yet
+    if (g_benchmark_mode) {
+        // Check if a cached template exists - if so, wallet is not required
+        json test_template;
+        bool template_exists = loadBenchmarkTemplate(test_template);
+        
+        if (!template_exists && g_miner_wallet_address.empty()) {
+            std::cerr << "\n" << Color::RED << Color::BOLD << "Error: Wallet address is required to fetch template" << Color::RESET << std::endl;
+            std::cerr << "\nFirst-time benchmark requires wallet address to fetch template from node." << std::endl;
+            std::cerr << "After template is saved, wallet is not required.\n" << std::endl;
+            print_usage(argv[0]);
+            return 1;
+        }
+        
+        print_system_info();
+        cudaDeviceReset();
+        install_signal_handlers();
+        runBenchmark(endpoint, g_gpu_device_id);
+        cudaDeviceReset();
+        return 0;
+    }
+    
+    // Normal mining mode: wallet address is required for block rewards
+    if (g_miner_wallet_address.empty()) {
+        std::cerr << "\n" << Color::RED << Color::BOLD << "Error: Wallet address is required" << Color::RESET << std::endl;
+        std::cerr << "\nMining requires your Neptune wallet address.\n" << std::endl;
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    // Auto-detect mining mode from URL format if not explicitly set
+    // (stratum:// URLs indicate pool mining, http:// indicates solo mining)
+    if (mining_mode == MiningMode::Solo) {
+        mining_mode = detect_mining_mode(endpoint);
+    }
+    
+    g_miner_worker_name = stratum_worker_name;
+    print_system_info();
+    
+    std::cout << Color::BOLD << "Configuration:" << Color::RESET << std::endl;
+    std::cout << "  Mining Mode:   " << mining_mode_name(mining_mode) << std::endl;
+    if (mining_mode == MiningMode::Stratum) {
+        std::cout << "  Pool:          " << endpoint << std::endl;
+        std::cout << "  Worker:        " << g_miner_worker_name << std::endl;
+    } else {
+        std::cout << "  RPC Endpoint:  " << endpoint << std::endl;
+    }
+    std::cout << "  Wallet:        " << shorten_address(g_miner_wallet_address) << std::endl;
+    if (g_gpu_device_id >= 0) {
+        std::cout << "  Device:        GPU " << g_gpu_device_id << std::endl;
+    } else {
+        std::cout << "  Device:        All available GPUs" << std::endl;
+    }
+    if (g_test_mode) {
+        std::cout << "  Test Mode:     " << Color::YELLOW << "ENABLED" << Color::RESET << std::endl;
+    }
+    std::cout << "  Batch size:    " << (g_batch_size == 0 ? "auto" : std::to_string(g_batch_size) + " nonces") << std::endl;
+    std::cout << std::endl;
+    
+    cudaDeviceReset();
+    install_signal_handlers();
+    
+    try {
+        startUnifiedMining(endpoint, g_gpu_device_id, mining_mode, stratum_password);
+    } catch (const std::exception& e) {
+        std::string error_msg = e.what();
+        // Sanitize error messages: replace full wallet address with shortened version
+        // to avoid exposing sensitive information in logs
+        if (!g_miner_wallet_address.empty() && error_msg.find(g_miner_wallet_address) != std::string::npos) {
+            size_t pos = 0;
+            while ((pos = error_msg.find(g_miner_wallet_address, pos)) != std::string::npos) {
+                error_msg.replace(pos, g_miner_wallet_address.length(), shorten_address(g_miner_wallet_address));
+                pos += shorten_address(g_miner_wallet_address).length();
+            }
+        }
+        std::cerr << Color::RED << "Error: " << error_msg << Color::RESET << std::endl;
+        return 1;
+    }
+    
+    // Cleanup CUDA resources before exit
+    cudaDeviceReset();
+    std::cout << "\n" << Color::GREEN << "Mining stopped" << Color::RESET << std::endl;
+    
+    return 0;
 }
