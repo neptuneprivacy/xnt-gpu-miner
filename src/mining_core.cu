@@ -1730,6 +1730,14 @@ __global__ void parallel_mining_kernel_high_vram(
     }
 }
 
+// ===== MINING KERNEL FINALIZE =====
+// Tiny kernel run after mining kernel (matches fast miner 3-phase structure).
+// Ensures mining kernel completes before host readback; 2μs typical.
+
+__global__ void mining_kernel_finalize(const int* __restrict__ d_solution_found) {
+    (void)__ldg(d_solution_found);  // Force completion of mining kernel before this
+}
+
 // ===== LOW-VRAM MINING KERNEL =====
 
 __global__ void parallel_mining_kernel_low_vram(
@@ -1898,6 +1906,20 @@ void calculate_mining_launch_config(
     }
     int max_blocks = num_sms * blocks_per_sm;
     
+    // Override via env or --blocks: 680 = fast miner config from profile
+    if (g_blocks_per_grid > 0) {
+        blocks_per_grid = std::min(g_blocks_per_grid, MAX_GRID_DIM_X);
+        blocks_per_grid = std::max(blocks_per_grid, 1);
+        return;
+    }
+    if (const char* env = std::getenv("XNT_BLOCKS_PER_GRID"); env && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0 && v <= MAX_GRID_DIM_X) {
+            blocks_per_grid = v;
+            return;
+        }
+    }
+    
     // Calculate blocks needed for nonces
     int needed_blocks = (num_nonces + threads_per_block - 1) / threads_per_block;
     
@@ -1970,6 +1992,30 @@ bool sync_and_check_errors(const char* stage) {
     return true;
 }
 
+// Forward declare phase-split kernels (defined after fast_mast_hash_direct)
+extern __global__ void mining_kernel_phase1_high_vram(
+    const Digest hash,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    uint64_t* __restrict__ d_phase_indices);
+extern __global__ void mining_kernel_phase2_high_vram(
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    const Digest hash,
+    const Digest target,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    const size_t num_leafs,
+    const size_t merkle_height,
+    const PowMastPaths mast_paths,
+    const uint64_t* __restrict__ d_phase_indices,
+    uint64_t* __restrict__ d_solution_nonce,
+    int* __restrict__ d_solution_found,
+    Digest* __restrict__ d_solution_path_a,
+    Digest* __restrict__ d_solution_path_b,
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash);
+
 // ===== MAIN MINING FUNCTION =====
 
 std::optional<MiningSolution> mine_pow_with_buffer(
@@ -2033,7 +2079,71 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
     
-    switch (kernel_type) {
+    bool use_phase_split = false;
+    if (kernel_type == MiningKernelType::HIGH_VRAM) {
+        if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '1') {
+            use_phase_split = true;
+        }
+    }
+    
+    if (use_phase_split) {
+        // Phase-split: d_phase_indices stores (index_a, index_b) = 16 bytes/nonce
+        // RTX 4090: 40M nonces * 16 = 640 MB, so full batch fits
+        constexpr size_t PHASE_CHUNK_MAX = 50ULL * 1024 * 1024;  // 50M nonces = 800 MB
+        size_t need_cap = std::min(max_nonces, PHASE_CHUNK_MAX);
+        if (buffer.d_phase_indices_capacity < need_cap) {
+            if (buffer.d_phase_indices) {
+                cudaFree(buffer.d_phase_indices);
+                buffer.d_phase_indices = nullptr;
+            }
+            cudaError_t err = cudaMalloc(&buffer.d_phase_indices, need_cap * 2 * sizeof(uint64_t));
+            if (err != cudaSuccess) {
+                LOG_ERROR("alloc d_phase_indices", err);
+                use_phase_split = false;
+            } else {
+                buffer.d_phase_indices_capacity = need_cap;
+            }
+        }
+    }
+    
+    if (use_phase_split && buffer.d_phase_indices) {
+        // Process in chunks to fit buffer
+        uint64_t off = 0;
+        while (off < max_nonces) {
+            uint64_t chunk = std::min(max_nonces - off, buffer.d_phase_indices_capacity);
+            mining_kernel_phase1_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
+                buffer.index_picker_preimage,
+                start_nonce + off,
+                chunk,
+                buffer.d_phase_indices);
+            if (!check_kernel_launch_errors("mining_kernel_phase1")) return std::nullopt;
+            
+            mining_kernel_phase2_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
+                buffer.d_leafs,
+                buffer.d_merkle_tree,
+                buffer.index_picker_preimage,
+                target,
+                start_nonce + off,
+                chunk,
+                buffer.num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                mast_paths,
+                buffer.d_phase_indices,
+                buffer.d_solution_nonce,
+                buffer.d_solution_found,
+                buffer.d_solution_path_a,
+                buffer.d_solution_path_b,
+                buffer.d_solution_nonce_digest,
+                buffer.d_solution_final_hash);
+            if (!check_kernel_launch_errors("mining_kernel_phase2")) return std::nullopt;
+            
+            int sol = 0;
+            cudaMemcpy(&sol, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
+            if (sol) break;
+            off += chunk;
+        }
+        mining_kernel_finalize<<<1, 1, 0, buffer.mining_stream>>>(buffer.d_solution_found);
+    } else switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 buffer.d_leafs,
@@ -2077,6 +2187,8 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.d_solution_final_hash);
             break;
     }
+    
+    mining_kernel_finalize<<<1, 1, 0, buffer.mining_stream>>>(buffer.d_solution_found);
     
     // Check for launch errors
     if (!check_kernel_launch_errors("mining_kernel")) {
@@ -2437,6 +2549,8 @@ bool launch_mining_kernel_async(
                 slot.d_solution_final_hash);
             break;
     }
+    
+    mining_kernel_finalize<<<1, 1, 0, slot.stream>>>(slot.d_solution_found);
     
     // Check for launch errors
     cudaError_t err = cudaGetLastError();
@@ -3093,6 +3207,144 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
     result.values[3] = state[3];
     result.values[4] = state[4];
     return result;
+}
+
+// ===== PHASE-SPLIT KERNELS (XNT_USE_PHASE_SPLIT=1) =====
+// Phase 1: Pow_indices only → store (index_a, index_b) buffer (16 bytes/nonce)
+// Phase 2: Read buffer, fast_mast_hash_direct (hash_pow_encoding + MAST) → target check
+// Uses less VRAM than pow_encoding buffer; RTX 4090 can handle full batch.
+
+__device__ __forceinline__ Digest mast_hash_from_pow_encoding(
+    const Digest& pow_encoding_digest,
+    const PowMastPaths& mast_paths) {
+    uint64_t state[STATE_SIZE];
+    tip5_hash_fixed_inplace(state, pow_encoding_digest, mast_paths.pow[0]);
+    tip5_hash_fixed_left_state(state, mast_paths.pow[1]);
+    tip5_hash_fixed_right_state(state, mast_paths.pow[2]);
+    tip5_hash_varlen5_state(state);
+    tip5_hash_fixed_left_state(state, mast_paths.header[0]);
+    tip5_hash_fixed_left_state(state, mast_paths.header[1]);
+    tip5_hash_varlen5_state(state);
+    tip5_hash_fixed_left_state(state, mast_paths.kernel[0]);
+    Digest result;
+    result.values[0] = state[0];
+    result.values[1] = state[1];
+    result.values[2] = state[2];
+    result.values[3] = state[3];
+    result.values[4] = state[4];
+    return result;
+}
+
+__global__ void __launch_bounds__(256, 2) mining_kernel_phase1_high_vram(
+    const Digest hash,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    uint64_t* __restrict__ d_phase_indices) {
+    
+    if (threadIdx.x < 256) {
+        s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    __syncthreads();
+    
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = gridDim.x * blockDim.x;
+    
+    for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
+        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+        Digest nonce_digest;
+        nonce_digest.values[0] = nonce_value;
+        nonce_digest.values[1] = 0;
+        nonce_digest.values[2] = 0;
+        nonce_digest.values[3] = 0;
+        nonce_digest.values[4] = 0;
+        
+        uint64_t index_a, index_b;
+        Pow_indices_device(hash, nonce_digest, index_a, index_b);
+        
+        d_phase_indices[idx * 2] = index_a;
+        d_phase_indices[idx * 2 + 1] = index_b;
+    }
+}
+
+__global__ void __launch_bounds__(256, 2) mining_kernel_phase2_high_vram(
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    const Digest hash,
+    const Digest target,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    const size_t num_leafs,
+    const size_t merkle_height,
+    const PowMastPaths mast_paths,
+    const uint64_t* __restrict__ d_phase_indices,
+    uint64_t* __restrict__ d_solution_nonce,
+    int* __restrict__ d_solution_found,
+    Digest* __restrict__ d_solution_path_a,
+    Digest* __restrict__ d_solution_path_b,
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash) {
+    
+    if (threadIdx.x < 256) {
+        s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    __syncthreads();
+    
+    if (*d_solution_found) return;
+    
+    const Digest merkle_root = d_internal_nodes[num_leafs - 2];
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = gridDim.x * blockDim.x;
+    const uint64_t CHECK_INTERVAL = 16384ULL;
+    
+    for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
+        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) break;
+        
+        uint64_t index_a = d_phase_indices[idx * 2];
+        uint64_t index_b = d_phase_indices[idx * 2 + 1];
+        
+        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+        Digest nonce_digest;
+        nonce_digest.values[0] = nonce_value;
+        nonce_digest.values[1] = 0;
+        nonce_digest.values[2] = 0;
+        nonce_digest.values[3] = 0;
+        nonce_digest.values[4] = 0;
+        
+        Digest pow_enc = hash_pow_encoding_direct(
+            nonce_digest, merkle_root, d_leafs, d_internal_nodes,
+            index_a, index_b, num_leafs, merkle_height);
+        Digest final_hash = mast_hash_from_pow_encoding(pow_enc, mast_paths);
+        bool is_solution = digest_less_equal_ptx(final_hash, target);
+        
+        if (__builtin_expect(is_solution, 0)) {
+            int was = atomicCAS(d_solution_found, 0, 1);
+            if (was == 0) {
+                atomicExch((unsigned long long*)d_solution_nonce, nonce_digest.values[0]);
+                *d_solution_nonce_digest = nonce_digest;
+                *d_solution_final_hash = final_hash;
+                
+                size_t running_index = index_a + num_leafs;
+                d_solution_path_a[0] = d_leafs[index_a ^ 1];
+                for (size_t level = 1; level < merkle_height; ++level) {
+                    running_index >>= 1;
+                    size_t sibling_index = running_index ^ 1;
+                    d_solution_path_a[level] = (sibling_index < num_leafs)
+                        ? d_internal_nodes[sibling_index]
+                        : Digest::default_digest();
+                }
+                running_index = index_b + num_leafs;
+                d_solution_path_b[0] = d_leafs[index_b ^ 1];
+                for (size_t level = 1; level < merkle_height; ++level) {
+                    running_index >>= 1;
+                    size_t sibling_index = running_index ^ 1;
+                    d_solution_path_b[level] = (sibling_index < num_leafs)
+                        ? d_internal_nodes[sibling_index]
+                        : Digest::default_digest();
+                }
+                return;
+            }
+        }
+    }
 }
 
 // Low VRAM version - uses on-demand node computation
@@ -4991,6 +5243,8 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 miner.slots[active_slot].d_solution_nonce_digest,
                 miner.slots[active_slot].d_solution_final_hash);
         }
+        
+        mining_kernel_finalize<<<1, 1, 0, miner.slots[active_slot].stream>>>(miner.slots[active_slot].d_solution_found);
         
         cudaMemcpyAsync(miner.slots[active_slot].h_solution_found_pinned, miner.slots[active_slot].d_solution_found,
                         sizeof(int), cudaMemcpyDeviceToHost, miner.slots[active_slot].stream);

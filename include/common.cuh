@@ -140,6 +140,8 @@ extern std::mutex g_log_mutex;
 // Tuning parameters (command-line configurable)
 extern int g_block_size;        // Threads per block (default: 256)
 extern uint64_t g_batch_size;   // Nonces per kernel launch (0 = auto)
+extern int g_blocks_per_grid;   // Blocks per grid (0 = auto; 680 = fast miner config)
+extern bool g_blocks_sweep;     // If true, benchmark sweeps 512,680,1024,1536,2048 blocks
 
 // Helper function to shorten wallet address for display
 inline std::string shorten_address(const std::string& addr, size_t prefix_len = 12, size_t suffix_len = 8) {

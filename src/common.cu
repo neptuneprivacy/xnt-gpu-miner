@@ -15,3 +15,5 @@ std::mutex g_log_mutex;
 // Tuning parameters (optimized defaults)
 int g_block_size = 256;              // Threads per block (optimal for LUT loading)
 uint64_t g_batch_size = DEFAULT_BATCH_SIZE;  // Mining + benchmark default (0 = auto)
+int g_blocks_per_grid = 0;           // Blocks per grid (0 = auto; 680 = fast miner config)
+bool g_blocks_sweep = false;         // If true, benchmark sweeps block counts

@@ -33,6 +33,9 @@ void print_usage(const char* program_name) {
     std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
     std::cerr << "  --batch N             Nonces per kernel (0=auto, e.g. 20000000 for 20M)" << std::endl;
     std::cerr << "                        Or set XNT_BATCH_SIZE env for quick tuning" << std::endl;
+    std::cerr << "  --blocks N            Blocks per grid (0=auto; 680=fast miner config)" << std::endl;
+    std::cerr << "  --blocks-sweep        Benchmark sweep 512-8192 blocks (with --benchmark)" << std::endl;
+    std::cerr << "  XNT_USE_PHASE_SPLIT=1 Use phase1+phase2 kernel split (HIGH_VRAM only)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
@@ -673,6 +676,136 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     }
 }
 
+/// Run benchmark with different block counts and report MH/s.
+void runBenchmarkBlocksSweep(const std::string& endpoint, int gpu_id) {
+    constexpr int SWEEP_BLOCKS[] = {512, 680, 1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192};
+    constexpr int SWEEP_DURATION_SEC = 5;
+    constexpr int WARMUP_BATCHES = 2;
+    
+    std::cout << Color::BOLD << "\n=== Blocks Sweep Benchmark ===" << Color::RESET << std::endl;
+    std::cout << "  Duration per config: " << SWEEP_DURATION_SEC << " s  |  Warmup: " << WARMUP_BATCHES << " batches\n" << std::endl;
+    
+    json template_response;
+    if (!loadBenchmarkTemplate(template_response)) {
+        std::cerr << Color::RED << "Error: " << BENCHMARK_FILE << " not found. Run --benchmark first to save template." << Color::RESET << std::endl;
+        return;
+    }
+    
+    json template_obj;
+    if (template_response.contains("result") && template_response["result"].contains("template")) {
+        template_obj = template_response["result"]["template"];
+    } else if (template_response.contains("template")) {
+        template_obj = template_response["template"];
+    } else {
+        std::cerr << Color::RED << "Error: Invalid template format" << Color::RESET << std::endl;
+        return;
+    }
+    
+    std::string template_json_str = template_response.dump();
+    PowPuzzle puzzle = parsePowPuzzle(template_json_str);
+    if (!puzzle.is_valid()) {
+        std::cerr << Color::RED << "Error: Invalid puzzle" << Color::RESET << std::endl;
+        return;
+    }
+    
+    int device_id = (gpu_id >= 0) ? gpu_id : 0;
+    if (cudaSetDevice(device_id) != cudaSuccess) {
+        std::cerr << Color::RED << "CUDA Error setting device" << Color::RESET << std::endl;
+        return;
+    }
+    
+    auto gpu_res = std::make_unique<GpuResources>(device_id);
+    gpu_res->mining_mode = MiningMode::Solo;
+    if (!preprocessPuzzle(puzzle, gpu_res.get())) {
+        std::cerr << Color::RED << "Failed to initialize GPU" << Color::RESET << std::endl;
+        return;
+    }
+    
+    if (g_batch_size > 0) {
+        gpu_res->optimal_max_nonces = std::max(g_batch_size, uint64_t(1));
+    } else {
+        gpu_res->optimal_max_nonces = get_optimal_batch_size(device_id);
+    }
+    
+    Digest original_threshold = hex_to_digest(puzzle.threshold);
+    constexpr uint64_t BENCHMARK_EASY_FACTOR = 1000000ULL;
+    Digest test_target = make_target_easier(original_threshold, BENCHMARK_EASY_FACTOR);
+    uint64_t NONCES_PER_BATCH = gpu_res->optimal_max_nonces;
+    
+    std::cout << "  Blocks  |  MH/s (sustained)" << std::endl;
+    std::cout << "  ------- |  -----------------" << std::endl;
+    
+    double best_mhps = 0;
+    int best_blocks = 0;
+    
+    for (int blocks : SWEEP_BLOCKS) {
+        g_blocks_per_grid = blocks;
+        uint64_t total_nonces = 0;
+        int batch_count = 0;
+        uint64_t measured_nonces = 0;
+        int full_batch_count = 0;
+        double full_batch_total_ms = 0.0;
+        
+        auto start_time = std::chrono::steady_clock::now();
+        
+        while (!stop_mining) {
+            auto batch_start = std::chrono::steady_clock::now();
+            auto result = mine_pow_with_buffer(
+                *gpu_res->buffer,
+                test_target,
+                gpu_res->buffer->mast_paths,
+                total_nonces,
+                NONCES_PER_BATCH,
+                gpu_res->buffer->consensus_rule_set,
+                nullptr);
+            auto batch_end = std::chrono::steady_clock::now();
+            double batch_ms = std::chrono::duration<double, std::milli>(batch_end - batch_start).count();
+            
+            batch_count++;
+            total_nonces += NONCES_PER_BATCH;
+            
+            if (batch_count > WARMUP_BATCHES) {
+                measured_nonces += NONCES_PER_BATCH;
+                if (!result.has_value()) {
+                    full_batch_count++;
+                    full_batch_total_ms += batch_ms;
+                }
+            }
+            
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(batch_end - start_time).count();
+            if (elapsed >= SWEEP_DURATION_SEC) break;
+        }
+        
+        double sustained_mhps = 0;
+        if (full_batch_count > 0) {
+            sustained_mhps = (NONCES_PER_BATCH / 1000000.0) / (full_batch_total_ms / full_batch_count / 1000.0);
+        } else if (measured_nonces > 0) {
+            auto end_time = std::chrono::steady_clock::now();
+            double sec = std::chrono::duration<double>(end_time - start_time).count();
+            sustained_mhps = (measured_nonces / 1000000.0) / std::max(0.001, sec);
+        }
+        
+        std::cout << "  " << std::setw(6) << blocks << "  |  " << std::fixed << std::setprecision(2) << sustained_mhps << std::endl;
+        
+        if (sustained_mhps > best_mhps) {
+            best_mhps = sustained_mhps;
+            best_blocks = blocks;
+        }
+    }
+    
+    std::cout << std::endl;
+    std::cout << Color::BOLD << "Best: " << best_blocks << " blocks @ " << std::fixed << std::setprecision(2) 
+              << best_mhps << " MH/s" << Color::RESET << std::endl;
+    std::cout << "  Use: --blocks " << best_blocks << " or XNT_BLOCKS_PER_GRID=" << best_blocks << std::endl;
+    std::cout << std::endl;
+    
+    g_blocks_per_grid = 0;  // Reset
+    if (gpu_res->buffer) {
+        gpu_res->buffer->cleanup();
+        gpu_res->buffer.reset();
+    }
+}
+
 int main(int argc, char* argv[]) {
     enable_ansi_colors();
     std::cout.setf(std::ios::unitbuf);
@@ -681,6 +814,11 @@ int main(int argc, char* argv[]) {
     // Batch size: env XNT_BATCH_SIZE as default (0=auto), --batch overrides
     if (const char* env = std::getenv("XNT_BATCH_SIZE"); env && env[0] != '\0') {
         try { g_batch_size = std::stoull(env); } catch (...) { /* keep default */ }
+    }
+    // Blocks per grid: env XNT_BLOCKS_PER_GRID (0=auto; 680=fast miner)
+    if (const char* env = std::getenv("XNT_BLOCKS_PER_GRID"); env && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0 && v <= 65535) g_blocks_per_grid = v;
     }
     
     std::string endpoint = "http://127.0.0.1:9897";
@@ -773,6 +911,19 @@ int main(int argc, char* argv[]) {
                 std::cerr << Color::RED << "Error: Invalid batch size: " << argv[i] << Color::RESET << std::endl;
                 return 1;
             }
+        } else if ((arg == "--blocks") && i + 1 < argc) {
+            try {
+                g_blocks_per_grid = std::stoi(argv[++i]);
+                if (g_blocks_per_grid < 0 || g_blocks_per_grid > 65535) {
+                    std::cerr << Color::RED << "Error: Blocks must be 1–65535" << Color::RESET << std::endl;
+                    return 1;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid blocks value: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
+        } else if (arg == "--blocks-sweep") {
+            g_blocks_sweep = true;
         } else if (arg[0] == '-') {
             std::cerr << Color::RED << "Error: Unknown option: " << arg << Color::RESET << std::endl;
             std::cerr << "Use --help or -h for usage information" << std::endl;
@@ -807,7 +958,11 @@ int main(int argc, char* argv[]) {
         print_system_info();
         cudaDeviceReset();
         install_signal_handlers();
-        runBenchmark(endpoint, g_gpu_device_id);
+        if (g_blocks_sweep) {
+            runBenchmarkBlocksSweep(endpoint, g_gpu_device_id);
+        } else {
+            runBenchmark(endpoint, g_gpu_device_id);
+        }
         cudaDeviceReset();
         return 0;
     }

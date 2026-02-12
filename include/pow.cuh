@@ -51,6 +51,10 @@ public:
     Digest* d_solution_final_hash;
     bool output_buffers_allocated;
     
+    // Phase-split intermediate buffer (index_a, index_b per nonce; 16 bytes/nonce)
+    uint64_t* d_phase_indices;
+    size_t d_phase_indices_capacity;
+    
     // GPU range initialization (only need to set once per GPU)
     bool gpu_range_initialized;
     // L2 persistence hint set for d_leafs (P0.3 optimization)
@@ -76,6 +80,8 @@ public:
         , d_solution_nonce_digest(nullptr)
         , d_solution_final_hash(nullptr)
         , output_buffers_allocated(false)
+        , d_phase_indices(nullptr)
+        , d_phase_indices_capacity(0)
         , gpu_range_initialized(false)
         , l2_persist_set(false) {}
     
@@ -102,6 +108,8 @@ public:
         if (d_solution_path_b) { cudaFree(d_solution_path_b); d_solution_path_b = nullptr; }
         if (d_solution_nonce_digest) { cudaFree(d_solution_nonce_digest); d_solution_nonce_digest = nullptr; }
         if (d_solution_final_hash) { cudaFree(d_solution_final_hash); d_solution_final_hash = nullptr; }
+        if (d_phase_indices) { cudaFree(d_phase_indices); d_phase_indices = nullptr; }
+        d_phase_indices_capacity = 0;
         output_buffers_allocated = false;
         
         if (stream_initialized && mining_stream) {
@@ -137,6 +145,8 @@ public:
         , d_solution_nonce_digest(other.d_solution_nonce_digest)
         , d_solution_final_hash(other.d_solution_final_hash)
         , output_buffers_allocated(other.output_buffers_allocated)
+        , d_phase_indices(other.d_phase_indices)
+        , d_phase_indices_capacity(other.d_phase_indices_capacity)
         , gpu_range_initialized(other.gpu_range_initialized)
         , l2_persist_set(other.l2_persist_set) {
         other.d_merkle_tree = nullptr;
@@ -151,6 +161,8 @@ public:
         other.d_solution_path_b = nullptr;
         other.d_solution_nonce_digest = nullptr;
         other.d_solution_final_hash = nullptr;
+        other.d_phase_indices = nullptr;
+        other.d_phase_indices_capacity = 0;
         other.output_buffers_allocated = false;
         other.gpu_range_initialized = false;
         other.l2_persist_set = false;
@@ -177,6 +189,8 @@ public:
             d_solution_path_b = other.d_solution_path_b;
             d_solution_nonce_digest = other.d_solution_nonce_digest;
             d_solution_final_hash = other.d_solution_final_hash;
+            d_phase_indices = other.d_phase_indices;
+            d_phase_indices_capacity = other.d_phase_indices_capacity;
             output_buffers_allocated = other.output_buffers_allocated;
             gpu_range_initialized = other.gpu_range_initialized;
             l2_persist_set = other.l2_persist_set;
@@ -192,6 +206,8 @@ public:
             other.d_solution_path_b = nullptr;
             other.d_solution_nonce_digest = nullptr;
             other.d_solution_final_hash = nullptr;
+            other.d_phase_indices = nullptr;
+            other.d_phase_indices_capacity = 0;
             other.output_buffers_allocated = false;
         }
         return *this;

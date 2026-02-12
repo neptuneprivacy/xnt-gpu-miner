@@ -21,6 +21,8 @@ std::mutex g_log_mutex;
 // Tuning parameters (optimized defaults)
 int g_block_size = 256;              // Threads per block (optimal for LUT loading)
 uint64_t g_batch_size = DEFAULT_BATCH_SIZE;  // Mining + benchmark default (0 = auto)
+int g_blocks_per_grid = 0;           // Blocks per grid (0 = auto; 680 = fast miner config)
+bool g_blocks_sweep = false;         // If true, benchmark sweeps block counts
 
 // --- mining_core.cu ---
 // ============================================================================
@@ -1755,6 +1757,14 @@ __global__ void parallel_mining_kernel_high_vram(
     }
 }
 
+// ===== MINING KERNEL FINALIZE =====
+// Tiny kernel run after mining kernel (matches fast miner 3-phase structure).
+// Ensures mining kernel completes before host readback; 2μs typical.
+
+__global__ void mining_kernel_finalize(const int* __restrict__ d_solution_found) {
+    (void)__ldg(d_solution_found);  // Force completion of mining kernel before this
+}
+
 // ===== LOW-VRAM MINING KERNEL =====
 
 __global__ void parallel_mining_kernel_low_vram(
@@ -1923,6 +1933,20 @@ void calculate_mining_launch_config(
     }
     int max_blocks = num_sms * blocks_per_sm;
     
+    // Override via env or --blocks: 680 = fast miner config from profile
+    if (g_blocks_per_grid > 0) {
+        blocks_per_grid = std::min(g_blocks_per_grid, MAX_GRID_DIM_X);
+        blocks_per_grid = std::max(blocks_per_grid, 1);
+        return;
+    }
+    if (const char* env = std::getenv("XNT_BLOCKS_PER_GRID"); env && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0 && v <= MAX_GRID_DIM_X) {
+            blocks_per_grid = v;
+            return;
+        }
+    }
+    
     // Calculate blocks needed for nonces
     int needed_blocks = (num_nonces + threads_per_block - 1) / threads_per_block;
     
@@ -1995,6 +2019,30 @@ bool sync_and_check_errors(const char* stage) {
     return true;
 }
 
+// Forward declare phase-split kernels (defined after fast_mast_hash_direct)
+extern __global__ void mining_kernel_phase1_high_vram(
+    const Digest hash,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    uint64_t* __restrict__ d_phase_indices);
+extern __global__ void mining_kernel_phase2_high_vram(
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    const Digest hash,
+    const Digest target,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    const size_t num_leafs,
+    const size_t merkle_height,
+    const PowMastPaths mast_paths,
+    const uint64_t* __restrict__ d_phase_indices,
+    uint64_t* __restrict__ d_solution_nonce,
+    int* __restrict__ d_solution_found,
+    Digest* __restrict__ d_solution_path_a,
+    Digest* __restrict__ d_solution_path_b,
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash);
+
 // ===== MAIN MINING FUNCTION =====
 
 std::optional<MiningSolution> mine_pow_with_buffer(
@@ -2058,7 +2106,71 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
     
-    switch (kernel_type) {
+    bool use_phase_split = false;
+    if (kernel_type == MiningKernelType::HIGH_VRAM) {
+        if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '1') {
+            use_phase_split = true;
+        }
+    }
+    
+    if (use_phase_split) {
+        // Phase-split: d_phase_indices stores (index_a, index_b) = 16 bytes/nonce
+        // RTX 4090: 40M nonces * 16 = 640 MB, so full batch fits
+        constexpr size_t PHASE_CHUNK_MAX = 50ULL * 1024 * 1024;  // 50M nonces = 800 MB
+        size_t need_cap = std::min(max_nonces, PHASE_CHUNK_MAX);
+        if (buffer.d_phase_indices_capacity < need_cap) {
+            if (buffer.d_phase_indices) {
+                cudaFree(buffer.d_phase_indices);
+                buffer.d_phase_indices = nullptr;
+            }
+            cudaError_t err = cudaMalloc(&buffer.d_phase_indices, need_cap * 2 * sizeof(uint64_t));
+            if (err != cudaSuccess) {
+                LOG_ERROR("alloc d_phase_indices", err);
+                use_phase_split = false;
+            } else {
+                buffer.d_phase_indices_capacity = need_cap;
+            }
+        }
+    }
+    
+    if (use_phase_split && buffer.d_phase_indices) {
+        // Process in chunks to fit buffer
+        uint64_t off = 0;
+        while (off < max_nonces) {
+            uint64_t chunk = std::min(max_nonces - off, buffer.d_phase_indices_capacity);
+            mining_kernel_phase1_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
+                buffer.index_picker_preimage,
+                start_nonce + off,
+                chunk,
+                buffer.d_phase_indices);
+            if (!check_kernel_launch_errors("mining_kernel_phase1")) return std::nullopt;
+            
+            mining_kernel_phase2_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
+                buffer.d_leafs,
+                buffer.d_merkle_tree,
+                buffer.index_picker_preimage,
+                target,
+                start_nonce + off,
+                chunk,
+                buffer.num_leafs,
+                MERKLE_TREE_HEIGHT_,
+                mast_paths,
+                buffer.d_phase_indices,
+                buffer.d_solution_nonce,
+                buffer.d_solution_found,
+                buffer.d_solution_path_a,
+                buffer.d_solution_path_b,
+                buffer.d_solution_nonce_digest,
+                buffer.d_solution_final_hash);
+            if (!check_kernel_launch_errors("mining_kernel_phase2")) return std::nullopt;
+            
+            int sol = 0;
+            cudaMemcpy(&sol, buffer.d_solution_found, sizeof(int), cudaMemcpyDeviceToHost);
+            if (sol) break;
+            off += chunk;
+        }
+        mining_kernel_finalize<<<1, 1, 0, buffer.mining_stream>>>(buffer.d_solution_found);
+    } else switch (kernel_type) {
         case MiningKernelType::HIGH_VRAM:
             parallel_mining_kernel_high_vram<<<blocks_per_grid, threads_per_block, 0, buffer.mining_stream>>>(
                 buffer.d_leafs,
@@ -2102,6 +2214,8 @@ std::optional<MiningSolution> mine_pow_with_buffer(
                 buffer.d_solution_final_hash);
             break;
     }
+    
+    mining_kernel_finalize<<<1, 1, 0, buffer.mining_stream>>>(buffer.d_solution_found);
     
     // Check for launch errors
     if (!check_kernel_launch_errors("mining_kernel")) {
@@ -2462,6 +2576,8 @@ bool launch_mining_kernel_async(
                 slot.d_solution_final_hash);
             break;
     }
+    
+    mining_kernel_finalize<<<1, 1, 0, slot.stream>>>(slot.d_solution_found);
     
     // Check for launch errors
     cudaError_t err = cudaGetLastError();
@@ -3118,6 +3234,144 @@ __device__ __noinline__ Digest fast_mast_hash_direct(
     result.values[3] = state[3];
     result.values[4] = state[4];
     return result;
+}
+
+// ===== PHASE-SPLIT KERNELS (XNT_USE_PHASE_SPLIT=1) =====
+// Phase 1: Pow_indices only → store (index_a, index_b) buffer (16 bytes/nonce)
+// Phase 2: Read buffer, fast_mast_hash_direct (hash_pow_encoding + MAST) → target check
+// Uses less VRAM than pow_encoding buffer; RTX 4090 can handle full batch.
+
+__device__ __forceinline__ Digest mast_hash_from_pow_encoding(
+    const Digest& pow_encoding_digest,
+    const PowMastPaths& mast_paths) {
+    uint64_t state[STATE_SIZE];
+    tip5_hash_fixed_inplace(state, pow_encoding_digest, mast_paths.pow[0]);
+    tip5_hash_fixed_left_state(state, mast_paths.pow[1]);
+    tip5_hash_fixed_right_state(state, mast_paths.pow[2]);
+    tip5_hash_varlen5_state(state);
+    tip5_hash_fixed_left_state(state, mast_paths.header[0]);
+    tip5_hash_fixed_left_state(state, mast_paths.header[1]);
+    tip5_hash_varlen5_state(state);
+    tip5_hash_fixed_left_state(state, mast_paths.kernel[0]);
+    Digest result;
+    result.values[0] = state[0];
+    result.values[1] = state[1];
+    result.values[2] = state[2];
+    result.values[3] = state[3];
+    result.values[4] = state[4];
+    return result;
+}
+
+__global__ void __launch_bounds__(256, 2) mining_kernel_phase1_high_vram(
+    const Digest hash,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    uint64_t* __restrict__ d_phase_indices) {
+    
+    if (threadIdx.x < 256) {
+        s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    __syncthreads();
+    
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = gridDim.x * blockDim.x;
+    
+    for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
+        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+        Digest nonce_digest;
+        nonce_digest.values[0] = nonce_value;
+        nonce_digest.values[1] = 0;
+        nonce_digest.values[2] = 0;
+        nonce_digest.values[3] = 0;
+        nonce_digest.values[4] = 0;
+        
+        uint64_t index_a, index_b;
+        Pow_indices_device(hash, nonce_digest, index_a, index_b);
+        
+        d_phase_indices[idx * 2] = index_a;
+        d_phase_indices[idx * 2 + 1] = index_b;
+    }
+}
+
+__global__ void __launch_bounds__(256, 2) mining_kernel_phase2_high_vram(
+    const Digest* __restrict__ d_leafs,
+    const Digest* __restrict__ d_internal_nodes,
+    const Digest hash,
+    const Digest target,
+    const uint64_t start_nonce,
+    const uint64_t num_nonces,
+    const size_t num_leafs,
+    const size_t merkle_height,
+    const PowMastPaths mast_paths,
+    const uint64_t* __restrict__ d_phase_indices,
+    uint64_t* __restrict__ d_solution_nonce,
+    int* __restrict__ d_solution_found,
+    Digest* __restrict__ d_solution_path_a,
+    Digest* __restrict__ d_solution_path_b,
+    Digest* __restrict__ d_solution_nonce_digest,
+    Digest* __restrict__ d_solution_final_hash) {
+    
+    if (threadIdx.x < 256) {
+        s_lookup_table[threadIdx.x] = LOOKUP_TABLE[threadIdx.x];
+    }
+    __syncthreads();
+    
+    if (*d_solution_found) return;
+    
+    const Digest merkle_root = d_internal_nodes[num_leafs - 2];
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t stride = gridDim.x * blockDim.x;
+    const uint64_t CHECK_INTERVAL = 16384ULL;
+    
+    for (uint64_t idx = tid; idx < num_nonces; idx += stride) {
+        if ((idx & (CHECK_INTERVAL - 1)) == 0 && *d_solution_found) break;
+        
+        uint64_t index_a = d_phase_indices[idx * 2];
+        uint64_t index_b = d_phase_indices[idx * 2 + 1];
+        
+        uint64_t nonce_value = d_gpu_range_start + start_nonce + idx;
+        Digest nonce_digest;
+        nonce_digest.values[0] = nonce_value;
+        nonce_digest.values[1] = 0;
+        nonce_digest.values[2] = 0;
+        nonce_digest.values[3] = 0;
+        nonce_digest.values[4] = 0;
+        
+        Digest pow_enc = hash_pow_encoding_direct(
+            nonce_digest, merkle_root, d_leafs, d_internal_nodes,
+            index_a, index_b, num_leafs, merkle_height);
+        Digest final_hash = mast_hash_from_pow_encoding(pow_enc, mast_paths);
+        bool is_solution = digest_less_equal_ptx(final_hash, target);
+        
+        if (__builtin_expect(is_solution, 0)) {
+            int was = atomicCAS(d_solution_found, 0, 1);
+            if (was == 0) {
+                atomicExch((unsigned long long*)d_solution_nonce, nonce_digest.values[0]);
+                *d_solution_nonce_digest = nonce_digest;
+                *d_solution_final_hash = final_hash;
+                
+                size_t running_index = index_a + num_leafs;
+                d_solution_path_a[0] = d_leafs[index_a ^ 1];
+                for (size_t level = 1; level < merkle_height; ++level) {
+                    running_index >>= 1;
+                    size_t sibling_index = running_index ^ 1;
+                    d_solution_path_a[level] = (sibling_index < num_leafs)
+                        ? d_internal_nodes[sibling_index]
+                        : Digest::default_digest();
+                }
+                running_index = index_b + num_leafs;
+                d_solution_path_b[0] = d_leafs[index_b ^ 1];
+                for (size_t level = 1; level < merkle_height; ++level) {
+                    running_index >>= 1;
+                    size_t sibling_index = running_index ^ 1;
+                    d_solution_path_b[level] = (sibling_index < num_leafs)
+                        ? d_internal_nodes[sibling_index]
+                        : Digest::default_digest();
+                }
+                return;
+            }
+        }
+    }
 }
 
 // Low VRAM version - uses on-demand node computation
@@ -5016,6 +5270,8 @@ bool continuousMiningLoop(GpuResources* gpu_res, GpuWorker* worker) {
                 miner.slots[active_slot].d_solution_nonce_digest,
                 miner.slots[active_slot].d_solution_final_hash);
         }
+        
+        mining_kernel_finalize<<<1, 1, 0, miner.slots[active_slot].stream>>>(miner.slots[active_slot].d_solution_found);
         
         cudaMemcpyAsync(miner.slots[active_slot].h_solution_found_pinned, miner.slots[active_slot].d_solution_found,
                         sizeof(int), cudaMemcpyDeviceToHost, miner.slots[active_slot].stream);
@@ -8330,6 +8586,9 @@ void print_usage(const char* program_name) {
     std::cerr << "  --fetch-interval SEC  Job fetch interval in seconds (default: 5)" << std::endl;
     std::cerr << "  --batch N             Nonces per kernel (0=auto, e.g. 20000000 for 20M)" << std::endl;
     std::cerr << "                        Or set XNT_BATCH_SIZE env for quick tuning" << std::endl;
+    std::cerr << "  --blocks N            Blocks per grid (0=auto; 680=fast miner config)" << std::endl;
+    std::cerr << "  --blocks-sweep        Benchmark sweep 512-8192 blocks (with --benchmark)" << std::endl;
+    std::cerr << "  XNT_USE_PHASE_SPLIT=1 Use phase1+phase2 kernel split (HIGH_VRAM only)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
@@ -8970,6 +9229,136 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     }
 }
 
+/// Run benchmark with different block counts and report MH/s.
+void runBenchmarkBlocksSweep(const std::string& endpoint, int gpu_id) {
+    constexpr int SWEEP_BLOCKS[] = {512, 680, 1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192};
+    constexpr int SWEEP_DURATION_SEC = 5;
+    constexpr int WARMUP_BATCHES = 2;
+    
+    std::cout << Color::BOLD << "\n=== Blocks Sweep Benchmark ===" << Color::RESET << std::endl;
+    std::cout << "  Duration per config: " << SWEEP_DURATION_SEC << " s  |  Warmup: " << WARMUP_BATCHES << " batches\n" << std::endl;
+    
+    json template_response;
+    if (!loadBenchmarkTemplate(template_response)) {
+        std::cerr << Color::RED << "Error: " << BENCHMARK_FILE << " not found. Run --benchmark first to save template." << Color::RESET << std::endl;
+        return;
+    }
+    
+    json template_obj;
+    if (template_response.contains("result") && template_response["result"].contains("template")) {
+        template_obj = template_response["result"]["template"];
+    } else if (template_response.contains("template")) {
+        template_obj = template_response["template"];
+    } else {
+        std::cerr << Color::RED << "Error: Invalid template format" << Color::RESET << std::endl;
+        return;
+    }
+    
+    std::string template_json_str = template_response.dump();
+    PowPuzzle puzzle = parsePowPuzzle(template_json_str);
+    if (!puzzle.is_valid()) {
+        std::cerr << Color::RED << "Error: Invalid puzzle" << Color::RESET << std::endl;
+        return;
+    }
+    
+    int device_id = (gpu_id >= 0) ? gpu_id : 0;
+    if (cudaSetDevice(device_id) != cudaSuccess) {
+        std::cerr << Color::RED << "CUDA Error setting device" << Color::RESET << std::endl;
+        return;
+    }
+    
+    auto gpu_res = std::make_unique<GpuResources>(device_id);
+    gpu_res->mining_mode = MiningMode::Solo;
+    if (!preprocessPuzzle(puzzle, gpu_res.get())) {
+        std::cerr << Color::RED << "Failed to initialize GPU" << Color::RESET << std::endl;
+        return;
+    }
+    
+    if (g_batch_size > 0) {
+        gpu_res->optimal_max_nonces = std::max(g_batch_size, uint64_t(1));
+    } else {
+        gpu_res->optimal_max_nonces = get_optimal_batch_size(device_id);
+    }
+    
+    Digest original_threshold = hex_to_digest(puzzle.threshold);
+    constexpr uint64_t BENCHMARK_EASY_FACTOR = 1000000ULL;
+    Digest test_target = make_target_easier(original_threshold, BENCHMARK_EASY_FACTOR);
+    uint64_t NONCES_PER_BATCH = gpu_res->optimal_max_nonces;
+    
+    std::cout << "  Blocks  |  MH/s (sustained)" << std::endl;
+    std::cout << "  ------- |  -----------------" << std::endl;
+    
+    double best_mhps = 0;
+    int best_blocks = 0;
+    
+    for (int blocks : SWEEP_BLOCKS) {
+        g_blocks_per_grid = blocks;
+        uint64_t total_nonces = 0;
+        int batch_count = 0;
+        uint64_t measured_nonces = 0;
+        int full_batch_count = 0;
+        double full_batch_total_ms = 0.0;
+        
+        auto start_time = std::chrono::steady_clock::now();
+        
+        while (!stop_mining) {
+            auto batch_start = std::chrono::steady_clock::now();
+            auto result = mine_pow_with_buffer(
+                *gpu_res->buffer,
+                test_target,
+                gpu_res->buffer->mast_paths,
+                total_nonces,
+                NONCES_PER_BATCH,
+                gpu_res->buffer->consensus_rule_set,
+                nullptr);
+            auto batch_end = std::chrono::steady_clock::now();
+            double batch_ms = std::chrono::duration<double, std::milli>(batch_end - batch_start).count();
+            
+            batch_count++;
+            total_nonces += NONCES_PER_BATCH;
+            
+            if (batch_count > WARMUP_BATCHES) {
+                measured_nonces += NONCES_PER_BATCH;
+                if (!result.has_value()) {
+                    full_batch_count++;
+                    full_batch_total_ms += batch_ms;
+                }
+            }
+            
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(batch_end - start_time).count();
+            if (elapsed >= SWEEP_DURATION_SEC) break;
+        }
+        
+        double sustained_mhps = 0;
+        if (full_batch_count > 0) {
+            sustained_mhps = (NONCES_PER_BATCH / 1000000.0) / (full_batch_total_ms / full_batch_count / 1000.0);
+        } else if (measured_nonces > 0) {
+            auto end_time = std::chrono::steady_clock::now();
+            double sec = std::chrono::duration<double>(end_time - start_time).count();
+            sustained_mhps = (measured_nonces / 1000000.0) / std::max(0.001, sec);
+        }
+        
+        std::cout << "  " << std::setw(6) << blocks << "  |  " << std::fixed << std::setprecision(2) << sustained_mhps << std::endl;
+        
+        if (sustained_mhps > best_mhps) {
+            best_mhps = sustained_mhps;
+            best_blocks = blocks;
+        }
+    }
+    
+    std::cout << std::endl;
+    std::cout << Color::BOLD << "Best: " << best_blocks << " blocks @ " << std::fixed << std::setprecision(2) 
+              << best_mhps << " MH/s" << Color::RESET << std::endl;
+    std::cout << "  Use: --blocks " << best_blocks << " or XNT_BLOCKS_PER_GRID=" << best_blocks << std::endl;
+    std::cout << std::endl;
+    
+    g_blocks_per_grid = 0;  // Reset
+    if (gpu_res->buffer) {
+        gpu_res->buffer->cleanup();
+        gpu_res->buffer.reset();
+    }
+}
+
 int main(int argc, char* argv[]) {
     enable_ansi_colors();
     std::cout.setf(std::ios::unitbuf);
@@ -8978,6 +9367,11 @@ int main(int argc, char* argv[]) {
     // Batch size: env XNT_BATCH_SIZE as default (0=auto), --batch overrides
     if (const char* env = std::getenv("XNT_BATCH_SIZE"); env && env[0] != '\0') {
         try { g_batch_size = std::stoull(env); } catch (...) { /* keep default */ }
+    }
+    // Blocks per grid: env XNT_BLOCKS_PER_GRID (0=auto; 680=fast miner)
+    if (const char* env = std::getenv("XNT_BLOCKS_PER_GRID"); env && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0 && v <= 65535) g_blocks_per_grid = v;
     }
     
     std::string endpoint = "http://127.0.0.1:9897";
@@ -9070,6 +9464,19 @@ int main(int argc, char* argv[]) {
                 std::cerr << Color::RED << "Error: Invalid batch size: " << argv[i] << Color::RESET << std::endl;
                 return 1;
             }
+        } else if ((arg == "--blocks") && i + 1 < argc) {
+            try {
+                g_blocks_per_grid = std::stoi(argv[++i]);
+                if (g_blocks_per_grid < 0 || g_blocks_per_grid > 65535) {
+                    std::cerr << Color::RED << "Error: Blocks must be 1–65535" << Color::RESET << std::endl;
+                    return 1;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << Color::RED << "Error: Invalid blocks value: " << argv[i] << Color::RESET << std::endl;
+                return 1;
+            }
+        } else if (arg == "--blocks-sweep") {
+            g_blocks_sweep = true;
         } else if (arg[0] == '-') {
             std::cerr << Color::RED << "Error: Unknown option: " << arg << Color::RESET << std::endl;
             std::cerr << "Use --help or -h for usage information" << std::endl;
@@ -9104,7 +9511,11 @@ int main(int argc, char* argv[]) {
         print_system_info();
         cudaDeviceReset();
         install_signal_handlers();
-        runBenchmark(endpoint, g_gpu_device_id);
+        if (g_blocks_sweep) {
+            runBenchmarkBlocksSweep(endpoint, g_gpu_device_id);
+        } else {
+            runBenchmark(endpoint, g_gpu_device_id);
+        }
         cudaDeviceReset();
         return 0;
     }
