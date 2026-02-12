@@ -2106,11 +2106,11 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
     
+    // Phase split default ON for HIGH_VRAM; set XNT_USE_PHASE_SPLIT=0 to disable
     bool use_phase_split = false;
     if (kernel_type == MiningKernelType::HIGH_VRAM) {
-        if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '1') {
-            use_phase_split = true;
-        }
+        const char* env = std::getenv("XNT_USE_PHASE_SPLIT");
+        use_phase_split = (env == nullptr || env[0] != '0');
     }
     
     if (use_phase_split) {
@@ -8588,7 +8588,7 @@ void print_usage(const char* program_name) {
     std::cerr << "                        Or set XNT_BATCH_SIZE env for quick tuning" << std::endl;
     std::cerr << "  --blocks N            Blocks per grid (0=auto; 680=fast miner config)" << std::endl;
     std::cerr << "  --blocks-sweep        Benchmark sweep 512-8192 blocks (with --benchmark)" << std::endl;
-    std::cerr << "  XNT_USE_PHASE_SPLIT=1 Use phase1+phase2 kernel split (HIGH_VRAM only)" << std::endl;
+    std::cerr << "  XNT_USE_PHASE_SPLIT=0 Disable phase split (default ON for HIGH_VRAM)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;

@@ -35,7 +35,7 @@ void print_usage(const char* program_name) {
     std::cerr << "                        Or set XNT_BATCH_SIZE env for quick tuning" << std::endl;
     std::cerr << "  --blocks N            Blocks per grid (0=auto; 680=fast miner config)" << std::endl;
     std::cerr << "  --blocks-sweep        Benchmark sweep 512-8192 blocks (with --benchmark)" << std::endl;
-    std::cerr << "  XNT_USE_PHASE_SPLIT=1 Use phase1+phase2 kernel split (HIGH_VRAM only)" << std::endl;
+    std::cerr << "  XNT_USE_PHASE_SPLIT=0 Disable phase split (default ON for HIGH_VRAM)" << std::endl;
     std::cerr << "  -h, --help            Show this help message\n" << std::endl;
     
     std::cerr << Color::BOLD << "Examples:" << Color::RESET << std::endl;
@@ -206,10 +206,15 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     auto gpu_res = std::make_unique<GpuResources>(device_id);
     gpu_res->mining_mode = MiningMode::Solo;
     
+    std::cout << "Preprocessing (buds, leafs, Merkle tree)..." << std::flush;
+    auto preprocess_start = std::chrono::steady_clock::now();
     if (!preprocessPuzzle(puzzle, gpu_res.get())) {
-        std::cerr << Color::RED << "Failed to initialize GPU resources" << Color::RESET << std::endl;
+        std::cerr << Color::RED << "\nFailed to initialize GPU resources" << Color::RESET << std::endl;
         return;
     }
+    auto preprocess_end = std::chrono::steady_clock::now();
+    double preprocess_sec = std::chrono::duration<double>(preprocess_end - preprocess_start).count();
+    std::cout << " " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
     
     // Batch size: use global override if set, otherwise auto-detect for this GPU
     const uint64_t min_batch = 1;
@@ -627,6 +632,7 @@ void runBenchmark(const std::string& endpoint, int gpu_id) {
     double total_hash_rate = (measured_nonces / 1000000.0) / (total_elapsed / 1000.0);
     
     std::cout << "\n\n" << Color::BOLD << "=== Benchmark Results ===" << Color::RESET << std::endl;
+    std::cout << "  Preprocessing: " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
     std::cout << "  Total Nonces:  " << measured_nonces << std::endl;
     std::cout << "  Total Batches: " << measured_batch_count << std::endl;
     if (warmup_batches > 0) {
@@ -716,10 +722,15 @@ void runBenchmarkBlocksSweep(const std::string& endpoint, int gpu_id) {
     
     auto gpu_res = std::make_unique<GpuResources>(device_id);
     gpu_res->mining_mode = MiningMode::Solo;
+    std::cout << "Preprocessing (buds, leafs, Merkle tree)..." << std::flush;
+    auto preprocess_start = std::chrono::steady_clock::now();
     if (!preprocessPuzzle(puzzle, gpu_res.get())) {
-        std::cerr << Color::RED << "Failed to initialize GPU" << Color::RESET << std::endl;
+        std::cerr << Color::RED << "\nFailed to initialize GPU" << Color::RESET << std::endl;
         return;
     }
+    auto preprocess_end = std::chrono::steady_clock::now();
+    double preprocess_sec = std::chrono::duration<double>(preprocess_end - preprocess_start).count();
+    std::cout << " " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
     
     if (g_batch_size > 0) {
         gpu_res->optimal_max_nonces = std::max(g_batch_size, uint64_t(1));
@@ -794,7 +805,8 @@ void runBenchmarkBlocksSweep(const std::string& endpoint, int gpu_id) {
     }
     
     std::cout << std::endl;
-    std::cout << Color::BOLD << "Best: " << best_blocks << " blocks @ " << std::fixed << std::setprecision(2) 
+    std::cout << "  Preprocessing: " << std::fixed << std::setprecision(2) << preprocess_sec << " s" << std::endl;
+    std::cout << Color::BOLD << "  Best: " << best_blocks << " blocks @ " << std::setprecision(2)
               << best_mhps << " MH/s" << Color::RESET << std::endl;
     std::cout << "  Use: --blocks " << best_blocks << " or XNT_BLOCKS_PER_GRID=" << best_blocks << std::endl;
     std::cout << std::endl;

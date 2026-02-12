@@ -2079,11 +2079,11 @@ std::optional<MiningSolution> mine_pow_with_buffer(
     // Select and launch appropriate kernel on the buffer's stream
     MiningKernelType kernel_type = select_mining_kernel(gpu_id);
     
+    // Phase split default ON for HIGH_VRAM; set XNT_USE_PHASE_SPLIT=0 to disable
     bool use_phase_split = false;
     if (kernel_type == MiningKernelType::HIGH_VRAM) {
-        if (const char* env = std::getenv("XNT_USE_PHASE_SPLIT"); env && env[0] == '1') {
-            use_phase_split = true;
-        }
+        const char* env = std::getenv("XNT_USE_PHASE_SPLIT");
+        use_phase_split = (env == nullptr || env[0] != '0');
     }
     
     if (use_phase_split) {
@@ -3671,30 +3671,42 @@ __host__ GuesserBuffer Pow::preprocess_gpu_high_vram(const PowMastPaths& mast_au
                         cudaMemcpyDeviceToDevice, pp_stream);
     }
     
-    // Sync bud+leaf phase, then free temp buffer BEFORE allocating merkle tree.
-    // This keeps peak memory within ~21.5 GB (fits 24 GB alongside old mining buffer).
-    cudaError_t leaf_sync = cudaStreamSynchronize(pp_stream);
-    cudaFree(d_temp_leafs);
-    d_temp_leafs = nullptr;
-    
-    if (leaf_sync != cudaSuccess) {
-        LOG_ERROR("preprocessing leaf sync", leaf_sync);
-        cudaStreamDestroy(pp_stream);
-        buffer.cleanup();
-        return GuesserBuffer();
-    }
-    
-    if (cancel_flag && *cancel_flag) {
-        cudaStreamDestroy(pp_stream);
-        buffer.cleanup();
-        return GuesserBuffer();
-    }
-    
-    LOG_DEBUG("preprocess_high_vram: bud+leaf phase complete, allocating merkle tree");
-    
-    // Now allocate d_merkle_tree (temp buffer is freed, so we have room)
     size_t internal_size = (MERKLE_NUM_LEAFS - 1) * sizeof(Digest);
-    alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
+    bool used_async_alloc = false;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
+    // Stream-ordered alloc: free temp and alloc merkle on same stream, no host sync.
+    // Saves ~50-100 ms by eliminating cudaStreamSynchronize + cudaFree + cudaMalloc blocking.
+    int mem_pools_supported = 0;
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    if (cudaDeviceGetAttribute(&mem_pools_supported, cudaDevAttrMemoryPoolsSupported, device_id) == cudaSuccess
+        && mem_pools_supported) {
+        cudaFreeAsync(d_temp_leafs, pp_stream);
+        d_temp_leafs = nullptr;
+        alloc_err = cudaMallocAsync(&buffer.d_merkle_tree, internal_size, pp_stream);
+        if (alloc_err == cudaSuccess) {
+            used_async_alloc = true;
+        }
+    }
+#endif
+    if (!used_async_alloc) {
+        // Fallback: sync, free temp, then alloc (required for peak memory < 24 GB)
+        cudaError_t leaf_sync = cudaStreamSynchronize(pp_stream);
+        cudaFree(d_temp_leafs);
+        d_temp_leafs = nullptr;
+        if (leaf_sync != cudaSuccess) {
+            LOG_ERROR("preprocessing leaf sync", leaf_sync);
+            cudaStreamDestroy(pp_stream);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        if (cancel_flag && *cancel_flag) {
+            cudaStreamDestroy(pp_stream);
+            buffer.cleanup();
+            return GuesserBuffer();
+        }
+        alloc_err = cudaMalloc(&buffer.d_merkle_tree, internal_size);
+    }
     if (alloc_err != cudaSuccess) {
         LOG_ERROR("cudaMalloc internal_nodes", alloc_err);
         cudaStreamDestroy(pp_stream);
