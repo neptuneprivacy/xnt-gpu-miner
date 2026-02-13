@@ -320,7 +320,7 @@ __host__ inline uint32_t get_mds_coeff_host(int i, int j) {
 }
 
 __device__ void sbox_layer(const uint64_t* __restrict__ state_in, uint64_t* __restrict__ state_out);
-__device__ void mds_layer(const uint64_t* state_in, uint64_t* state_out);
+__device__ __noinline__ void mds_layer(const uint64_t* state_in, uint64_t* state_out);
 __device__ void round_constants_layer(int round_index, const uint64_t* state_in, uint64_t* state_out);
 __device__ void generated_function(const uint64_t* input, uint64_t* output);
 
